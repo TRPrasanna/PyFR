@@ -3,6 +3,7 @@ from pyfr.plugins.base import (BaseCLIPlugin, BasePlugin, BaseSolnPlugin,
                                BaseSolverPlugin)
 from pyfr.plugins.dtstats import DtStatsPlugin
 from pyfr.plugins.fluidforce import FluidForcePlugin
+from pyfr.plugins.fluidflux import FluidFluxPlugin
 from pyfr.plugins.fwh import FWHPlugin
 from pyfr.plugins.integrate import IntegratePlugin
 from pyfr.plugins.nancheck import NaNCheckPlugin
