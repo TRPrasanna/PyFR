@@ -209,3 +209,25 @@ class NavierStokesSubOutflowBCInters(NavierStokesBaseBCInters):
         super().__init__(be, lhs, elemap, cfgsect, cfg)
 
         self.c |= self._exp_opts(['p'], lhs)
+        
+class  NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
+    type = 'sub-in-frv-neural'
+    cflux_state = 'ghost'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+
+        self.c |= self._exp_opts(
+            ['rho', 'u', 'v', 'w'][:self.ndims + 1], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+        self.nn_params = self.backend.matrix((1, 2),tags={'align'})
+        self._set_external('nn_params', 'broadcast fpdtype_t[1][2]',value=self.nn_params)
+
+    def prepare(self, t):
+        nn_params = self.nn_params.get()
+        nn_params[0][0] = 0.09 # mdot
+        #nn_params[0][1] = 0.00 # reserved for future purposes
+        self.nn_params.set(nn_params)
