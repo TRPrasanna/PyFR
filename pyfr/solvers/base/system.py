@@ -21,7 +21,8 @@ class BaseSystem:
     # Nonce sequence
     _nonce_seq = it.count()
 
-    def __init__(self, backend, rallocs, mesh, initsoln, nregs, cfg):
+    def __init__(self, intg, backend, rallocs, mesh, initsoln, nregs, cfg):
+        self.intg = intg
         self.backend = backend
         self.mesh = mesh
         self.cfg = cfg
@@ -164,12 +165,24 @@ class BaseSystem:
                 # Get the interface
                 interarr = mesh[f].tolist()
 
+                # Get the boundary condition type
+                bc_type = self.cfg.get(cfgsect, 'type')
+
                 # Instantiate
                 bcclass = bcmap[self.cfg.get(cfgsect, 'type')]
-                bciface = bcclass(self.backend, interarr, elemap, cfgsect,
-                                  self.cfg)
+                if bc_type == 'sub-in-frv-neural':
+                    # Include 'intg' for your neural BC
+                    bciface = bcclass(self.intg, self.backend, interarr, elemap, cfgsect, self.cfg)
+                else:
+                    # Instantiate other BCs without 'intg'
+                    bciface = bcclass(self.backend, interarr, elemap, cfgsect, self.cfg)
                 bc_inters.append(bciface)
 
+        # Initialize sampling for neural BCs
+        for bc in bc_inters:
+            if hasattr(bc, 'setup_sampling'):
+                bc.setup_sampling()
+            
         return bc_inters
 
     def _gen_kernels(self, nregs, eles, iint, mpiint, bcint):

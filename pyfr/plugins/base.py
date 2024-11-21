@@ -127,7 +127,8 @@ class BaseSolnPlugin(BasePlugin):
 
 class BaseSolverPlugin(BasePlugin):
     prefix = 'solver'
-
+    def __init__(self, intg, cfgsect, suffix=None):
+        super().__init__(intg, cfgsect, suffix=suffix)
 
 class BaseCLIPlugin:
     name = None
