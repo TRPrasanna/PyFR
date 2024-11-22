@@ -207,6 +207,14 @@ class NavierStokesSubInflowFtpttangBCInters(NavierStokesBaseBCInters):
 
         self.c['vc'] = velcomps[:self.ndims]
 
+class NavierStokesSubOutflowBCInters(NavierStokesBaseBCInters):
+    type = 'sub-out-fp'
+    cflux_state = 'ghost'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg):
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+
+        self.c |= self._exp_opts(['p'], lhs)
 
 class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
     type = 'sub-in-frv-neural'  
