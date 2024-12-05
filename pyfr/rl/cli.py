@@ -7,18 +7,8 @@ mpi4py.rc.initialize = False
 from pyfr.mpiutil import get_comm_rank_root, init_mpi
 
 from pyfr._version import __version__
-from pyfr.backends import BaseBackend, get_backend
-from pyfr.inifile import Inifile
-from pyfr.partitioners import BasePartitioner, get_partitioner
-from pyfr.plugins import BaseCLIPlugin
-from pyfr.progress import ProgressBar, ProgressSequenceAction
-from pyfr.rank_allocator import get_rank_allocation
-from pyfr.readers import BaseReader, get_reader_by_name, get_reader_by_extn
-from pyfr.readers.native import NativeReader
-from pyfr.solvers import get_solver
+from pyfr.backends import BaseBackend
 from pyfr.util import subclasses
-from pyfr.writers import (BaseWriter, get_writer_by_extn, get_writer_by_name,
-                          write_pyfrms)
 
 def main():
     ap = ArgumentParser(prog='pyfr-rl')

@@ -20,8 +20,7 @@ class BaseSystem:
     # Nonce sequence
     _nonce_seq = it.count()
 
-    def __init__(self, intg, backend, mesh, initsoln, nregs, cfg):
-        self.intg = intg
+    def __init__(self, backend, mesh, initsoln, nregs, cfg):
         self.backend = backend
         self.mesh = mesh
         self.cfg = cfg
@@ -158,18 +157,18 @@ class BaseSystem:
             # Determine the config file section
             cfgsect = f'soln-bcs-{bname}'
 
-                # Get the boundary condition type
-                bc_type = self.cfg.get(cfgsect, 'type')
+            # Get the boundary condition type
+            bc_type = self.cfg.get(cfgsect, 'type')
 
-                # Instantiate
-                bcclass = bcmap[self.cfg.get(cfgsect, 'type')]
-                if bc_type == 'sub-in-frv-neural':
-                    # Include 'intg' for your neural BC
-                    bciface = bcclass(self.intg, self.backend, interarr, elemap, cfgsect, self.cfg)
-                else:
-                    # Instantiate other BCs without 'intg'
-                    bciface = bcclass(self.backend, interarr, elemap, cfgsect, self.cfg)
-                bc_inters.append(bciface)
+            # Instantiate
+            bcclass = bcmap[self.cfg.get(cfgsect, 'type')]
+            if bc_type == 'sub-in-frv-neural':
+                # Include 'intg' for your neural BC
+                bciface = bcclass(self.intg, self.backend, interarr, elemap, cfgsect, self.cfg)
+            else:
+                # Instantiate other BCs without 'intg'
+                bciface = bcclass(self.backend, interarr, elemap, cfgsect, self.cfg)
+            bc_inters.append(bciface)
 
         # Initialize sampling for neural BCs
         for bc in bc_inters:

@@ -1,6 +1,5 @@
 from pyfr.plugins.base import BaseSolverPlugin
 from pyfr.quadrules import get_quadrule
-from pyfr.plugins.sampler import _closest_pts, _plocs_to_tlocs
 from pyfr.mpiutil import get_comm_rank_root, mpi
 import numpy as np
 import torch
