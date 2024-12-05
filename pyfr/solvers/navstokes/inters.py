@@ -217,12 +217,13 @@ class NavierStokesSubOutflowBCInters(NavierStokesBaseBCInters):
         self.c |= self._exp_opts(['p'], lhs)
 
 class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
-    type = 'sub-in-frv-neural'  
+    type = 'sub-in-frv-neural'
     cflux_state = 'ghost'
+
     def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
         self.backend = be
-        super().__init__(be, lhs, elemap, cfgsect, cfg)
         self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
         
         # Basic initialization
         self.c |= self._exp_opts(
@@ -232,164 +233,18 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
 
         # Neural network parameters
         self.nn_params = self.backend.matrix((1, 2), tags={'align'})
-        self._set_external('nn_params', 'broadcast fpdtype_t[1][2]', value=self.nn_params)
+        self._set_external('nn_params', 'broadcast fpdtype_t[1][2]', 
+                         value=self.nn_params)
 
-        # Get sampling config
-        self.pts = cfg.getliteral(cfgsect, 'samp-pts')
-        self.samp_dt = cfg.getfloat(cfgsect, 'samp-dt', 0.1)
-        
-        # Initialize last sample time to current simulation time
-        self._last_sample_time = intg.tcurr
-            
-        # Initialize sampling points
-        self._initialize_sampling(elemap)
-
-    def _initialize_sampling(self, elemap):
-        """Initialize sampling with provided element map"""
-        # MPI setup
-        comm, rank, root = get_comm_rank_root()
-        
-        # Initialize sampling points
-        elepts = [[] for i in range(len(elemap))]
-        
-        # Search locations using elemap directly
-        tlocs, plocs = self._search_pts_init(elemap)
-        closest = self._closest_pts(plocs, self.pts)
-        
-        # Process points
-        for i, (dist, etype, (uidx, eidx)) in enumerate(closest):
-            _, mrank = comm.allreduce((dist, rank), op=mpi.MINLOC)
-            if rank == mrank:
-                elepts[etype].append((i, eidx, tlocs[etype][uidx]))
-
-        # Store refined points
-        self._ourpts = self._refine_pts_init(elemap, elepts)
-
-    def _search_pts_init(self, elemap):
-        """Get search locations using element map"""
-        tlocs, plocs = [], []
-
-        qrule_map = {
-            'quad': 'gauss-legendre',
-            'tri': 'williams-shunn',
-            'hex': 'gauss-legendre',
-            'pri': 'williams-shunn~gauss-legendre',
-            'pyr': 'gauss-legendre',
-            'tet': 'shunn-ham'
-        }
-
-        for etype, eles in elemap.items():
-            pts = get_quadrule(etype, qrule_map[etype], eles.basis.nupts).pts
-            tlocs.append(pts)
-            plocs.append(eles.ploc_at_np(pts).swapaxes(1, 2))
-
-        return tlocs, plocs
-
-    def _refine_pts_init(self, elemap, elepts):
-        """Refine points using provided element map"""
-        elelist = elemap.values()
-        ptsinfo = []
-
-        for etype, (eles, epts) in enumerate(zip(elelist, elepts)):
-            if not epts:
-                continue
-
-            idx, eidx, tlocs = zip(*epts)
-            spts = eles.eles[:, eidx, :]
-            plocs = [self.pts[i] for i in idx]
-
-            ntlocs, nplocs = self._plocs_to_tlocs(eles.basis.sbasis, spts, plocs, tlocs)
-            intops = eles.basis.ubasis.nodal_basis_at(ntlocs)
-            
-            ptsinfo.extend((*info, etype) for info in zip(idx, eidx, nplocs, intops))
-
-        ptsinfo.sort()
-        return [(etype, *info) for idx, *info, etype in ptsinfo]
-
-    def _closest_pts(self, epts, pts):
-        ndims = len(pts[0])
-        props = Property(dimension=ndims, interleaved=True)
-        trees = []
-
-        for e in epts:
-            # Build list of solution points for each element type
-            ins = [(i, [*p, *p], None) for i, p in enumerate(e.reshape(-1, ndims))]
-
-            # Build tree of solution points for each element type
-            trees.append(Index(ins, properties=props))
-
-        for p in pts:
-            # Find index of solution point closest to p
-            amins = [np.unravel_index(next(t.nearest([*p, *p], 1)), ept.shape[:2])
-                    for ept, t in zip(epts, trees)]
-
-            # Find distance of solution point closest to p
-            dmins = [np.linalg.norm(e[a] - p) for e, a in zip(epts, amins)]
-
-            # Reduce across element types
-            yield min(zip(dmins, range(len(epts)), amins))
-
-
-    def _plocs_to_tlocs(self, sbasis, spts, plocs, tlocs):
-        plocs, itlocs = np.array(plocs), np.array(tlocs)
-
-        # Evaluate the initial guesses
-        iplocs = np.einsum('ij,jik->ik', sbasis.nodal_basis_at(itlocs), spts)
-
-        # Iterates
-        kplocs, ktlocs = iplocs.copy(), itlocs.copy()
-
-        # Apply three iterations of Newton's method
-        for k in range(3):
-            jac_ops = sbasis.jac_nodal_basis_at(ktlocs)
-
-            A = np.einsum('ijk,jkl->kli', jac_ops, spts)
-            b = kplocs - plocs
-            ktlocs -= np.linalg.solve(A, b[..., None]).squeeze()
-
-            ops = sbasis.nodal_basis_at(ktlocs)
-            np.einsum('ij,jik->ik', ops, spts, out=kplocs)
-
-        # Compute the initial and final distances from the target location
-        idists = np.linalg.norm(plocs - iplocs, axis=1)
-        kdists = np.linalg.norm(plocs - kplocs, axis=1)
-
-        # Replace any points which failed to converge with their initial guesses
-        closer = np.where(idists < kdists)
-        ktlocs[closer] = itlocs[closer]
-        kplocs[closer] = iplocs[closer]
-
-        return ktlocs, kplocs
-    
     def prepare(self, t):
-        """Called each timestep"""
-        # Only sample if enough time has elapsed
-        if t - self._last_sample_time >= self.samp_dt:
-            # Get solution values at sample points
-            solns = self.intg.soln
-            samples = [op @ solns[et][:, :, ei] for et, ei, _, op in self._ourpts]
+        # Get RL plugin
+        rl_plugin = next((p for p in self.intg.plugins 
+                            if p.name == 'reinforcementlearning'), None)
             
-            # Convert to primitive variables
-            samples = np.array(samples)
-            if samples.size:
-                samples = self.intg.system.elementscls.con_to_pri(samples.T, self.cfg)
-                samples = np.array(samples).T
-
-            # Print sampled values
-            comm, rank, root = get_comm_rank_root()
-            if rank == root:
-                print(f"t={t:.3f}, Sampled values:", samples)
-
-            # Update last sample time
-            self._last_sample_time = t
-
-            # Update neural network parameters based on observations
+        if rl_plugin:
+            # Update neural network parameters from RL plugin's control signal 
             nn_params = self.nn_params.get()
-            nn_params[0][0] = self._compute_control(samples)
+            nn_params[0][0] = nn_params[0][0] + 0.01*(rl_plugin.control_signal.item()-nn_params[0][0]) # need to change this for variable time-step size
+            #print(f"Neural network parameters updated to: {nn_params[0][0]} at time {t}")
             self.nn_params.set(nn_params)
-
-    def _compute_control(self, observations):
-        """Compute control action based on observations"""
-        # TODO: Implement RL-based control
-        return 0.09  # Default value for now
 

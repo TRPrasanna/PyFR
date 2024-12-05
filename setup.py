@@ -64,7 +64,8 @@ modules = [
     'pyfr.solvers.navstokes',
     'pyfr.solvers.navstokes.kernels',
     'pyfr.solvers.navstokes.kernels.bcs',
-    'pyfr.writers'
+    'pyfr.writers',
+    'pyfr.rl'
 ]
 
 # Tests
@@ -115,7 +116,11 @@ install_requires = [
     'numpy >= 1.26.4',
     'platformdirs >= 2.2.0',
     'pytools >= 2016.2.1',
-    'rtree >= 1.0.1'
+    'rtree >= 1.0.1',
+    'torch >= 2.5.1',
+    'torchrl >= 0.6.0',
+    'tensordict >= 0.6.2',
+    'tqdm >= 4.67.0'
 ]
 
 # Soft dependencies
@@ -125,7 +130,8 @@ extras_require = {
 
 # Scripts
 console_scripts = [
-    'pyfr = pyfr.__main__:main'
+    'pyfr = pyfr.__main__:main',
+    'pyfr-rl = pyfr.rl.cli:main'
 ]
 
 # Info
