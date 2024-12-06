@@ -12,8 +12,9 @@ from typing import Optional
 class PyFREnvironment(EnvBase):
     """PyFR environment compatible with TorchRL."""
     
-    def __init__(self, mesh_file, cfg_file, backend_name):
-        device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu') # change to run RL portion on CPU
+    def __init__(self, mesh_file, cfg_file, backend_name, restart_soln=None):
+        #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
+        device = torch.device('cpu')
         super().__init__(device=device)
 
         # Load mesh and config once
@@ -24,6 +25,7 @@ class PyFREnvironment(EnvBase):
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)
 
         # Initialize the solver and other components
+        self.restart_soln = restart_soln
         self._init_solver()
 
         # Get observation size from RL plugin
@@ -72,7 +74,7 @@ class PyFREnvironment(EnvBase):
 
     def _init_solver(self):
         self.solver = get_solver(self.backend, self.rallocs, self.mesh, 
-                               initsoln=None, cfg=self.cfg)
+                               initsoln=self.restart_soln, cfg=self.cfg)
         self.rl_plugin = next(p for p in self.solver.plugins 
                             if p.name == 'reinforcementlearning')
         self.action_interval = self.rl_plugin.action_interval
@@ -101,10 +103,12 @@ class PyFREnvironment(EnvBase):
         # Set the action in the RL plugin
         self.rl_plugin.set_action(action.item())
         # Advance the solver to the next action time
-        t_end = self.next_action_time
-        while self.solver.tcurr < t_end:
-            self.solver.advance_to(self.solver.tcurr + self.solver._dt)
-            self.current_time = self.solver.tcurr
+        #t_end = self.next_action_time
+        #while self.solver.tcurr < t_end:
+        #    self.solver.advance_to(self.solver.tcurr + self.solver._dt)
+        #    self.current_time = self.solver.tcurr
+        self.solver.advance_to(self.next_action_time)
+        self.current_time = self.solver.tcurr
         # Update the next action time
         self.next_action_time += self.action_interval
         # Get observation and reward

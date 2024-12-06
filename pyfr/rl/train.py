@@ -7,15 +7,45 @@ from torchrl.collectors import SyncDataCollector
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torchrl.envs.utils import ExplorationType, set_exploration_type
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
 from torchrl.envs.utils import check_env_specs, step_mdp
 import os
+from tensordict.tensordict import TensorDict
+from typing import Dict, Optional
+import numpy as np
 
-def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints'):
-    # Device setup
-    device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
+class ReplayBuffer:
+    """Replay buffer implementation using TensorDict."""
     
+    def __init__(self, capacity: int, device: torch.device):
+        self.capacity = capacity
+        self.device = device
+        self.buffer = []
+        self.position = 0
+        
+    def push(self, tensordict: TensorDict):
+        """Add a new experience to buffer."""
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = tensordict.clone()
+        self.position = (self.position + 1) % self.capacity
+        
+    def sample(self, batch_size: int) -> Optional[TensorDict]:
+        """Sample a batch of experiences."""
+        if len(self.buffer) < batch_size:
+            return None
+        samples = random.sample(self.buffer, batch_size)
+        return torch.stack(samples, dim=0).to(self.device)
+        
+    def __len__(self):
+        return len(self.buffer)
+
+def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', restart_soln=None):
+    # Device setup
+    #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
+    device = torch.device('cpu')
+                          
     # Hyperparameters
     num_cells = 512  # Hidden layer size
     num_cells_critic = 32  # Hidden layer size for critic
@@ -29,14 +59,17 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints')
     lr = 1e-3 #3e-4
     max_grad_norm = 1.0
 
+    # Add replay buffer parameters
+    buffer_size = 10000
+    batch_size = 80
+    min_buffer_size = 800  # Min experiences before training
+
+    # Initialize replay buffer
+    replay_buffer = ReplayBuffer(buffer_size, device)
+
     # Initialize environment
-    env = PyFREnvironment(mesh_file, cfg_file, backend_name)
+    env = PyFREnvironment(mesh_file, cfg_file, backend_name, restart_soln)
     #check_env_specs(env)
-    #td = env.rand_step()
-    #print("random step tensordict", td)
-    #rollout = env.rollout(3)
-    #print("rollout of three steps:", rollout)
-    #print("Shape of the rollout TensorDict:", rollout.batch_size)
     
      # Actor network with proper output handling
     actor_net = nn.Sequential(
@@ -53,15 +86,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints')
         in_keys=["observation"],
         out_keys=["loc", "scale"]  # NormalParamExtractor splits into these
     ).to(device)
-
-    class ScaledTanhNormal(TanhNormal): # this is probably wrong because of log probabilities
-        def __init__(self, loc, scale):
-            super().__init__(loc, scale)
-            self.output_scale = 0.06  # Scale factor to get [-0.1, 0.1]
-        
-        def rsample(self, sample_shape=torch.Size()):
-            x = super().rsample(sample_shape)
-            return x * self.output_scale
     
     policy = ProbabilisticActor(
         module=actor_module,
@@ -122,33 +146,42 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints')
     best_model_path = os.path.join(checkpoint_dir, 'best_model.pt')
 
     # Training loop
-    logs = defaultdict(list)
     total_episodes = total_frames // frames_per_batch
-    pbar = tqdm(total=total_episodes, desc="Training Progress")
+    pbar = tqdm(total=total_episodes, desc="Training")
     episode_count = 0
 
     for i, tensordict_data in enumerate(collector):
-        for _ in range(num_epochs):
-            advantage_module(tensordict_data)
-            data_view = tensordict_data.reshape(-1)
-            
-            # Single mini-batch per update
-            mini_batch = data_view
-            loss_vals = loss_module(mini_batch)
-            loss_value = (
-                loss_vals["loss_objective"] + 
-                loss_vals["loss_critic"] + 
-                loss_vals["loss_entropy"]
-            )
+        # Add experiences to replay buffer
+        replay_buffer.push(tensordict_data)
+        
+        # Only train if we have enough samples
+        if len(replay_buffer) >= min_buffer_size:
+            for _ in range(num_epochs):
+                # Sample from replay buffer
+                batch = replay_buffer.sample(batch_size)
+                if batch is None:
+                    continue
+                    
+                # Calculate advantages
+                advantage_module(batch)
+                data_view = batch.reshape(-1)
+                
+                # Training step
+                loss_vals = loss_module(data_view)
+                loss_value = (
+                    loss_vals["loss_objective"] + 
+                    loss_vals["loss_critic"] + 
+                    loss_vals["loss_entropy"]
+                )
 
-            loss_value.backward()
-            torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
-            optim.step()
-            optim.zero_grad()
+                loss_value.backward()
+                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
+                optim.step()
+                optim.zero_grad()
 
         # Get episode reward
         mean_reward = tensordict_data["next", "reward"].mean().item()
-        logs["reward"].append(mean_reward)
+        #logs["reward"].append(mean_reward)
 
         # Save checkpoint periodically
         # if episode_count % 10 == 0:
@@ -163,6 +196,10 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints')
             
         # Update episode count and progress bar
         episode_count += 1
+        pbar.set_postfix({
+            "reward": f"{mean_reward:.2f}",
+            "best": f"{best_reward:.2f}"
+        })
         pbar.update(1)
         
         # Save best model
@@ -176,11 +213,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints')
                 'episode': episode_count,
             }, best_model_path)
 
-        pbar.set_description(
-            f"Episode {episode_count}/{total_episodes} | "
-            f"Reward: {mean_reward:.4f} (Best: {best_reward:.4f})"
-        )
-
     collector.shutdown()
     env.close()
-    return logs
+    #return logs

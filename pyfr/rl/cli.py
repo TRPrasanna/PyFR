@@ -37,6 +37,7 @@ def main():
     ap_train.add_argument('cfg', type=FileType('r'), help='config file')
     ap_train.add_argument('--checkpoint-dir', default='checkpoints',
                          help='directory to save checkpoints')
+    ap_train.add_argument('--restart', help='restart solution file')
     ap_train.set_defaults(process=process_train)
 
     # Add backend argument
@@ -50,6 +51,7 @@ def main():
     ap_eval.add_argument('cfg', type=FileType('r'), help='config file')
     ap_eval.add_argument('--model-path', required=True, help='path to model checkpoint')
     ap_eval.add_argument('--episodes', type=int, default=10, help='number of evaluation episodes')
+    ap_eval.add_argument('--restart', help='restart solution file')
     ap_eval.add_argument('--backend', '-b', choices=backends, required=True)
     ap_eval.set_defaults(process=process_evaluate)
 
@@ -66,6 +68,16 @@ def process_train(args):
     # Manually initialise MPI
     init_mpi()
 
+    # Load restart solution if provided
+    restart_soln = None
+    if args.restart:
+        restart_soln = NativeReader(args.restart)
+        mesh = NativeReader(args.mesh)
+        
+        # Verify mesh UUID matches
+        if restart_soln['mesh_uuid'] != mesh['mesh_uuid']:
+            raise RuntimeError('Restart solution does not match mesh.')
+
     print(f"Starting training with checkpoint dir: {args.checkpoint_dir}")
     from .train import train_agent
 
@@ -73,18 +85,30 @@ def process_train(args):
         mesh_file=args.mesh,
         cfg_file=args.cfg,
         backend_name=args.backend,
-        checkpoint_dir=args.checkpoint_dir
+        checkpoint_dir=args.checkpoint_dir,
+        restart_soln=restart_soln
     )
 
 def process_evaluate(args):
     init_mpi()
     
+    # Load restart solution if provided 
+    restart_soln = None
+    if args.restart:
+        restart_soln = NativeReader(args.restart)
+        mesh = NativeReader(args.mesh)
+        
+        if restart_soln['mesh_uuid'] != mesh['mesh_uuid']:
+            raise RuntimeError('Restart solution does not match mesh.')
+            
     from .train import evaluate_policy
     from .env import PyFREnvironment
     
-    env = PyFREnvironment(args.mesh, args.cfg, args.backend)
+    env = PyFREnvironment(
+        args.mesh,
+        args.cfg,
+        args.backend,
+        restart_soln=restart_soln
+    )
     evaluate_policy(env, args.model_path, args.episodes)
     env.close()
-
-if __name__ == '__main__':
-    main()

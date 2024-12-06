@@ -15,8 +15,8 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
     
     def __init__(self, intg, cfgsect, suffix=None):
         super().__init__(intg, cfgsect, suffix)
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+        #self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = torch.device('cpu')
         # Get sampling points configuration
         self.pts = self.cfg.getliteral(cfgsect, 'probe-pts')
         self.fmt = self.cfg.get(cfgsect, 'format', 'primitive')
@@ -94,6 +94,15 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             if self._viscous:
                 self._rcpjact = {k: rcpjact[k[0]][..., v] 
                                 for k, v in self._eidxs.items()}
+
+        # Add averaging window parameter
+        self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
+        print(f"Using averaging window of {self.avg_window} seconds for reward")
+        
+        # Initialize force history buffers
+        self.force_times = []
+        self.drag_history = []  # x-component
+        self.lift_history = []  # y-component
 
     def __call__(self, intg):
         # Update observations and rewards at action times
@@ -266,9 +275,32 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         else:
             comm.Reduce(mpi.IN_PLACE, fm, op=mpi.SUM, root=root)
             
-        # Return negative drag (x-component)
-        drag = -(fm[0, 0] + (fm[1, 0] if self._viscous else 0))
-        return float(drag)
+        # Current time
+        t = solver.tcurr
+        
+        # Total forces (pressure + viscous)
+        drag = (fm[0, 0] + (fm[1, 0] if self._viscous else 0)) * 2 # multiplying by to make it Cd
+        lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0)) * 2
+        
+        # Update history
+        self.force_times.append(t)
+        self.drag_history.append(drag)
+        self.lift_history.append(lift)
+        
+        # Remove old data outside window # check this
+        while self.force_times[0] < t - self.avg_window:
+            self.force_times.pop(0)
+            self.drag_history.pop(0)
+            self.lift_history.pop(0)
+            
+        # Calculate sliding averages
+        avg_drag = np.mean(self.drag_history)
+        avg_lift = np.mean(self.lift_history)
+        
+        # Combined reward: -0.8*<C_d> - 0.2*|<C_l>|
+        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
+        
+        return float(reward)
         
 
     def reset(self):
