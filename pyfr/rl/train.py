@@ -47,11 +47,14 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     device = torch.device('cpu')
                           
     # Hyperparameters
-    num_cells = 512  # Hidden layer size
-    num_cells_critic = 32  # Hidden layer size for critic
-    frames_per_batch = 930  # 10 episodes, 93 frames per episode
-    total_frames = 93 * 400 # Total number of actions across all episodes (400 episodes)
-    num_epochs = 25         # optimization steps per batch?
+    num_cells_policy = 512  # Hidden layer size
+    num_cells_value = 32  # Hidden layer size for value network
+    episodes = 800
+    actions_per_episode = 93
+    episodes_per_batch = 10
+    frames_per_batch = actions_per_episode * episodes_per_batch  # 10 episodes, 93 frames per episode
+    total_frames = actions_per_episode * episodes  # 93 actions per episode, 400 episodes
+    num_epochs = 25         # optimization steps per batch
     clip_epsilon = 0.2
     gamma = 0.99
     lmbda = 0.97 #0.95
@@ -73,11 +76,11 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     
      # Actor network with proper output handling
     actor_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0], num_cells),
+        nn.Linear(env.observation_spec["observation"].shape[0], num_cells_policy),
         nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
-        nn.Linear(num_cells, num_cells),
+        nn.Linear(num_cells_policy, num_cells_policy),
         nn.Tanh(),
-        nn.Linear(num_cells, 2),  # 2 outputs: mean and log_std
+        nn.Linear(num_cells_policy, 2),  # 2 outputs: mean and log_std
         NormalParamExtractor()  # Use default scale_mapping
     ).to(device)
 
@@ -98,11 +101,11 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     # Value network (critic)
     value_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0], num_cells_critic),
+        nn.Linear(env.observation_spec["observation"].shape[0], num_cells_value),
         nn.Tanh(),
-        nn.Linear(num_cells_critic, num_cells_critic),
+        nn.Linear(num_cells_value, num_cells_value),
         nn.Tanh(),
-        nn.Linear(num_cells_critic, 1)
+        nn.Linear(num_cells_value, 1)
     ).to(device)
 
     value_module = ValueOperator(
@@ -146,8 +149,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     best_model_path = os.path.join(checkpoint_dir, 'best_model.pt')
 
     # Training loop
-    total_episodes = total_frames // frames_per_batch
-    pbar = tqdm(total=total_episodes, desc="Training")
+    pbar = tqdm(total=episodes, desc="Training")
     episode_count = 0
 
     for tensordict_data in collector:
@@ -172,12 +174,12 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         mean_reward = tensordict_data["next", "reward"].mean().item()
         
         # Update progress
-        episode_count += 1
+        episode_count += episodes_per_batch
         pbar.set_postfix({
             "reward": f"{mean_reward:.2f}",
             "best": f"{best_reward:.2f}"
         })
-        pbar.update(1)
+        pbar.update(episodes_per_batch)
         
         # Save best model
         if mean_reward > best_reward:
