@@ -98,7 +98,7 @@ class PyFREnvironment(EnvBase):
 
     def _step(self, tensordict):
         action = tensordict['action']
-        print(f"Step called with action: {0.09*action.item()}")
+        #print(f"Step called with action: {0.09*action.item()}")
         
         # Set the action in the RL plugin
         self.rl_plugin.set_action(action.item())

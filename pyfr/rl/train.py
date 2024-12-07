@@ -15,7 +15,7 @@ from tensordict.tensordict import TensorDict
 from typing import Dict, Optional
 import numpy as np
 
-class ReplayBuffer:
+class ReplayBuffer: # will not use for now, PPO usually doesn't use replay buffer
     """Replay buffer implementation using TensorDict."""
     
     def __init__(self, capacity: int, device: torch.device):
@@ -49,8 +49,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # Hyperparameters
     num_cells = 512  # Hidden layer size
     num_cells_critic = 32  # Hidden layer size for critic
-    frames_per_batch = 80  # 80 actions per batch (and per episode?)
-    total_frames = frames_per_batch * 400 # Total number of actions across all episodes (400 episodes)
+    frames_per_batch = 930  # 10 episodes, 93 frames per episode
+    total_frames = 93 * 400 # Total number of actions across all episodes (400 episodes)
     num_epochs = 25         # optimization steps per batch?
     clip_epsilon = 0.2
     gamma = 0.99
@@ -60,12 +60,12 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     max_grad_norm = 1.0
 
     # Add replay buffer parameters
-    buffer_size = 10000
-    batch_size = 80
-    min_buffer_size = 800  # Min experiences before training
+    #buffer_size = 10000
+    #batch_size = 80
+    #min_buffer_size = 800  # Min experiences before training
 
     # Initialize replay buffer
-    replay_buffer = ReplayBuffer(buffer_size, device)
+    # replay_buffer = ReplayBuffer(buffer_size, device)
 
     # Initialize environment
     env = PyFREnvironment(mesh_file, cfg_file, backend_name, restart_soln)
@@ -74,7 +74,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
      # Actor network with proper output handling
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], num_cells),
-        nn.Tanh(),
+        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
         nn.Linear(num_cells, num_cells),
         nn.Tanh(),
         nn.Linear(num_cells, 2),  # 2 outputs: mean and log_std
@@ -150,51 +150,28 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     pbar = tqdm(total=total_episodes, desc="Training")
     episode_count = 0
 
-    for i, tensordict_data in enumerate(collector):
-        # Add experiences to replay buffer
-        replay_buffer.push(tensordict_data)
-        
-        # Only train if we have enough samples
-        if len(replay_buffer) >= min_buffer_size:
-            for _ in range(num_epochs):
-                # Sample from replay buffer
-                batch = replay_buffer.sample(batch_size)
-                if batch is None:
-                    continue
-                    
-                # Calculate advantages
-                advantage_module(batch)
-                data_view = batch.reshape(-1)
-                
-                # Training step
-                loss_vals = loss_module(data_view)
-                loss_value = (
-                    loss_vals["loss_objective"] + 
-                    loss_vals["loss_critic"] + 
-                    loss_vals["loss_entropy"]
-                )
+    for tensordict_data in collector:
+        # PPO update loop
+        for _ in range(num_epochs):
+            advantage_module(tensordict_data)
+            data_view = tensordict_data.reshape(-1)
+            
+            loss_vals = loss_module(data_view)
+            loss_value = (
+                loss_vals["loss_objective"] + 
+                loss_vals["loss_critic"] + 
+                loss_vals["loss_entropy"]
+            )
 
-                loss_value.backward()
-                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
-                optim.step()
-                optim.zero_grad()
+            loss_value.backward()
+            torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
+            optim.step()
+            optim.zero_grad()
 
         # Get episode reward
         mean_reward = tensordict_data["next", "reward"].mean().item()
-        #logs["reward"].append(mean_reward)
-
-        # Save checkpoint periodically
-        # if episode_count % 10 == 0:
-        #     checkpoint = {
-        #         'policy_state_dict': policy.state_dict(),
-        #         'value_state_dict': value_module.state_dict(),
-        #         'optimizer_state_dict': optim.state_dict(),
-        #         'episode': episode_count,
-        #         'mean_reward': mean_reward,
-        #     }
-        #     torch.save(checkpoint, f"{checkpoint_dir}/checkpoint_{episode_count}.pt")
-            
-        # Update episode count and progress bar
+        
+        # Update progress
         episode_count += 1
         pbar.set_postfix({
             "reward": f"{mean_reward:.2f}",
@@ -215,4 +192,3 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     collector.shutdown()
     env.close()
-    #return logs

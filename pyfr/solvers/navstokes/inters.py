@@ -236,15 +236,23 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
         self._set_external('nn_params', 'broadcast fpdtype_t[1][2]', 
                          value=self.nn_params)
 
-    def prepare(self, t):
-        # Get RL plugin
-        rl_plugin = next((p for p in self.intg.plugins 
-                            if p.name == 'reinforcementlearning'), None)
-            
-        if rl_plugin:
-            # Update neural network parameters from RL plugin's control signal 
-            nn_params = self.nn_params.get()
-            nn_params[0][0] = nn_params[0][0] + 0.01*(rl_plugin.control_signal.item()-nn_params[0][0]) # need to change this for variable time-step size
-            #print(f"Neural network parameters updated to: {nn_params[0][0]} at time {t}")
-            self.nn_params.set(nn_params)
+        # Initial value
+        nn_params = self.nn_params.get()
+        nn_params[0][0] = 0.0
+        self.nn_params.set(nn_params)
 
+        # Flag for initialization
+        self._initialized = False
+
+    def prepare(self, t):
+        # Initialize plugin reference on first prepare call
+        if not self._initialized:
+            self.rl_plugin = next((p for p in self.intg.plugins 
+                                if p.name == 'reinforcementlearning'), None)
+            self._initialized = True
+
+        # Update parameters if plugin is available
+        if hasattr(self, 'rl_plugin') and self.rl_plugin:
+            nn_params = self.nn_params.get()
+            nn_params[0][0] = nn_params[0][0] + self.intg._dt/5e-2*(self.rl_plugin.control_signal.item()-nn_params[0][0])
+            self.nn_params.set(nn_params)
