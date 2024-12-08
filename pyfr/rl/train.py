@@ -191,7 +191,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         # Logging
         mean_reward = tensordict_data["next", "reward"].mean().item()
         logs["reward"].append(mean_reward)
-        logs["step_count"].append(tensordict_data["step_count"].max().item())
+        #logs["step_count"].append(tensordict_data["step_count"].max().item())
         logs["lr"].append(optim.param_groups[0]["lr"])
 
         # Progress updates
