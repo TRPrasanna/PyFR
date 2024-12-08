@@ -28,6 +28,8 @@ class PyFREnvironment(EnvBase):
         self.restart_soln = restart_soln
         self._init_solver()
 
+        self.tend = self.cfg.getfloat('solver-time-integrator', 'tend')
+
         # Get observation size from RL plugin
         obs_size = self.rl_plugin.observation_size
         print(f"Observation size: {obs_size}")
@@ -107,14 +109,25 @@ class PyFREnvironment(EnvBase):
         #while self.solver.tcurr < t_end:
         #    self.solver.advance_to(self.solver.tcurr + self.solver._dt)
         #    self.current_time = self.solver.tcurr
-        self.solver.advance_to(self.next_action_time)
+        try:
+            self.solver.advance_to(self.next_action_time)
+            crashed = False
+        except RuntimeError as e:
+            print(f"Will reset because PyFR solver crashed. Reason: {str(e)}")
+            crashed = True
+
         self.current_time = self.solver.tcurr
         # Update the next action time
         self.next_action_time += self.action_interval
         # Get observation and reward
         observation = self._get_observation()
-        reward = self._compute_reward()
-        done = self._check_done()
+        reward = -1000.0 if crashed else self._compute_reward()  # Large penalty for crashes
+
+
+        # Time limit vs crash handling
+        done = crashed or self.current_time >= self.tend
+        terminated = crashed  # Natural end due to failure
+        truncated = not crashed and self.current_time >= self.tend  # Artificial end due to time
 
         #print observation
         #print(f"Observation: {observation}")
@@ -122,8 +135,8 @@ class PyFREnvironment(EnvBase):
             'observation': observation,
             'reward': torch.tensor([reward], device=self.device),
             'done': torch.tensor([done], device=self.device, dtype=torch.bool),
-            'terminated': torch.tensor([done], device=self.device, dtype=torch.bool),
-            'truncated': torch.tensor([False], device=self.device, dtype=torch.bool),
+            'terminated': torch.tensor([terminated], device=self.device, dtype=torch.bool),
+            'truncated': torch.tensor([truncated], device=self.device, dtype=torch.bool),
         }, batch_size=torch.Size([]))
 
     def _get_observation(self):
@@ -141,7 +154,7 @@ class PyFREnvironment(EnvBase):
         reward = self.rl_plugin._get_reward(self.solver)
         return reward
 
-    def _check_done(self):
+    def _check_done(self): # not used now
         # Implement your termination condition
         max_time = self.cfg.getfloat('solver-time-integrator', 'tend')
         return self.current_time >= max_time

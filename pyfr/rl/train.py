@@ -25,13 +25,13 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # Device setup
     #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
     device = torch.device('cpu')
-                          
+                    
     # Hyperparameters
     num_cells_policy = 512  # Hidden layer size
     num_cells_value = 32  # Hidden layer size for value network
     episodes = 800
     actions_per_episode = 93
-    episodes_per_batch = 1
+    episodes_per_batch = 20
     frames_per_batch = actions_per_episode * episodes_per_batch
     total_frames = actions_per_episode * episodes  # 93 actions per episode, 400 episodes
     sub_batch_size = round(0.2 * frames_per_batch) # 20% of frames per batch
@@ -55,7 +55,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             StepCounter(),
         ),
     )
-    
+
     env.transform[0].init_stats(num_iter=actions_per_episode, reduce_dim=0, cat_dim=0)
     print("Finished gathering stats for observation normalization")
 
@@ -74,7 +74,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         in_keys=["observation"],
         out_keys=["loc", "scale"]  # NormalParamExtractor splits into these
     ).to(device)
-    
+
     policy = ProbabilisticActor(
         module=actor_module,
         spec=env.action_spec,
@@ -125,7 +125,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optim, total_frames // frames_per_batch, 0.0
     )
-    
+
     # Data collection
     collector = SyncDataCollector(
         env,
@@ -172,7 +172,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             advantage_module(tensordict_data)
             data_view = tensordict_data.reshape(-1)
             replay_buffer.extend(data_view.cpu())
-            
+
             # Sub-batch updates
             for _ in range(frames_per_batch // sub_batch_size):
                 subdata = replay_buffer.sample(sub_batch_size)
