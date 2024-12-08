@@ -64,14 +64,33 @@ class PyFREnvironment(EnvBase):
             shape=torch.Size([])
         )
 
+        # Done specifications
         self.full_done_spec = Composite(
             {
-                "done": Categorical(n=2, shape=(1,), dtype=torch.bool, device=self.device),
+                # Generic done flag (legacy)
+                "done": Categorical(
+                    n=2, 
+                    shape=(1,), 
+                    dtype=torch.bool, 
+                    device=self.device
+                ),
+                # Natural termination (crashes, divergence)
+                "terminated": Categorical(
+                    n=2, 
+                    shape=(1,), 
+                    dtype=torch.bool, 
+                    device=self.device
+                ),
+                # Time limit reached
+                "truncated": Categorical(
+                    n=2, 
+                    shape=(1,), 
+                    dtype=torch.bool, 
+                    device=self.device
+                ),
             },
             shape=torch.Size([])
         )
-        self.full_done_spec["terminated"] = self.full_done_spec["done"].clone()
-        self.full_done_spec["truncated"] = self.full_done_spec["done"].clone()
         print("Environment initialized.")
 
     def _init_solver(self):
@@ -112,25 +131,24 @@ class PyFREnvironment(EnvBase):
         try:
             self.solver.advance_to(self.next_action_time)
             crashed = False
+            # Normal reward computation
+            reward = self._compute_reward()
+            observation = self._get_observation()
         except RuntimeError as e:
-            print(f"Will reset because PyFR solver crashed. Reason: {str(e)}")
+            print(f"Solver crashed: {str(e)}. Resetting...")
             crashed = True
+            # Return neutral state with zero reward
+            observation = self.observation_spec.zero(torch.Size([]))["observation"]
+            reward = -10.0
 
         self.current_time = self.solver.tcurr
         # Update the next action time
         self.next_action_time += self.action_interval
-        # Get observation and reward
-        observation = self._get_observation()
-        reward = -1000.0 if crashed else self._compute_reward()  # Large penalty for crashes
 
-
-        # Time limit vs crash handling
         done = crashed or self.current_time >= self.tend
-        terminated = crashed  # Natural end due to failure
-        truncated = not crashed and self.current_time >= self.tend  # Artificial end due to time
+        terminated = crashed  
+        truncated = not crashed and self.current_time >= self.tend
 
-        #print observation
-        #print(f"Observation: {observation}")
         return TensorDict({
             'observation': observation,
             'reward': torch.tensor([reward], device=self.device),
