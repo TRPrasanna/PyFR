@@ -8,14 +8,18 @@ from torchrl.collectors import SyncDataCollector
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 
-def evaluate_policy(env, model_path, num_episodes=10):
-    """Evaluate trained policy"""
+def evaluate_policy(env, model_path, num_episodes=1):
+    """Evaluate trained policy for same duration as training episode"""
     device = env.device
     
-    # Load best model
-    checkpoint = torch.load(model_path, map_location=device)
+    # Get timing parameters from config
+    tend = env.cfg.getfloat('solver-time-integrator', 'tend')
+    tstart = env.cfg.getfloat('solver-time-integrator', 'tstart', 0.0)
+    simulation_time = tend - tstart
     
-    # Recreate policy network
+    # Load and setup policy
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], 512),
         nn.Tanh(),
@@ -40,31 +44,36 @@ def evaluate_policy(env, model_path, num_episodes=10):
         safe=True
     ).to(device)
     
-    # Load weights
     policy.load_state_dict(checkpoint['policy_state_dict'])
     policy.eval()
     
-    # Evaluation loop
-    rewards = []
     with torch.no_grad():
-        for ep in tqdm(range(num_episodes), desc="Evaluating"):
+        try:
+            print(f"Starting evaluation for {simulation_time} time units...")
             state = env.reset()
-            episode_reward = 0
+            total_reward = 0
+            step = 0
             
-            done = False
-            while not done:
-                action = policy.act(state, deterministic=True)
-                state = env.step(action)
-                reward = state["reward"].item()
-                episode_reward += reward
-                done = state["done"].item()
+            while env.current_time < tend:
+                policy_output = policy(state)
+                next_state = env.step(policy_output)
+                reward = next_state["next", "reward"].item()
+                total_reward += reward
                 
-            rewards.append(episode_reward)
-            print(f"Episode {ep+1}: Reward = {episode_reward:.4f}")
-    
-    mean_reward = np.mean(rewards)
-    std_reward = np.std(rewards)
-    print(f"\nEvaluation over {num_episodes} episodes:")
-    print(f"Mean reward: {mean_reward:.4f} ± {std_reward:.4f}")
-    
-    return mean_reward, std_reward
+                if step % 10 == 0:
+                    action = policy_output["action"].item()
+                    print(f"Time {env.current_time:.3f}: Action = {action:.3f}, Reward = {reward:.3f}")
+                    #print(next_state["next", "observation"])
+                
+                state = next_state
+                step += 1
+            
+            print(f"\nSimulation completed:")
+            print(f"End time: {env.current_time:.3f}")
+            print(f"Total steps: {step}")
+            print(f"Final reward: {total_reward:.4f}")
+            return total_reward, None
+            
+        except RuntimeError as e:
+            print(f"Simulation failed: {str(e)}")
+            return None, None

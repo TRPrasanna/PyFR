@@ -2,44 +2,24 @@ import torch
 from torch import nn
 from collections import defaultdict
 from tensordict.nn import TensorDictModule
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, TruncatedNormal
+from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
+from torchrl.envs import (
+    Compose,
+    DoubleToFloat,
+    ObservationNorm,
+    StepCounter,
+    TransformedEnv,
+)
 from torchrl.collectors import SyncDataCollector
+from torchrl.data.replay_buffers import ReplayBuffer
+from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
+from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
-from torchrl.envs.utils import ExplorationType, set_exploration_type
 from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
-from torchrl.envs.utils import check_env_specs, step_mdp
+#from torchrl.envs.utils import check_env_specs
 import os
-from tensordict.tensordict import TensorDict
-from typing import Dict, Optional
-import numpy as np
-
-class ReplayBuffer: # will not use for now, PPO usually doesn't use replay buffer
-    """Replay buffer implementation using TensorDict."""
-    
-    def __init__(self, capacity: int, device: torch.device):
-        self.capacity = capacity
-        self.device = device
-        self.buffer = []
-        self.position = 0
-        
-    def push(self, tensordict: TensorDict):
-        """Add a new experience to buffer."""
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = tensordict.clone()
-        self.position = (self.position + 1) % self.capacity
-        
-    def sample(self, batch_size: int) -> Optional[TensorDict]:
-        """Sample a batch of experiences."""
-        if len(self.buffer) < batch_size:
-            return None
-        samples = random.sample(self.buffer, batch_size)
-        return torch.stack(samples, dim=0).to(self.device)
-        
-    def __len__(self):
-        return len(self.buffer)
 
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', restart_soln=None):
     # Device setup
@@ -52,8 +32,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     episodes = 800
     actions_per_episode = 93
     episodes_per_batch = 1
-    frames_per_batch = actions_per_episode * episodes_per_batch  # 10 episodes, 93 frames per episode
+    frames_per_batch = actions_per_episode * episodes_per_batch
     total_frames = actions_per_episode * episodes  # 93 actions per episode, 400 episodes
+    sub_batch_size = round(0.2 * frames_per_batch) # 20% of frames per batch
     num_epochs = 25         # optimization steps per batch
     clip_epsilon = 0.2
     gamma = 0.99
@@ -62,18 +43,22 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     lr = 1e-3 #3e-4
     max_grad_norm = 1.0
 
-    # Add replay buffer parameters
-    #buffer_size = 10000
-    #batch_size = 80
-    #min_buffer_size = 800  # Min experiences before training
-
-    # Initialize replay buffer
-    # replay_buffer = ReplayBuffer(buffer_size, device)
-
     # Initialize environment
-    env = PyFREnvironment(mesh_file, cfg_file, backend_name, restart_soln)
+    base_env = PyFREnvironment(mesh_file, cfg_file, backend_name, restart_soln)
     #check_env_specs(env)
+    env = TransformedEnv(
+        base_env,
+        Compose(
+            # normalize observations
+            ObservationNorm(in_keys=["observation"]),
+            #DoubleToFloat(), # will need this when using PyFR in double precision mode
+            StepCounter(),
+        ),
+    )
     
+    env.transform[0].init_stats(num_iter=actions_per_episode, reduce_dim=0, cat_dim=0)
+    print("Finished gathering stats for observation normalization")
+
      # Actor network with proper output handling
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], num_cells_policy),
@@ -96,6 +81,10 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
         return_log_prob=True,
+        distribution_kwargs={
+        "low": env.action_spec.space.low,
+        "high": env.action_spec.space.high,
+        },
         #safe = True
     ).to(device)
 
@@ -128,10 +117,14 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         entropy_bonus=bool(entropy_eps),
         entropy_coef=entropy_eps,
         critic_coef=1.0,
+        loss_critic_type="smooth_l1",
     )
 
     # Optimizer
-    optim = torch.optim.Adam(loss_module.parameters(), lr=lr)
+    optim = torch.optim.Adam(loss_module.parameters(), lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optim, total_frames // frames_per_batch, 0.0
+    )
     
     # Data collection
     collector = SyncDataCollector(
@@ -143,44 +136,57 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         device=device
     )
 
+    replay_buffer = ReplayBuffer(
+        storage=LazyTensorStorage(max_size=frames_per_batch),
+        sampler=SamplerWithoutReplacement(),
+    )
+
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_reward = float('-inf')
     best_model_path = os.path.join(checkpoint_dir, 'best_model.pt')
-
-    # Training loop
+    logs = defaultdict(list)
     pbar = tqdm(total=episodes, desc="Training")
     episode_count = 0
 
+    # Training loop
     for tensordict_data in collector:
         # PPO update loop
         for _ in range(num_epochs):
             advantage_module(tensordict_data)
             data_view = tensordict_data.reshape(-1)
+            replay_buffer.extend(data_view.cpu())
             
-            loss_vals = loss_module(data_view)
-            loss_value = (
-                loss_vals["loss_objective"] + 
-                loss_vals["loss_critic"] + 
-                loss_vals["loss_entropy"]
-            )
+            # Sub-batch updates
+            for _ in range(frames_per_batch // sub_batch_size):
+                subdata = replay_buffer.sample(sub_batch_size)
+                loss_vals = loss_module(subdata.to(device))
+                loss_value = (
+                    loss_vals["loss_objective"] + 
+                    loss_vals["loss_critic"] + 
+                    loss_vals["loss_entropy"]
+                )
 
-            loss_value.backward()
-            torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
-            optim.step()
-            optim.zero_grad()
+                loss_value.backward()
+                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
+                optim.step()
+                optim.zero_grad()
 
-        # Get episode reward
+        # Logging
         mean_reward = tensordict_data["next", "reward"].mean().item()
-        
-        # Update progress
+        logs["reward"].append(mean_reward)
+        logs["step_count"].append(tensordict_data["step_count"].max().item())
+        logs["lr"].append(optim.param_groups[0]["lr"])
+
+        # Progress updates
         episode_count += episodes_per_batch
         pbar.set_postfix({
             "reward": f"{mean_reward:.2f}",
-            "best": f"{best_reward:.2f}"
+            "best": f"{best_reward:.2f}",
+            "lr": f"{logs['lr'][-1]:.2e}"
         })
-        pbar.update(episodes_per_batch)
-        
+        pbar.update(episodes_per_batch)  # Update per batch
+
         # Save best model
         if mean_reward > best_reward:
             best_reward = mean_reward
@@ -191,6 +197,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 'reward': best_reward,
                 'episode': episode_count,
             }, best_model_path)
+
+        # Update learning rate
+        scheduler.step()
 
     collector.shutdown()
     env.close()

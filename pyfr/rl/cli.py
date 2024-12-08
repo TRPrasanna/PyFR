@@ -101,7 +101,7 @@ def process_evaluate(args):
         if restart_soln['mesh_uuid'] != mesh['mesh_uuid']:
             raise RuntimeError('Restart solution does not match mesh.')
             
-    from .train import evaluate_policy
+    from .evaluate import evaluate_policy
     from .env import PyFREnvironment
     
     env = PyFREnvironment(

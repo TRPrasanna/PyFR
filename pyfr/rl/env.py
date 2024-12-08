@@ -47,8 +47,8 @@ class PyFREnvironment(EnvBase):
 
         self.action_spec = Composite(
             {"action": Bounded(
-                low=torch.tensor(-1.0, device=self.device), # not really, the bounds are scaled in inters.py
-                high=torch.tensor(1.0, device=self.device),
+                low=torch.tensor(-0.09, device=self.device), # not sure if this is the best way
+                high=torch.tensor(0.09, device=self.device),
                 shape=(1,),
                 device=self.device
             )},
@@ -98,7 +98,7 @@ class PyFREnvironment(EnvBase):
 
     def _step(self, tensordict):
         action = tensordict['action']
-        #print(f"Step called with action: {0.09*action.item()}")
+        #print(f"Step called with action: {action.item()}")
         
         # Set the action in the RL plugin
         self.rl_plugin.set_action(action.item())
@@ -116,6 +116,8 @@ class PyFREnvironment(EnvBase):
         reward = self._compute_reward()
         done = self._check_done()
 
+        #print observation
+        #print(f"Observation: {observation}")
         return TensorDict({
             'observation': observation,
             'reward': torch.tensor([reward], device=self.device),
