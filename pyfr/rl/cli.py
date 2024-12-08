@@ -38,6 +38,7 @@ def main():
     ap_train.add_argument('--checkpoint-dir', default='checkpoints',
                          help='directory to save checkpoints')
     ap_train.add_argument('--restart', help='restart solution file')
+    ap_train.add_argument('--load-model', help='load existing model checkpoint to continue training')
     ap_train.set_defaults(process=process_train)
 
     # Add backend argument
@@ -86,7 +87,8 @@ def process_train(args):
         cfg_file=args.cfg,
         backend_name=args.backend,
         checkpoint_dir=args.checkpoint_dir,
-        restart_soln=restart_soln
+        restart_soln=restart_soln,
+        load_model=args.load_model
     )
 
 def process_evaluate(args):

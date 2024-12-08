@@ -21,7 +21,7 @@ from pyfr.rl.env import PyFREnvironment
 #from torchrl.envs.utils import check_env_specs
 import os
 
-def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', restart_soln=None):
+def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', restart_soln=None, load_model=None):
     # Device setup
     #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
     device = torch.device('cpu')
@@ -141,13 +141,29 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         sampler=SamplerWithoutReplacement(),
     )
 
+    # Load existing model if specified
+    best_reward = float('-inf')
+    if load_model and os.path.exists(load_model):
+        checkpoint = torch.load(load_model, map_location=device)
+        policy.load_state_dict(checkpoint['policy_state_dict'])
+        value_module.load_state_dict(checkpoint['value_state_dict'])
+        best_reward = checkpoint['reward']
+        start_episode = checkpoint.get('episode', 0)
+        
+        print("\nLoaded existing model:")
+        print(f"Previous best reward: {best_reward:.4f}")
+        print(f"Previous episode count: {start_episode}")
+        print(f"Model path: {load_model}\n")
+    else:
+        start_episode = 0
+
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
-    best_reward = float('-inf')
     best_model_path = os.path.join(checkpoint_dir, 'best_model.pt')
     logs = defaultdict(list)
-    pbar = tqdm(total=episodes, desc="Training")
-    episode_count = 0
+    remaining_episodes = episodes - start_episode
+    pbar = tqdm(total=remaining_episodes, desc="Training", initial=start_episode)
+    episode_count = start_episode
 
     # Training loop
     for tensordict_data in collector:
