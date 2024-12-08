@@ -44,20 +44,20 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     max_grad_norm = 1.0
 
     # Initialize environment
-    base_env = PyFREnvironment(mesh_file, cfg_file, backend_name, restart_soln)
+    env = PyFREnvironment(mesh_file, cfg_file, backend_name, restart_soln)
     #check_env_specs(env)
-    env = TransformedEnv(
-        base_env,
-        Compose(
-            # normalize observations
-            ObservationNorm(in_keys=["observation"]),
-            #DoubleToFloat(), # will need this when using PyFR in double precision mode
-            StepCounter(),
-        ),
-    )
+    #env = TransformedEnv(
+    #    base_env,
+    #    Compose(
+    #        # normalize observations
+    #        ObservationNorm(in_keys=["observation"]),
+    #        #DoubleToFloat(), # will probably need this when using PyFR in double precision mode
+    #        StepCounter(),
+    #    ),
+    #)
 
-    env.transform[0].init_stats(num_iter=actions_per_episode, reduce_dim=0, cat_dim=0)
-    print("Finished gathering stats for observation normalization")
+    #env.transform[0].init_stats(num_iter=actions_per_episode, reduce_dim=0, cat_dim=0)
+    #print("Finished gathering stats for observation normalization")
 
      # Actor network with proper output handling
     actor_net = nn.Sequential(
@@ -184,7 +184,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 )
 
                 loss_value.backward()
-                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
+                #torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
                 optim.step()
                 optim.zero_grad()
 

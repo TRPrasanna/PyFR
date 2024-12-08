@@ -159,12 +159,9 @@ class PyFREnvironment(EnvBase):
 
     def _get_observation(self):
         # Get raw observation
-        obs_np = self.rl_plugin._get_observation(self.solver)
-        
-        # Proper tensor construction with dtype
-        obs = torch.as_tensor(obs_np, 
-                            device=self.device, 
-                            dtype=torch.float32) # obs from PyFR may be 32 or 64 bit float
+        obs = self.rl_plugin._get_observation(self.solver)
+        #print(f"Raw observation: {obs}")
+        # obs from PyFR may be 32 or 64 bit float, need to check
         return obs
     
     def _compute_reward(self):
