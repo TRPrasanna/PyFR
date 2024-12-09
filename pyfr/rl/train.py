@@ -39,7 +39,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     clip_epsilon = 0.2
     gamma = 0.99
     lmbda = 0.97 #0.95
-    entropy_eps = 1e-3 #0.01 #1e-4 seems to crash
+    entropy_eps = 1e-4 #1e-3 and 1e-4 seems to crash # 0.01
     lr = 1e-3 #3e-4
     max_grad_norm = 1.0
 
@@ -188,6 +188,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                     )
 
                     loss_value.backward()
+                    nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
                     optim.step()
                     optim.zero_grad()
 
@@ -219,6 +220,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             "reward": f"{mean_reward:.2f}" if not any_crash else "crashed",
             "best": f"{best_reward:.2f}",
             "lr": f"{logs['lr'][-1] if logs['lr'] else 0:.2e}",
+            "loss_actor": f"{logs['loss_actor'][-1] if logs['loss_actor'] else 0:.2f}",
+            "loss_critic": f"{logs['loss_critic'][-1] if logs['loss_critic'] else 0:.2f}",
+            "loss_entropy": f"{logs['loss_entropy'][-1] if logs['loss_entropy'] else 0:.2f}",
         })
         pbar.update(episodes_per_batch)
 
