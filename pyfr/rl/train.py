@@ -167,61 +167,62 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     # Training loop
     for i, tensordict_data in enumerate(collector):
-        # PPO update loop
-        for _ in range(num_epochs):
-            advantage_module(tensordict_data)
-            data_view = tensordict_data.reshape(-1)
-            replay_buffer.extend(data_view.cpu())
+        # Check if any trajectory contains a crash
+        any_crash = tensordict_data["terminated"].any().item()
+        
+        if not any_crash:
+            # Normal training - only if no crashes
+            for _ in range(num_epochs):
+                advantage_module(tensordict_data)
+                data_view = tensordict_data.reshape(-1)
+                replay_buffer.extend(data_view.cpu())
 
-            # Sub-batch updates
-            for _ in range(frames_per_batch // sub_batch_size):
-                subdata = replay_buffer.sample(sub_batch_size)
-                loss_vals = loss_module(subdata.to(device))
-                loss_value = (
-                    loss_vals["loss_objective"] + 
-                    loss_vals["loss_critic"] + 
-                    loss_vals["loss_entropy"]
-                )
+                # Sub-batch updates
+                for _ in range(frames_per_batch // sub_batch_size):
+                    subdata = replay_buffer.sample(sub_batch_size)
+                    loss_vals = loss_module(subdata.to(device))
+                    loss_value = (
+                        loss_vals["loss_objective"] + 
+                        loss_vals["loss_critic"] + 
+                        loss_vals["loss_entropy"]
+                    )
 
-                loss_value.backward()
-                #torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
-                optim.step()
-                optim.zero_grad()
+                    loss_value.backward()
+                    optim.step()
+                    optim.zero_grad()
 
-        # Logging
-        mean_reward = tensordict_data["next", "reward"].mean().item()
-        #print(tensordict_data["next", "reward"])
-        logs["reward"].append(mean_reward)
-        #logs["step_count"].append(tensordict_data["step_count"].max().item())
-        logs["lr"].append(optim.param_groups[0]["lr"])
-        logs["loss_actor"].append(loss_vals["loss_objective"].item())
-        logs["loss_critic"].append(loss_vals["loss_critic"].item())
-        logs["loss_entropy"].append(loss_vals["loss_entropy"].item())
+            # Logging - only for successful episodes
+            mean_reward = tensordict_data["next", "reward"].mean().item()
+            logs["reward"].append(mean_reward)
+            logs["lr"].append(optim.param_groups[0]["lr"])
+            logs["loss_actor"].append(loss_vals["loss_objective"].item())
+            logs["loss_critic"].append(loss_vals["loss_critic"].item())
+            logs["loss_entropy"].append(loss_vals["loss_entropy"].item())
 
-        # Progress updates
+            # Save best model - only for successful episodes
+            if mean_reward > best_reward:
+                best_reward = mean_reward
+                print(f"\nNew best reward: {best_reward:.4f}")
+                torch.save({
+                    'policy_state_dict': policy.state_dict(),
+                    'value_state_dict': value_module.state_dict(),
+                    'reward': best_reward,
+                    'episode': episode_count,
+                }, best_model_path)
+        else:
+            print("\nCrash detected - discarding batch")
+            mean_reward = float('nan')  # For progress bar
+
+        # Progress updates (always)
         episode_count += episodes_per_batch
         pbar.set_postfix({
-            "reward": f"{mean_reward:.2f}",
+            "reward": f"{mean_reward:.2f}" if not any_crash else "crashed",
             "best": f"{best_reward:.2f}",
-            "lr": f"{logs['lr'][-1]:.2e}",
-            "loss_actor": f"{logs['loss_actor'][-1]:.2f}",
-            "loss_critic": f"{logs['loss_critic'][-1]:.2f}",
-            "loss_entropy": f"{logs['loss_entropy'][-1]:.2f}"
+            "lr": f"{logs['lr'][-1] if logs['lr'] else 0:.2e}",
         })
-        pbar.update(episodes_per_batch)  # Update per batch
+        pbar.update(episodes_per_batch)
 
-        # Save best model
-        if mean_reward > best_reward:
-            best_reward = mean_reward
-            print(f"\nNew best reward: {best_reward:.4f}")
-            torch.save({
-                'policy_state_dict': policy.state_dict(),
-                'value_state_dict': value_module.state_dict(),
-                'reward': best_reward,
-                'episode': episode_count,
-            }, best_model_path)
-
-        # Update learning rate
+        # Learning rate update (always)
         scheduler.step()
 
     collector.shutdown()
