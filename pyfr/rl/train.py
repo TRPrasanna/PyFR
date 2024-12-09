@@ -18,7 +18,7 @@ from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
-#from torchrl.envs.utils import check_env_specs
+from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 import os
 
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', restart_soln=None, load_model=None):
@@ -30,8 +30,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     num_cells_policy = 512  # Hidden layer size
     num_cells_value = 32  # Hidden layer size for value network
     episodes = 800
-    actions_per_episode = 93
-    episodes_per_batch = 20
+    actions_per_episode = 92 # 93?
+    episodes_per_batch = 1
     frames_per_batch = actions_per_episode * episodes_per_batch
     total_frames = actions_per_episode * episodes  # 93 actions per episode, 400 episodes
     sub_batch_size = round(0.2 * frames_per_batch) # 20% of frames per batch
@@ -39,7 +39,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     clip_epsilon = 0.2
     gamma = 0.99
     lmbda = 0.97 #0.95
-    entropy_eps = 0.01 #1e-4 
+    entropy_eps = 1e-3 #0.01 #1e-4 seems to crash
     lr = 1e-3 #3e-4
     max_grad_norm = 1.0
 
@@ -166,7 +166,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     episode_count = start_episode
 
     # Training loop
-    for tensordict_data in collector:
+    for i, tensordict_data in enumerate(collector):
         # PPO update loop
         for _ in range(num_epochs):
             advantage_module(tensordict_data)
@@ -190,16 +190,23 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
         # Logging
         mean_reward = tensordict_data["next", "reward"].mean().item()
+        #print(tensordict_data["next", "reward"])
         logs["reward"].append(mean_reward)
         #logs["step_count"].append(tensordict_data["step_count"].max().item())
         logs["lr"].append(optim.param_groups[0]["lr"])
+        logs["loss_actor"].append(loss_vals["loss_objective"].item())
+        logs["loss_critic"].append(loss_vals["loss_critic"].item())
+        logs["loss_entropy"].append(loss_vals["loss_entropy"].item())
 
         # Progress updates
         episode_count += episodes_per_batch
         pbar.set_postfix({
             "reward": f"{mean_reward:.2f}",
             "best": f"{best_reward:.2f}",
-            "lr": f"{logs['lr'][-1]:.2e}"
+            "lr": f"{logs['lr'][-1]:.2e}",
+            "loss_actor": f"{logs['loss_actor'][-1]:.2f}",
+            "loss_critic": f"{logs['loss_critic'][-1]:.2f}",
+            "loss_entropy": f"{logs['loss_entropy'][-1]:.2f}"
         })
         pbar.update(episodes_per_batch)  # Update per batch
 

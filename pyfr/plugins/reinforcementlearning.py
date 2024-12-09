@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from collections import defaultdict
 from pyfr.plugins.base import BaseSolnPlugin, SurfaceMixin
+from scipy.integrate import trapezoid
 
 class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin):
     name = 'reinforcementlearning'
@@ -103,13 +104,6 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         self.force_times = []
         self.drag_history = []  # x-component
         self.lift_history = []  # y-component
-
-    def __call__(self, intg):
-        # Update observations and rewards at action times
-        if intg.tcurr >= self.last_action_time + self.action_interval:
-            self.latest_observation = self._get_observation(intg)
-            self.latest_reward = self._get_reward(intg)
-            self.last_action_time = intg.tcurr
 
     def set_action(self, action):
         self.control_signal = torch.tensor([action], device=self.device)
@@ -285,25 +279,28 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         
         # Total forces (pressure + viscous)
         drag = (fm[0, 0] + (fm[1, 0] if self._viscous else 0)) * 2 # multiplying by to make it Cd
-        lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0)) * 2
+        #lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0)) * 2
         
         # Update history
         self.force_times.append(t)
         self.drag_history.append(drag)
-        self.lift_history.append(lift)
+        #self.lift_history.append(lift)
         
-        # Remove old data outside window # check this
+        # Remove old data outside window
         while self.force_times[0] < t - self.avg_window:
             self.force_times.pop(0)
             self.drag_history.pop(0)
-            self.lift_history.pop(0)
-            
-        # Calculate sliding averages
-        avg_drag = np.mean(self.drag_history)
-        avg_lift = np.mean(self.lift_history)
+            #self.lift_history.pop(0)
+
+        if len(self.force_times) > 1: # need to find out how to sample more frequently
+            avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
+            #avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
+        else:
+            avg_drag = drag
+            #avg_lift = lift
         
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>|
-        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
+        reward = -avg_drag #-0.8 * avg_drag - 0.2 * abs(avg_lift)
         
         return float(reward)
         
