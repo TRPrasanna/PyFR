@@ -31,16 +31,16 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     num_cells_value = 32  # Hidden layer size for value network
     episodes = 800
     actions_per_episode = 93 # 93?
-    episodes_per_batch = 20/93 #1
-    frames_per_batch = 20 #actions_per_episode * episodes_per_batch
+    episodes_per_batch = 20 #1
+    frames_per_batch = actions_per_episode * episodes_per_batch
     total_frames = actions_per_episode * episodes  # 93 actions per episode, 400 episodes
-    sub_batch_size = 4 #round(0.2 * frames_per_batch) # 20% of frames per batch
+    sub_batch_size = round(0.2 * frames_per_batch) # 20% of frames per batch
     num_epochs = 25         # optimization steps per batch
     clip_epsilon = 0.2
     gamma = 0.99
     lmbda = 0.97 #0.95
     entropy_eps = 0.01 #1e-3 and 1e-4 seems to crash
-    lr = 1e-3 #3e-4
+    lr = 3e-4 #1e-3 #3e-4
     max_grad_norm = 1.0
 
     # Initialize environment

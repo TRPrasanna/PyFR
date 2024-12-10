@@ -63,7 +63,7 @@ def evaluate_policy(env, model_path, num_episodes=1):
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         try:
             print("Starting evaluation...")
-            eval_rollout = env.rollout(93, policy)
+            eval_rollout = env.rollout(1000, policy) # rollout will be stopped by tend
             
             # Extract actions and rewards
             actions = eval_rollout["action"].cpu().numpy()

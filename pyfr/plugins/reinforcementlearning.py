@@ -279,28 +279,28 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         
         # Total forces (pressure + viscous)
         drag = (fm[0, 0] + (fm[1, 0] if self._viscous else 0)) * 2 # multiplying by to make it Cd
-        #lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0)) * 2
+        lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0)) * 2
         
         # Update history
         self.force_times.append(t)
         self.drag_history.append(drag)
-        #self.lift_history.append(lift)
+        self.lift_history.append(lift)
         
         # Remove old data outside window
         while self.force_times[0] < t - self.avg_window:
             self.force_times.pop(0)
             self.drag_history.pop(0)
-            #self.lift_history.pop(0)
+            self.lift_history.pop(0)
 
         if len(self.force_times) > 1: # need to find out how to sample more frequently
             avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
-            #avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
+            avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
         else:
             avg_drag = drag
-            #avg_lift = lift
+            avg_lift = lift
         
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>|
-        reward = -avg_drag #-0.8 * avg_drag - 0.2 * abs(avg_lift)
+        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
         
         return float(reward)
         
