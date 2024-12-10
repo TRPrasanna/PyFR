@@ -7,17 +7,26 @@ from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, Norma
 from torchrl.collectors import SyncDataCollector
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
+from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
+from torchrl.envs import (
+    Compose,
+    StepCounter,
+    TransformedEnv,
+)
+import matplotlib.pyplot as plt
 
 def evaluate_policy(env, model_path, num_episodes=1):
-    """Evaluate trained policy for same duration as training episode"""
+    """Evaluate trained policy"""
     device = env.device
-    
-    # Get timing parameters from config
-    tend = env.cfg.getfloat('solver-time-integrator', 'tend')
-    tstart = env.cfg.getfloat('solver-time-integrator', 'tstart', 0.0)
-    simulation_time = tend - tstart
-    
-    # Load and setup policy
+
+    env = TransformedEnv(
+        env,
+        Compose(
+            StepCounter(),
+        ),
+    )
+
+    # Load policy
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     
     actor_net = nn.Sequential(
@@ -41,39 +50,71 @@ def evaluate_policy(env, model_path, num_episodes=1):
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
         return_log_prob=True,
-        safe=True
+        distribution_kwargs={
+        "low": env.action_spec.space.low,
+        "high": env.action_spec.space.high,
+        },
+        #safe=True
     ).to(device)
     
     policy.load_state_dict(checkpoint['policy_state_dict'])
     policy.eval()
     
-    with torch.no_grad():
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         try:
-            print(f"Starting evaluation for {simulation_time} time units...")
-            state = env.reset()
-            total_reward = 0
-            step = 0
+            print("Starting evaluation...")
+            eval_rollout = env.rollout(93, policy)
             
-            while env.current_time < tend:
-                policy_output = policy(state)
-                next_state = env.step(policy_output)
-                reward = next_state["next", "reward"].item()
-                total_reward += reward
-                
-                if step % 10 == 0:
-                    action = policy_output["action"].item()
-                    print(f"Time {env.current_time:.3f}: Action = {action:.3f}, Reward = {reward:.3f}")
-                    #print(next_state["next", "observation"])
-                
-                state = next_state
-                step += 1
+            # Extract actions and rewards
+            actions = eval_rollout["action"].cpu().numpy()
+            rewards = eval_rollout["next", "reward"].cpu().numpy()
+            times = eval_rollout["next", "step_count"].cpu().numpy()
             
-            print(f"\nSimulation completed:")
-            print(f"End time: {env.current_time:.3f}")
-            print(f"Total steps: {step}")
-            print(f"Final reward: {total_reward:.4f}")
-            return total_reward, None
+            print("\nAction history:")
+            print("Time\t\tAction\t\tReward")
+            print("-" * 40)
+            
+            # Handle array formatting explicitly
+            for t in range(len(actions)):
+                action_val = float(actions[t].flatten()[0])  # Extract single value
+                reward_val = float(rewards[t])
+                print(f"{t*env.action_interval:.2f}\t\t{action_val:.3f}\t\t{reward_val:.3f}")
+            
+            eval_reward = float(np.mean(rewards))  # Convert to float
+            print(f"\nMean reward: {eval_reward:.4f}")
+
+            # Create time array
+            time_array = np.arange(len(actions)) * env.action_interval
+            
+            # Create figure with 2 subplots
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+            
+            # Plot action vs time
+            ax1.plot(time_array, actions.flatten(), 'b-', label='Action')
+            ax1.set_xlabel('Time (s)')
+            ax1.set_ylabel('Action')
+            ax1.grid(True)
+            ax1.legend()
+            
+            # Plot reward vs time
+            ax2.plot(time_array, rewards, 'r-', label='Reward')
+            ax2.set_xlabel('Time (s)')
+            ax2.set_ylabel('Reward')
+            ax2.grid(True)
+            ax2.legend()
+            
+            # Adjust layout and save
+            plt.tight_layout()
+            plt.savefig('evaluation_results.png')
+            plt.close()
+            
+            print(f"\nPlots saved as evaluation_results.png")
+
+            return eval_reward
             
         except RuntimeError as e:
-            print(f"Simulation failed: {str(e)}")
-            return None, None
+            print(f"Evaluation failed: {str(e)}")
+            return None
+        except Exception as e:
+            print(f"Unexpected error: {str(e)}")
+            return None

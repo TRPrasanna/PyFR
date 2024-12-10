@@ -47,7 +47,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         if not self.surf_bname:
             raise ValueError("No surface specified for drag calculation")
             
-        print(f"Calculating drag over boundary: {self.surf_bname}")
+        #print(f"Calculating drag over boundary: {self.surf_bname}")
         # Get boundary info with specified name
         bc = f'bcon_{self.surf_bname}_p{intg.rallocs.prank}'
         if bc not in intg.system.mesh:
@@ -98,7 +98,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
 
         # Add averaging window parameter
         self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
-        print(f"Using averaging window of {self.avg_window} seconds for reward")
+        #print(f"Using averaging window of {self.avg_window} seconds for reward")
         
         # Initialize force history buffers
         self.force_times = []

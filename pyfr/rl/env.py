@@ -49,8 +49,8 @@ class PyFREnvironment(EnvBase):
 
         self.action_spec = Composite(
             {"action": Bounded(
-                low=torch.tensor(-0.09, device=self.device), # not sure if this is the best way
-                high=torch.tensor(0.09, device=self.device),
+                low=torch.tensor(-0.088, device=self.device), # ideally get this from somewhere else
+                high=torch.tensor(0.088, device=self.device),
                 shape=(1,),
                 device=self.device
             )},
@@ -109,7 +109,7 @@ class PyFREnvironment(EnvBase):
     # Mandatory methods: _step, _reset and _set_seed
 
     def _reset(self, tensordict=None, **kwargs):
-        print("Reset called")
+        #print("Reset called")
         self._init_solver()
         #self.rl_plugin.reset()
         
