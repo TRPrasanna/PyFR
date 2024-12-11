@@ -96,14 +96,110 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
                 self._rcpjact = {k: rcpjact[k[0]][..., v] 
                                 for k, v in self._eidxs.items()}
 
-        # Add averaging window parameter
-        self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
-        #print(f"Using averaging window of {self.avg_window} seconds for reward")
-        
+        # Add step-based sampling (like SamplerPlugin)
+        self.nsteps = self.cfg.getint(cfgsect, 'nsteps')
+        #print(f"Sampling forces every {self.nsteps} steps")
+            
         # Initialize force history buffers
         self.force_times = []
-        self.drag_history = []  # x-component
-        self.lift_history = []  # y-component
+        self.drag_history = []
+        self.lift_history = []
+        self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
+
+    def __call__(self, intg):
+        """Called after each step - store forces if needed"""
+        # Return if no sampling is due
+        if intg.nacptsteps % self.nsteps:
+            return
+
+        # Get forces and store them
+        comm, rank, root = get_comm_rank_root()
+        fm = self._compute_forces(dict(zip(intg.system.ele_types, intg.soln)))
+        
+        if rank == root:
+            t = intg.tcurr
+            drag = (fm[0, 0] + (fm[1, 0] if self._viscous else 0)) * 2
+            lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0)) * 2
+            
+            # Store forces
+            self.force_times.append(t)
+            self.drag_history.append(drag)
+            self.lift_history.append(lift)
+            
+            # Remove old data outside window
+            while self.force_times[0] < t - self.avg_window:
+                self.force_times.pop(0)
+                self.drag_history.pop(0)
+                self.lift_history.pop(0)
+
+    def _compute_forces(self, solns):
+        """Compute instantaneous forces"""
+        comm, rank, root = get_comm_rank_root()
+        
+        # Get solution matrices ; solns is already the solution dict
+        ndims = self.ndims
+        
+        # Force vectors (pressure and viscous)
+        fm = np.zeros((2 if self._viscous else 1, ndims))
+        
+        for etype, fidx in self._m0:
+            # Get interpolation operator
+            m0 = self._m0[etype, fidx]
+            nfpts, nupts = m0.shape
+            
+            # Get solution at points
+            uupts = solns[etype][..., self._eidxs[etype, fidx]]
+            
+            # Interpolate to face
+            ufpts = m0 @ uupts.reshape(nupts, -1)
+            ufpts = ufpts.reshape(nfpts, self.nvars, -1)
+            ufpts = ufpts.swapaxes(0, 1)
+            
+            # Compute pressure
+            pidx = 0 if self._ac else -1
+            p = self.elementscls.con_to_pri(ufpts, self.cfg)[pidx]
+            
+            # Get weights and normals
+            qwts = self._qwts[etype, fidx]
+            norms = self._norms[etype, fidx]
+            
+            # Pressure force
+            fm[0, :ndims] += np.einsum('i...,ij,jik', qwts, p, norms)
+            
+            if self._viscous:
+                # Get operator and J^-T matrix
+                m4 = self._m4[etype]
+                rcpjact = self._rcpjact[etype, fidx]
+
+                # Transformed gradient at solution points
+                tduupts = m4 @ uupts.reshape(nupts, -1)
+                tduupts = tduupts.reshape(ndims, nupts, self.nvars, -1)
+
+                # Physical gradient at solution points
+                duupts = np.einsum('ijkl,jkml->ikml', rcpjact, tduupts)
+                duupts = duupts.reshape(ndims, nupts, -1)
+
+                # Interpolate gradient to flux points
+                dufpts = np.array([m0 @ du for du in duupts])
+                dufpts = dufpts.reshape(ndims, nfpts, self.nvars, -1)
+                dufpts = dufpts.swapaxes(1, 2)
+
+                # Viscous stress
+                if self._ac:
+                    vis = self.ac_stress_tensor(dufpts)
+                else:
+                    vis = self.stress_tensor(ufpts, dufpts)
+
+                # Do the quadrature
+                fm[1, :ndims] += np.einsum('i...,klij,jil', qwts, vis, norms)
+                
+        # Reduce across ranks
+        if rank != root:
+            comm.Reduce(fm, None, op=mpi.SUM, root=root)
+        else:
+            comm.Reduce(mpi.IN_PLACE, fm, op=mpi.SUM, root=root)
+
+        return fm
 
     def set_action(self, action):
         self.control_signal = torch.tensor([action], device=self.device)
@@ -207,101 +303,22 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         return obs
 
     def _get_reward(self, solver):
-        """Compute reward as drag force"""
-        comm, rank, root = get_comm_rank_root()
-        
-        # Get solution matrices
-        solns = dict(zip(solver.system.ele_types, solver.soln))
-        ndims = self.ndims
-        
-        # Force vectors (pressure and viscous)
-        fm = np.zeros((2 if self._viscous else 1, ndims))
-        
-        for etype, fidx in self._m0:
-            # Get interpolation operator
-            m0 = self._m0[etype, fidx]
-            nfpts, nupts = m0.shape
+        """Compute reward using stored force history"""
+        if len(self.force_times) < 1:
+            return 0.0
             
-            # Get solution at points
-            uupts = solns[etype][..., self._eidxs[etype, fidx]]
-            
-            # Interpolate to face
-            ufpts = m0 @ uupts.reshape(nupts, -1)
-            ufpts = ufpts.reshape(nfpts, self.nvars, -1)
-            ufpts = ufpts.swapaxes(0, 1)
-            
-            # Compute pressure
-            pidx = 0 if self._ac else -1
-            p = self.elementscls.con_to_pri(ufpts, self.cfg)[pidx]
-            
-            # Get weights and normals
-            qwts = self._qwts[etype, fidx]
-            norms = self._norms[etype, fidx]
-            
-            # Pressure force
-            fm[0, :ndims] += np.einsum('i...,ij,jik', qwts, p, norms)
-            
-            if self._viscous:
-                # Get operator and J^-T matrix
-                m4 = self._m4[etype]
-                rcpjact = self._rcpjact[etype, fidx]
-
-                # Transformed gradient at solution points
-                tduupts = m4 @ uupts.reshape(nupts, -1)
-                tduupts = tduupts.reshape(ndims, nupts, self.nvars, -1)
-
-                # Physical gradient at solution points
-                duupts = np.einsum('ijkl,jkml->ikml', rcpjact, tduupts)
-                duupts = duupts.reshape(ndims, nupts, -1)
-
-                # Interpolate gradient to flux points
-                dufpts = np.array([m0 @ du for du in duupts])
-                dufpts = dufpts.reshape(ndims, nfpts, self.nvars, -1)
-                dufpts = dufpts.swapaxes(1, 2)
-
-                # Viscous stress
-                if self._ac:
-                    vis = self.ac_stress_tensor(dufpts)
-                else:
-                    vis = self.stress_tensor(ufpts, dufpts)
-
-                # Do the quadrature
-                fm[1, :ndims] += np.einsum('i...,klij,jil', qwts, vis, norms)
-                
-        # Reduce across ranks
-        if rank != root:
-            comm.Reduce(fm, None, op=mpi.SUM, root=root)
-        else:
-            comm.Reduce(mpi.IN_PLACE, fm, op=mpi.SUM, root=root)
-            
-        # Current time
-        t = solver.tcurr
-        
-        # Total forces (pressure + viscous)
-        drag = (fm[0, 0] + (fm[1, 0] if self._viscous else 0)) * 2 # multiplying by to make it Cd
-        lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0)) * 2
-        
-        # Update history
-        self.force_times.append(t)
-        self.drag_history.append(drag)
-        self.lift_history.append(lift)
-        
-        # Remove old data outside window
-        while self.force_times[0] < t - self.avg_window:
-            self.force_times.pop(0)
-            self.drag_history.pop(0)
-            self.lift_history.pop(0)
-
-        if len(self.force_times) > 1: # need to find out how to sample more frequently
+        if len(self.force_times) > 1:
+            # Time-averaged forces using trapezoid rule
             avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
             avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
+            #print("averaging over time ", self.force_times[-1] - self.force_times[0])
         else:
-            avg_drag = drag
-            avg_lift = lift
+            # Single point
+            avg_drag = self.drag_history[0]
+            avg_lift = self.lift_history[0]
         
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>|
-        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
-        
+        reward = -avg_drag #-0.8 * avg_drag - 0.2 * abs(avg_lift)
         return float(reward)
         
 
@@ -341,3 +358,4 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         gradu, nu = du[:, 1:], self._constants['nu']
 
         return -nu*(gradu + gradu.swapaxes(0, 1))
+    

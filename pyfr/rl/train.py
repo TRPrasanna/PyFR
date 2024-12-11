@@ -40,7 +40,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     gamma = 0.99
     lmbda = 0.97 #0.95
     entropy_eps = 0.01 #1e-3 and 1e-4 seems to crash
-    lr = 3e-4 #1e-3 #3e-4
+    lr = 1e-3 #1e-3 #3e-4
     max_grad_norm = 1.0
 
     # Initialize environment
