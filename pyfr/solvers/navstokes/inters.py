@@ -231,6 +231,14 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
             default={'u': 0, 'v': 0, 'w': 0}
         )
 
+        # some config parameters
+        self.jcenter = self.backend.matrix((1,1))
+        self.polarity = self.backend.matrix((1,1))
+        self._set_external('jcenter', 'broadcast fpdtype_t[1][1]', 
+                         value=self.jcenter)
+        self._set_external('polarity', 'broadcast fpdtype_t[1][1]', 
+                         value=self.polarity)
+
         # Neural network parameters
         self.nn_params = self.backend.matrix((1, 2), tags={'align'})
         self._set_external('nn_params', 'broadcast fpdtype_t[1][2]', 
@@ -240,6 +248,15 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
         nn_params = self.nn_params.get()
         nn_params[0][0] = 0.0
         self.nn_params.set(nn_params)
+
+        # Fixed values
+        jcenter = self.jcenter.get()
+        jcenter[0][0] = self.cfg.getfloat(cfgsect, 'jcenter')
+        self.jcenter.set(jcenter)
+        polarity = self.polarity.get()
+        polarity[0][0] = self.cfg.getfloat(cfgsect, 'polarity')
+        self.polarity.set(polarity)
+        #print(f"jcenter: {jcenter[0][0]}, polarity: {polarity[0][0]}")
 
         # Flag for initialization
         self._initialized = False
