@@ -49,8 +49,10 @@ class PyFREnvironment(EnvBase):
 
         self.action_spec = Composite(
             {"action": Bounded(
-                low=torch.tensor(-0.088, device=self.device), # ideally get this from somewhere else
-                high=torch.tensor(0.088, device=self.device),
+                #low=torch.tensor(-0.088, device=self.device), # ideally get this from somewhere else
+                #high=torch.tensor(0.088, device=self.device),
+                low=torch.tensor(-60.0, device=self.device), # airfoil case
+                high=torch.tensor(60.0, device=self.device),
                 shape=(1,),
                 device=self.device
             )},

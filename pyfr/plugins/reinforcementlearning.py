@@ -37,18 +37,26 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         self.latest_observation = torch.zeros(self.observation_size, device=self.device)
         self.latest_reward = 0.0
 
-        # Force calculation setup (from FluidForcePlugin)
+        # Force and moments calculation setup (from FluidForcePlugin)
         self._viscous = 'navier-stokes' in intg.system.name
         self._ac = intg.system.name.startswith('ac')
         self._viscorr = self.cfg.get('solver', 'viscosity-correction', 'none')
         self._constants = self.cfg.items_as('constants', float)
 
+        # Moments : check how to avoid calculating Cl and Cd when only this is required
+        mcomp = 3 if self.ndims == 3 else 1
+        self._mcomp = mcomp if self.cfg.hasopt(cfgsect, 'morigin') else 0
+        if self._mcomp:
+            morigin = np.array(self.cfg.getliteral(cfgsect, 'morigin'))
+            if len(morigin) != self.ndims:
+                raise ValueError(f'morigin must have {self.ndims} components')
+
         self.surf_bname = self.cfg.get(cfgsect, 'surface', None)
         if not self.surf_bname:
-            raise ValueError("No surface specified for drag calculation")
+            raise ValueError("No surface specified for forces/moment calculation for reward")
             
-        #print(f"Calculating drag over boundary: {self.surf_bname}")
-        # Get boundary info with specified name
+        #print(f"Calculating forces/moment over boundary: {self.surf_bname}")
+        # Get boundary info with specified name; check MPI calls
         bc = f'bcon_{self.surf_bname}_p{intg.rallocs.prank}'
         if bc not in intg.system.mesh:
             raise ValueError(f"Boundary '{self.surf_bname}' not found")
@@ -65,6 +73,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         if bc in mesh:
             eidxs = defaultdict(list)
             norms = defaultdict(list)
+            rfpts = defaultdict(list)
             
             for etype, eidx, fidx, flags in mesh[bc].tolist():
                 eles = elemap[etype]
@@ -89,9 +98,17 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
                     smat = eles.smat_at_np('upts').transpose(2, 0, 1, 3)
                     rcpdjac = eles.rcpdjac_at_np('upts')
                     rcpjact[etype] = smat*rcpdjac
+
+                # Get the flux points position of the given face and element
+                # indices relative to the moment origin
+                if self._mcomp:
+                    ploc = eles.ploc_at_np(ppts)[..., eidx]
+                    rfpt = ploc - morigin
+                    rfpts[etype, fidx].append(rfpt)
                     
             self._eidxs = {k: np.array(v) for k, v in eidxs.items()}
             self._norms = {k: np.array(v) for k, v in norms.items()}
+            self._rfpts = {k: np.array(v) for k, v in rfpts.items()}
             if self._viscous:
                 self._rcpjact = {k: rcpjact[k[0]][..., v] 
                                 for k, v in self._eidxs.items()}
@@ -104,10 +121,11 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         self.force_times = []
         self.drag_history = []
         self.lift_history = []
+        self.moment_history = []
         self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
 
     def __call__(self, intg):
-        """Called after each step - store forces if needed"""
+        """Called after each step - store forces/moments if needed"""
         # Return if no sampling is due
         if intg.nacptsteps % self.nsteps:
             return
@@ -115,22 +133,25 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         # Get forces and store them
         comm, rank, root = get_comm_rank_root()
         fm = self._compute_forces(dict(zip(intg.system.ele_types, intg.soln)))
-        
+        #print(fm) # check how to throw error if morigin is not given in .ini file
         if rank == root:
             t = intg.tcurr
-            drag = (fm[0, 0] + (fm[1, 0] if self._viscous else 0)) * 2
-            lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0)) * 2
+            #drag = (fm[0, 0] + (fm[1, 0] if self._viscous else 0)) * 2
+            #lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0)) * 2
+            moment = (fm[0, 2] + (fm[1, 2] if self._viscous else 0)) * 2
             
             # Store forces
             self.force_times.append(t)
-            self.drag_history.append(drag)
-            self.lift_history.append(lift)
+            #self.drag_history.append(drag)
+            #self.lift_history.append(lift)
+            self.moment_history.append(moment)
             
             # Remove old data outside window
             while self.force_times[0] < t - self.avg_window:
                 self.force_times.pop(0)
-                self.drag_history.pop(0)
-                self.lift_history.pop(0)
+                #self.drag_history.pop(0)
+                #self.lift_history.pop(0)
+                self.moment_history.pop(0)
 
     def _compute_forces(self, solns):
         """Compute instantaneous forces"""
@@ -138,9 +159,10 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         
         # Get solution matrices ; solns is already the solution dict
         ndims = self.ndims
+        mcomp = self._mcomp
         
-        # Force vectors (pressure and viscous)
-        fm = np.zeros((2 if self._viscous else 1, ndims))
+        # Force and moment vectors
+        fm = np.zeros((2 if self._viscous else 1, ndims + mcomp))
         
         for etype, fidx in self._m0:
             # Get interpolation operator
@@ -192,6 +214,26 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
 
                 # Do the quadrature
                 fm[1, :ndims] += np.einsum('i...,klij,jil', qwts, vis, norms)
+            
+            if self._mcomp:
+                # Get the flux points positions relative to the moment origin
+                rfpts = self._rfpts[etype, fidx]
+
+                # Do the cross product with the normal vectors
+                rcn = np.atleast_3d(np.cross(rfpts, norms))
+
+                # Pressure force moments
+                fm[0, ndims:] += np.einsum('i...,ij,jik->k', qwts, p, rcn)
+
+                if self._viscous:
+                    # Normal viscous force at each flux point
+                    viscf = np.einsum('ijkl,lkj->lki', vis, norms)
+
+                    # Normal viscous force moments at each flux point
+                    rcf = np.atleast_3d(np.cross(rfpts, viscf))
+
+                    # Do the quadrature
+                    fm[1, ndims:] += np.einsum('i,jik->k', qwts, rcf)
                 
         # Reduce across ranks
         if rank != root:
@@ -309,16 +351,21 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             
         if len(self.force_times) > 1:
             # Time-averaged forces using trapezoid rule
-            avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
-            avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
+            delta_t = self.force_times[-1] - self.force_times[0]
+            #avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
+            #avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+            avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
             #print("averaging over time ", self.force_times[-1] - self.force_times[0])
         else:
             # Single point
             avg_drag = self.drag_history[0]
             avg_lift = self.lift_history[0]
+            avg_moment = self.moment_history[0]
         
-        # Combined reward: -0.8*<C_d> - 0.2*|<C_l>|
-        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
+        # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
+        # -|<C_m>| : Airfoil
+        reward = - abs(avg_moment)
+        # reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
         return float(reward)
         
 
