@@ -29,18 +29,18 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # Hyperparameters
     num_cells_policy = 512  # Hidden layer size for policy network
     num_cells_value = 32  # Hidden layer size for value network
-    episodes = 800
-    actions_per_episode = 93 # 93?
+    episodes = 1200
+    actions_per_episode = 480 # 93?
     episodes_per_batch = 20 #1
     frames_per_batch = actions_per_episode * episodes_per_batch
     total_frames = actions_per_episode * episodes  # 93 actions per episode, 400 episodes
-    sub_batch_size = round(0.2 * frames_per_batch) # 20% of frames per batch
-    num_epochs = 25         # optimization steps per batch
+    sub_batch_size = frames_per_batch #round(0.2 * frames_per_batch) # 20% of frames per batch
+    num_epochs = 50 #25         # optimization steps per batch
     clip_epsilon = 0.2
     gamma = 0.99
     lmbda = 0.97 #0.95
     entropy_eps = 0.01 #1e-3 and 1e-4 seems to crash
-    lr = 1e-3 #1e-3 #3e-4
+    lr = 1e-4 #1e-3 #3e-4
     max_grad_norm = 1.0
 
     # Initialize environment
@@ -141,17 +141,18 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         sampler=SamplerWithoutReplacement(),
     )
 
+    best_eval_reward = float('-inf')
     # Load existing model if specified
     best_reward = float('-inf')
     if load_model and os.path.exists(load_model):
         checkpoint = torch.load(load_model, map_location=device)
         policy.load_state_dict(checkpoint['policy_state_dict'])
         value_module.load_state_dict(checkpoint['value_state_dict'])
-        best_reward = checkpoint['reward']
+        best_eval_reward = checkpoint['reward']
         start_episode = checkpoint.get('episode', 0)
         
         print("\nLoaded existing model:")
-        print(f"Previous best reward: {best_reward:.4f}")
+        print(f"Previous best eval reward: {best_eval_reward:.4f}")
         print(f"Previous episode count: {start_episode}")
         print(f"Model path: {load_model}\n")
     else:
@@ -165,7 +166,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     pbar = tqdm(total=remaining_episodes, desc="Training", initial=start_episode)
     episode_count = start_episode
 
-    best_eval_reward = float('-inf')
     eval_str = ""
 
     for i, tensordict_data in enumerate(collector):
