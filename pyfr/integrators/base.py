@@ -28,7 +28,7 @@ def _common_plugin_prop(attr):
 
 
 class BaseIntegrator:
-    def __init__(self, backend, rallocs, mesh, initsoln, cfg):
+    def __init__(self, backend, rallocs, mesh, initsoln, cfg, env=None):
         self.backend = backend
         self.rallocs = rallocs
         self.isrestart = initsoln is not None

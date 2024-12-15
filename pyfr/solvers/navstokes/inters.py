@@ -258,18 +258,15 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
         self.polarity.set(polarity)
         #print(f"jcenter: {jcenter[0][0]}, polarity: {polarity[0][0]}")
 
-        # Flag for initialization
-        self._initialized = False
+        # Time constant for control signal smoothing
+        self.alpha = 5e-2
 
     def prepare(self, t):
-        # Initialize plugin reference on first prepare call
-        if not self._initialized:
-            self.rl_plugin = next((p for p in self.intg.plugins 
-                                if p.name == 'reinforcementlearning'), None)
-            self._initialized = True
-
-        # Update parameters if plugin is available
-        if hasattr(self, 'rl_plugin') and self.rl_plugin:
-            nn_params = self.nn_params.get()
-            nn_params[0][0] = nn_params[0][0] + self.intg._dt/5e-2*(self.rl_plugin.control_signal.item()-nn_params[0][0])
-            self.nn_params.set(nn_params)
+        # Direct access to control signal from solver environment
+        target = self.intg.system.env.current_control
+        
+        # Update parameters with smoothing
+        nn_params = self.nn_params.get()
+        nn_params[0][0] += self.intg._dt/self.alpha * (target - nn_params[0][0])
+        self.nn_params.set(nn_params)
+        print(f"Control signal: {target}, Updated nn_params: {nn_params[0][0]}")

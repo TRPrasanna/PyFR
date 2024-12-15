@@ -201,8 +201,8 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
 
         return fm
 
-    def set_action(self, action):
-        self.control_signal = torch.tensor([action], device=self.device)
+    #def set_action(self, action):
+    #    self.control_signal = torch.tensor([action], device=self.device)
 
     def _setup_sampling(self, intg):
         """Setup sampling infrastructure similar to SamplerPlugin"""

@@ -21,12 +21,13 @@ class BaseSystem:
     # Nonce sequence
     _nonce_seq = it.count()
 
-    def __init__(self, intg, backend, rallocs, mesh, initsoln, nregs, cfg):
+    def __init__(self, intg, backend, rallocs, mesh, initsoln, nregs, cfg, env=None):
         self.intg = intg
         self.backend = backend
         self.mesh = mesh
         self.cfg = cfg
         self.nregs = nregs
+        self.env = env  # Store DRL environment reference
 
         # Obtain a nonce to uniquely identify this system
         nonce = str(next(self._nonce_seq))
@@ -153,6 +154,7 @@ class BaseSystem:
         return mpi_inters
 
     def _load_bc_inters(self, rallocs, mesh, elemap):
+
         bccls = self.bbcinterscls
         bcmap = {b.type: b for b in subclasses(bccls, just_leaf=True)}
 
@@ -177,11 +179,6 @@ class BaseSystem:
                     # Instantiate other BCs without 'intg'
                     bciface = bcclass(self.backend, interarr, elemap, cfgsect, self.cfg)
                 bc_inters.append(bciface)
-
-        # Initialize sampling for neural BCs
-        for bc in bc_inters:
-            if hasattr(bc, 'setup_sampling'):
-                bc.setup_sampling()
             
         return bc_inters
 

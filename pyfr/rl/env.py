@@ -24,9 +24,12 @@ class PyFREnvironment(EnvBase):
         self.backend = get_backend(backend_name, self.cfg)
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)
 
+        # Add global control signal storage
+        self.current_control = 0.0
+
         # Initialize the solver and other components
         self.restart_soln = restart_soln
-        self._init_solver()
+        self._init_solver() # probably hard to get observation_size without doing this
 
         self.tend = self.cfg.getfloat('solver-time-integrator', 'tend')
 
@@ -97,7 +100,7 @@ class PyFREnvironment(EnvBase):
 
     def _init_solver(self):
         self.solver = get_solver(self.backend, self.rallocs, self.mesh, 
-                               initsoln=self.restart_soln, cfg=self.cfg)
+                               initsoln=self.restart_soln, cfg=self.cfg, env=self)
         self.rl_plugin = next(p for p in self.solver.plugins 
                             if p.name == 'reinforcementlearning')
         self.action_interval = self.rl_plugin.action_interval
@@ -121,15 +124,11 @@ class PyFREnvironment(EnvBase):
 
     def _step(self, tensordict):
         action = tensordict['action']
-        #print(f"Step called with action: {action.item()}")
+        print(f"Step called with action: {action.item()}")
         
-        # Set the action in the RL plugin
-        self.rl_plugin.set_action(action.item())
-        # Advance the solver to the next action time
-        #t_end = self.next_action_time
-        #while self.solver.tcurr < t_end:
-        #    self.solver.advance_to(self.solver.tcurr + self.solver._dt)
-        #    self.current_time = self.solver.tcurr
+        # Update global control signal
+        self.current_control = action.item()
+
         try:
             self.solver.advance_to(self.next_action_time)
             crashed = False
@@ -137,7 +136,7 @@ class PyFREnvironment(EnvBase):
             reward = self._compute_reward()
             observation = self._get_observation()
         except RuntimeError as e:
-            print(f"Solver crashed: {str(e)}. Resetting...")
+            print(f"Solver crashed: {str(e)}. Resetting. Last action was: {action.item()}")
             crashed = True
             # Return neutral state with zero reward
             observation = self.observation_spec.zero(torch.Size([]))["observation"]

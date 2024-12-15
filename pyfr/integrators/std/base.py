@@ -5,8 +5,8 @@ from pyfr.integrators.base import BaseCommon
 class BaseStdIntegrator(BaseCommon, BaseIntegrator):
     formulation = 'std'
 
-    def __init__(self, backend, systemcls, rallocs, mesh, initsoln, cfg):
-        super().__init__(backend, rallocs, mesh, initsoln, cfg)
+    def __init__(self, backend, systemcls, rallocs, mesh, initsoln, cfg, env=None):
+        super().__init__(backend, rallocs, mesh, initsoln, cfg, env=env)
 
         # Sanity checks
         if self.controller_needs_errest and not self.stepper_has_errest:
@@ -17,7 +17,7 @@ class BaseStdIntegrator(BaseCommon, BaseIntegrator):
 
         # Construct the relevant system
         self.system = systemcls(self, backend, rallocs, mesh, initsoln,
-                                nregs=self.nregs, cfg=cfg)
+                                nregs=self.nregs, cfg=cfg, env=env)
 
         # Event handlers for advance_to
         self.plugins = self._get_plugins(initsoln)
