@@ -30,9 +30,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # Hyperparameters
     num_cells_policy = 512  # Hidden layer size for policy network
     num_cells_value = 32  # Hidden layer size for value network
-    episodes = 1 # 1200
+    episodes = 1200
     actions_per_episode = 480 # 93?
-    episodes_per_batch = 1 #20 #1
+    episodes_per_batch = 20 #1
     frames_per_batch = actions_per_episode * episodes_per_batch
     total_frames = actions_per_episode * episodes  # 93 actions per episode, 400 episodes
     sub_batch_size = frames_per_batch #round(0.2 * frames_per_batch) # 20% of frames per batch
