@@ -232,33 +232,49 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
         )
 
         # some config parameters
-        self.t_act_interval = self.backend.matrix((1,1))
-        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
-                         value=self.t_act_interval)
+        self.jcenter = self.backend.matrix((1,1))
+        self.polarity = self.backend.matrix((1,1))
+        self._set_external('jcenter', 'broadcast fpdtype_t[1][1]', 
+                         value=self.jcenter)
+        self._set_external('polarity', 'broadcast fpdtype_t[1][1]', 
+                         value=self.polarity)
 
-        # Neural network + control parameters
-        self.control_params = self.backend.matrix((1,3))
-        self._set_external('control_params', 'broadcast fpdtype_t[1][3]', 
-                         value=self.control_params)
+        # Neural network parameters
+        self.nn_params = self.backend.matrix((1, 1))
+        self._set_external('nn_params', 'broadcast fpdtype_t[1][1]', 
+                         value=self.nn_params)
 
         # Initial value
-        self.control_params.set(np.array([[0.0, 0.0, 0.0]])) #(Q0,Q1,t0)
+        nn_params = self.nn_params.get()
+        nn_params[0][0] = 0.0
+        self.nn_params.set(nn_params)
+        #print("nn_params",nn_params)
 
         # Cache current parameter value 
-        self._current_target = 0.0
+        self._current_param = nn_params[0][0]
 
         # Fixed values
-        #self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]]))
+        jcenter = self.jcenter.get()
+        jcenter[0][0] = self.cfg.getfloat(cfgsect, 'jcenter')
+        self.jcenter.set(jcenter)
+        polarity = self.polarity.get()
+        polarity[0][0] = self.cfg.getfloat(cfgsect, 'polarity')
+        self.polarity.set(polarity)
         #print(f"jcenter: {jcenter[0][0]}, polarity: {polarity[0][0]}")
+
+        # Time constant for control signal smoothing
+        self.alpha = 5e-2
 
     def prepare(self, t):
         # Direct access to control signal from solver environment
-        new_target = self.intg.system.env.current_control
+        target = self.intg.system.env.current_control
 
-        # Only update backend if there is a new new_target
-        if new_target != self._current_target:
-            self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]])) # check how to avoid this
-            self.control_params.set(np.array([[self._current_target, new_target, t]]))
-            #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
-            self._current_target = new_target
+        new_param = self._current_param + self.intg._dt/self.alpha * (target - self._current_param)
+
+        # Only update backend if change is significant
+        if abs(new_param - self._current_param) > 1e-2:
+            self.nn_params.set(np.array([[new_param]]))
+            #print(f"Control signal: {target}, Updated nn_params: {new_param}")
+
+        self._current_param = new_param
         

@@ -53,10 +53,10 @@ class PyFREnvironment(EnvBase):
 
         self.action_spec = Composite(
             {"action": Bounded(
-                #low=torch.tensor(-0.088, device=self.device), # ideally get this from somewhere else
-                #high=torch.tensor(0.088, device=self.device),
-                low=torch.tensor(-60.0, device=self.device), # angular case
-                high=torch.tensor(60.0, device=self.device),
+                low=torch.tensor(-0.088, device=self.device), # ideally get this from somewhere else
+                high=torch.tensor(0.088, device=self.device),
+                #low=torch.tensor(-60.0, device=self.device), # angular case
+                #high=torch.tensor(60.0, device=self.device),
                 shape=(1,),
                 device=self.device
             )},
@@ -130,6 +130,10 @@ class PyFREnvironment(EnvBase):
         # Update global control signal
         self.current_control = action.item()
 
+        self.current_time = self.solver.tcurr
+        # Update the next action time
+        self.next_action_time += self.action_interval
+
         try:
             self.solver.advance_to(self.next_action_time)
             crashed = False
@@ -142,10 +146,6 @@ class PyFREnvironment(EnvBase):
             # Return neutral state with zero reward
             observation = self.observation_spec.zero(torch.Size([]))["observation"]
             reward = -10.0
-
-        self.current_time = self.solver.tcurr
-        # Update the next action time
-        self.next_action_time += self.action_interval
 
         done = crashed or self.current_time >= self.tend
         terminated = crashed  
