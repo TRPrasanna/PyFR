@@ -14,7 +14,8 @@ class PyFREnvironment(EnvBase):
     
     def __init__(self, mesh_file, cfg_file, backend_name, restart_soln=None):
         #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
-        device = torch.device('cpu')
+        #device = torch.device('cpu')
+        device = torch.device('cuda')
         super().__init__(device=device)
 
         # Load mesh and config once
