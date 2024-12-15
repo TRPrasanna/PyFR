@@ -273,8 +273,8 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
 
         # Only update backend if change is significant
         if abs(new_param - self._current_param) > 1e-2:
-            #nn_params = self.nn_params.get()
-            #nn_params[0][0] = new_param
             self.nn_params.set(np.array([[new_param]]))
-            self._current_param = new_param
-            #print(f"Control signal: {target}, Updated nn_params: {new_param}")
+            print(f"Control signal: {target}, Updated nn_params: {new_param}")
+
+        self._current_param = new_param
+        
