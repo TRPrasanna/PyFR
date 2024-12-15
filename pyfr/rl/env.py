@@ -124,7 +124,7 @@ class PyFREnvironment(EnvBase):
 
     def _step(self, tensordict):
         action = tensordict['action']
-        print(f"Step called with action: {action.item()}")
+        #print(f"Step called with action: {action.item()}")
         
         # Update global control signal
         self.current_control = action.item()

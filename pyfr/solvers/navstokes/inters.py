@@ -269,4 +269,4 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
         nn_params = self.nn_params.get()
         nn_params[0][0] += self.intg._dt/self.alpha * (target - nn_params[0][0])
         self.nn_params.set(nn_params)
-        print(f"Control signal: {target}, Updated nn_params: {nn_params[0][0]}")
+        #print(f"Control signal: {target}, Updated nn_params: {nn_params[0][0]}")
