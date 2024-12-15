@@ -240,14 +240,18 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
                          value=self.polarity)
 
         # Neural network parameters
-        self.nn_params = self.backend.matrix((1, 2), tags={'align'})
-        self._set_external('nn_params', 'broadcast fpdtype_t[1][2]', 
+        self.nn_params = self.backend.matrix((1, 1))
+        self._set_external('nn_params', 'broadcast fpdtype_t[1][1]', 
                          value=self.nn_params)
 
         # Initial value
         nn_params = self.nn_params.get()
         nn_params[0][0] = 0.0
         self.nn_params.set(nn_params)
+        #print("nn_params",nn_params)
+
+        # Cache current parameter value 
+        self._current_param = nn_params[0][0]
 
         # Fixed values
         jcenter = self.jcenter.get()
@@ -264,9 +268,13 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
     def prepare(self, t):
         # Direct access to control signal from solver environment
         target = self.intg.system.env.current_control
-        
-        # Update parameters with smoothing
-        nn_params = self.nn_params.get()
-        nn_params[0][0] += self.intg._dt/self.alpha * (target - nn_params[0][0])
-        self.nn_params.set(nn_params)
-        #print(f"Control signal: {target}, Updated nn_params: {nn_params[0][0]}")
+
+        new_param = self._current_param + self.intg._dt/self.alpha * (target - self._current_param)
+
+        # Only update backend if change is significant
+        if abs(new_param - self._current_param) > 1e-2:
+            #nn_params = self.nn_params.get()
+            #nn_params[0][0] = new_param
+            self.nn_params.set(np.array([[new_param]]))
+            self._current_param = new_param
+            #print(f"Control signal: {target}, Updated nn_params: {new_param}")

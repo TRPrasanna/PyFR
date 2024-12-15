@@ -146,7 +146,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # Load existing model if specified
     best_reward = float('-inf')
     if load_model and os.path.exists(load_model):
-        checkpoint = torch.load(load_model, map_location=device)
+        checkpoint = torch.load(load_model, map_location=device, weights_only=True)
         policy.load_state_dict(checkpoint['policy_state_dict'])
         value_module.load_state_dict(checkpoint['value_state_dict'])
         best_eval_reward = checkpoint['reward']
@@ -162,6 +162,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_model_path = os.path.join(checkpoint_dir, 'best_model.pt')
+    latest_model_path = os.path.join(checkpoint_dir, 'latest_model.pt')
     logs = defaultdict(list)
     remaining_episodes = episodes - start_episode
     pbar = tqdm(total=remaining_episodes, desc="Training", initial=start_episode)
@@ -200,7 +201,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             eval_reward = evaluate_policy(env, policy, num_steps=actions_per_episode)
             logs["eval_reward"].append(eval_reward)
             
-            # Save if best
+            # Save best
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
                 print(f"\nNew best eval reward: {best_eval_reward:.4f}")
@@ -210,7 +211,15 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                     'reward': best_eval_reward,
                     'episode': episode_count,
                 }, best_model_path)
-                
+
+            # Save latest model even if not the best
+            torch.save({
+                'policy_state_dict': policy.state_dict(),
+                'value_state_dict': value_module.state_dict(),
+                'reward': eval_reward,
+                'episode': episode_count,
+            }, latest_model_path)
+
             eval_str = f"eval reward: {eval_reward:.2f} (best: {best_eval_reward:.2f})"
 
         # Progress bar update
