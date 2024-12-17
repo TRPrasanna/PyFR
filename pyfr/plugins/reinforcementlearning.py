@@ -27,7 +27,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         
         # Calculate observation size based on probe points and variables
         nvars = len(self.elementscls.privarmap[self.ndims]) if self.fmt == 'primitive' else len(self.elementscls.convarmap[self.ndims])
-        self.observation_size = len(self.pts) * 2 # * nvars for all variables
+        self.observation_size = len(self.pts) * 3 # * nvars for all variables
         self.nvars = nvars
         
         # Rest of initialization
@@ -293,8 +293,8 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             samples = self.elementscls.con_to_pri(np.array(samples).T, self.cfg)
             samples = np.array(samples).T
 
-            # Extract only u,v velocities (indices 1,2 in primitive variables)
-            var_indices = [1, 2]  # u,v are at indices 1,2 (after density)
+            # Extract only u,v velocities, p (indices 1,2,3 in primitive variables)
+            var_indices = [1, 2, 3]  # u,v,p are at indices 1,2,3 (after density)
             samples = samples[:, var_indices]
             
         # Convert to tensor of 32-bit floats, check
