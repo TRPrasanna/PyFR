@@ -34,6 +34,12 @@ def evaluate_policy(env, model_path, num_episodes=1):
         nn.Tanh(),
         nn.Linear(512, 512),
         nn.Tanh(),
+        nn.Linear(512, 512),
+        nn.Tanh(),
+        nn.Linear(512, 512),
+        nn.Tanh(),
+        nn.Linear(512, 512),
+        nn.Tanh(),
         nn.Linear(512, 2),
         NormalParamExtractor()
     ).to(device)
@@ -63,7 +69,7 @@ def evaluate_policy(env, model_path, num_episodes=1):
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         try:
             print("Starting evaluation...")
-            eval_rollout = env.rollout(1000, policy) # rollout will be stopped by tend
+            eval_rollout = env.rollout(100000, policy) # rollout will be stopped by tend
             
             # Extract actions and rewards
             actions = eval_rollout["action"].cpu().numpy()

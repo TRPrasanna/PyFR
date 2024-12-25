@@ -261,4 +261,49 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
             self.control_params.set(np.array([[self._current_target, new_target, t]]))
             #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
             self._current_target = new_target
+
+class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
+    type = 'sub-in-frv-neural-type2'
+    cflux_state = 'ghost'
+
+    def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
         
+        # Basic initialization
+        self.c |= self._exp_opts(
+            ['rho', 'u', 'v', 'w'][:self.ndims + 1], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+        # some config parameters
+        self.t_act_interval = self.backend.matrix((1,1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
+                         value=self.t_act_interval)
+
+        # Neural network + control parameters
+        self.control_params = self.backend.matrix((1,3))
+        self._set_external('control_params', 'broadcast fpdtype_t[1][3]', 
+                         value=self.control_params)
+
+        # Initial value
+        self.control_params.set(np.array([[0.0, 0.0, 0.0]])) #(Q0,Q1,t0)
+
+        # Cache current parameter value 
+        self._current_target = 0.0
+
+        # Fixed values
+        #self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]]))
+        #print(f"jcenter: {jcenter[0][0]}, polarity: {polarity[0][0]}")
+
+    def prepare(self, t):
+        # Direct access to control signal from solver environment
+        new_target = self.intg.system.env.current_control
+
+        # Only update backend if there is a new new_target
+        if new_target != self._current_target:
+            self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]])) # check how to avoid this
+            self.control_params.set(np.array([[self._current_target, new_target, t]]))
+            #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
+            self._current_target = new_target
