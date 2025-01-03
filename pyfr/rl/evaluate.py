@@ -34,12 +34,6 @@ def evaluate_policy(env, model_path, num_episodes=1):
         nn.Tanh(),
         nn.Linear(512, 512),
         nn.Tanh(),
-        nn.Linear(512, 512),
-        nn.Tanh(),
-        nn.Linear(512, 512),
-        nn.Tanh(),
-        nn.Linear(512, 512),
-        nn.Tanh(),
         nn.Linear(512, 2),
         NormalParamExtractor()
     ).to(device)

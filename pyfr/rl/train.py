@@ -235,7 +235,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     collector.shutdown()
     env.close()
 
-def evaluate_policy(env, policy, num_steps=93):
+def evaluate_policy(env, policy, num_steps=1000000):
     """Evaluate policy without exploration"""
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         eval_rollout = env.rollout(num_steps, policy)
