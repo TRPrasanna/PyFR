@@ -27,6 +27,7 @@ class PyFREnvironment(EnvBase):
 
         # Add global control signal storage
         self.current_control = 0.0
+        self.current_control2 = 0.0
 
         # Initialize the solver and other components
         self.restart_soln = restart_soln
@@ -55,9 +56,9 @@ class PyFREnvironment(EnvBase):
             {"action": Bounded(
                 #low=torch.tensor(-0.088, device=self.device), # ideally get this from somewhere else
                 #high=torch.tensor(0.088, device=self.device),
-                low=torch.tensor(-60.0, device=self.device), # angular case
-                high=torch.tensor(60.0, device=self.device),
-                shape=(1,),
+                low=torch.tensor([-60.0,0.0], device=self.device), # angular case
+                high=torch.tensor([60.0,8.0], device=self.device),
+                shape=torch.Size([2]),
                 device=self.device
             )},
             batch_size=torch.Size([])
@@ -124,12 +125,10 @@ class PyFREnvironment(EnvBase):
         return state.update(self.full_done_spec.zero(shape))
 
     def _step(self, tensordict):
-        action = tensordict['action']
-        #print(f"Step called with action: {action.item()}")
-        
         # Update global control signal
-        self.current_control = action.item()
-
+        self.current_control = tensordict['action'][0].item()
+        self.current_control2 = tensordict['action'][1].item()
+        #print(f"Step called with actions: {self.current_control}, {self.current_control2}")
         self.current_time = self.solver.tcurr
         # Update the next action time
         self.next_action_time += self.action_interval
@@ -141,7 +140,7 @@ class PyFREnvironment(EnvBase):
             reward = self._compute_reward()
             observation = self._get_observation()
         except RuntimeError as e:
-            print(f"Solver crashed: {str(e)}. Resetting. Last action was: {action.item()}")
+            print(f"Solver crashed: {str(e)}. Resetting. Last actions were: {self.current_control}, {self.current_control2}")
             crashed = True
             # Return neutral state with zero reward
             observation = self.observation_spec.zero(torch.Size([]))["observation"]
