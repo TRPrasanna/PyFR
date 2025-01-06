@@ -30,7 +30,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     # Hyperparameters
     num_cells_policy = 512  # Hidden layer size for policy network
-    num_cells_value = 32  # Hidden layer size for value network
+    num_cells_value = 512 #32  # Hidden layer size for value network
     episodes = 1200
     actions_per_episode = 480 # 93?
     episodes_per_batch = 20 #1
@@ -51,11 +51,11 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             f"Adjusted num_minibatches to {adjusted_num_minibatches} with sub_batch_size {sub_batch_size}."
         )
 
-    num_epochs = 50 #25         # optimization steps per batch
+    num_epochs = 10 # optimization steps per batch
     clip_epsilon = 0.2
     gamma = 0.99
     lmbda = 0.97 #0.95
-    entropy_eps = 0.01 #1e-3 and 1e-4 seems to crash
+    entropy_eps = 1e-3 #0.01 #1e-3 and 1e-4 seems to crash
     lr = 1e-4 #1e-3 #3e-4
     max_grad_norm = 1.0
 
