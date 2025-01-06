@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 import os
+import math
 
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', restart_soln=None, load_model=None):
     # Device setup
@@ -35,7 +36,21 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     episodes_per_batch = 20 #1
     frames_per_batch = actions_per_episode * episodes_per_batch
     total_frames = actions_per_episode * episodes  # 93 actions per episode, 400 episodes
-    sub_batch_size = frames_per_batch #round(0.2 * frames_per_batch) # 20% of frames per batch
+
+    desired_num_minibatches = 16
+    #round(0.2 * frames_per_batch) # usually 10-25% of frames per batch, but not necessarily
+    sub_batch_size = frames_per_batch // desired_num_minibatches
+    remainder = frames_per_batch % desired_num_minibatches
+    # Adjust num_minibatches if there's a remainder
+    if remainder != 0:
+        adjusted_num_minibatches = get_closest_divisor(frames_per_batch, desired_num_minibatches)
+        sub_batch_size = frames_per_batch // adjusted_num_minibatches
+        print(
+            f"Warning: frames_per_batch ({frames_per_batch}) is not perfectly divisible by "
+            f"num_minibatches ({desired_num_minibatches}). "
+            f"Adjusted num_minibatches to {adjusted_num_minibatches} with sub_batch_size {sub_batch_size}."
+        )
+
     num_epochs = 50 #25         # optimization steps per batch
     clip_epsilon = 0.2
     gamma = 0.99
@@ -137,6 +152,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         device=device
     )
 
+    # Replay buffer here is not actually used for experience replay
+    # It is rather used for convenience to sample mini-batches from the collected data
     replay_buffer = ReplayBuffer(
         storage=LazyTensorStorage(max_size=frames_per_batch),
         sampler=SamplerWithoutReplacement(),
@@ -241,3 +258,26 @@ def evaluate_policy(env, policy, num_steps=1000000):
         eval_rollout = env.rollout(num_steps, policy)
         eval_reward = eval_rollout["next", "reward"].mean().item()
         return eval_reward
+
+def get_closest_divisor(n, target):
+    """
+    Finds the closest divisor of n to the target value.
+    
+    Args:
+        n (int): The number to find divisors for.
+        target (int): The target divisor to approach.
+        
+    Returns:
+        int: The closest divisor to the target.
+    """
+    # Find all divisors of n
+    divisors = set()
+    for i in range(1, int(math.sqrt(n)) + 1):
+        if n % i == 0:
+            divisors.add(i)
+            divisors.add(n // i)
+    
+    # Find the divisor with the minimum absolute difference to the target
+    closest = min(divisors, key=lambda x: (abs(x - target), -x))  # Prefer larger divisor if tie
+    return closest
+
