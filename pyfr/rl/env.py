@@ -1,27 +1,23 @@
 import torch
 from torchrl.envs.common import EnvBase
 from torchrl.data import Bounded, Composite, Unbounded, Categorical
-from tensordict import TensorDict, TensorDictBase
-from pyfr.inifile import Inifile
+from tensordict import TensorDict
 from pyfr.backends import get_backend
-from pyfr.readers.native import NativeReader
 from pyfr.rank_allocator import get_rank_allocation
 from pyfr.solvers import get_solver
-from typing import Optional
 
 class PyFREnvironment(EnvBase):
     """PyFR environment compatible with TorchRL."""
     
-    def __init__(self, mesh_file, cfg_file, backend_name, restart_soln=None):
+    def __init__(self, mesh, cfg, backend_name, restart_soln=None):
         #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
         #device = torch.device('cpu')
         device = torch.device('cuda')
         super().__init__(device=device)
 
         # Load mesh and config once
-        self.mesh = NativeReader(mesh_file)
-        self.cfg = Inifile.load(cfg_file)
-        #print(self.cfg)
+        self.mesh = mesh #NativeReader(mesh_file)
+        self.cfg = cfg
         self.backend = get_backend(backend_name, self.cfg)
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)
 
