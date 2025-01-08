@@ -104,13 +104,11 @@ def process_evaluate(args):
             raise RuntimeError('Restart solution does not match mesh.')
             
     from .evaluate import evaluate_policy
-    from .env import PyFREnvironment
-    
-    env = PyFREnvironment(
-        args.mesh,
-        args.cfg,
-        args.backend,
-        restart_soln=restart_soln
+    evaluate_policy(
+        mesh_file=args.mesh,
+        cfg_file=args.cfg,
+        backend_name=args.backend,
+        model_path=args.model_path,
+        restart_soln=restart_soln,
+        episodes=args.episodes
     )
-    evaluate_policy(env, args.model_path, args.episodes)
-    env.close()

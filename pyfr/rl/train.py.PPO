@@ -18,7 +18,7 @@ from torchrl.collectors import SyncDataCollector
 from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.objectives import SACLoss
+from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
@@ -60,9 +60,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
      # Actor network with proper output handling
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_policy),
-        nn.ReLU(), # tanh activation function is most commonly used for small networks for PPO
+        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        nn.ReLU(),
+        nn.Tanh(),
         nn.Linear(hp.num_cells_policy, 2),  # 2 outputs: mean and log_std
         NormalParamExtractor()  # Use default scale_mapping
     ).to(device)
@@ -86,30 +86,36 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         #safe = True
     ).to(device)
 
-    # state-action value (Q) network; by default this will be duplicated to get 2 Q networks (critics)
-    # We won't use the third optional state value network
-    qvalue_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0] + env.action_spec.shape[0], hp.num_cells_value),
-        nn.ReLU(),
+    # Value network (critic)
+    value_net = nn.Sequential(
+        nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_value),
+        nn.Tanh(),
         nn.Linear(hp.num_cells_value, hp.num_cells_value),
-        nn.ReLU(),
+        nn.Tanh(),
         nn.Linear(hp.num_cells_value, 1)
     ).to(device)
 
-    qvalue_module = ValueOperator(
-        module=qvalue_net,
-        in_keys=["observation", "action"],
+    value_module = ValueOperator(
+        module=value_net,
+        in_keys=["observation"]
     ).to(device)
 
-    qvalue_module2 = ValueOperator(
-        module=qvalue_net,
-        in_keys=["observation", "action"],
-    ).to(device)
+    # PPO components
+    advantage_module = GAE(
+        gamma=hp.gamma, 
+        lmbda=hp.lmbda,
+        value_network=value_module,
+        average_gae=True
+    )
 
-    loss_module = SACLoss(
+    loss_module = ClipPPOLoss(
         actor_network=policy,
-        qvalue_network=[qvalue_module,qvalue_module2], # here specified as a list so it will be convenient to save as pytorch model
-        #num_qvalue_nets=2, 2 is default
+        critic_network=value_module,
+        clip_epsilon=hp.clip_epsilon,
+        entropy_bonus=bool(hp.entropy_eps),
+        entropy_coef=hp.entropy_eps,
+        critic_coef=1.0,
+        loss_critic_type="smooth_l1",
     )
 
     # Optimizer
@@ -141,10 +147,10 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     if load_model and os.path.exists(load_model):
         checkpoint = torch.load(load_model, map_location=device, weights_only=True)
         policy.load_state_dict(checkpoint['policy_state_dict'])
-        qvalue_module.load_state_dict(checkpoint['qvalue_state_dict'][0])
-        qvalue_module2.load_state_dict(checkpoint['qvalue_state_dict'][1])
-        best_eval_reward = checkpoint['best_reward']
+        value_module.load_state_dict(checkpoint['value_state_dict'])
+        best_eval_reward = checkpoint['reward']
         start_episode = checkpoint.get('episode', 0)
+        
         print("\nLoaded existing model:")
         print(f"Previous best eval reward: {best_eval_reward:.4f}")
         print(f"Previous episode count: {start_episode}")
@@ -166,6 +172,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     for i, tensordict_data in enumerate(collector):
         # Training updates
         for _ in range(hp.num_epochs):
+            advantage_module(tensordict_data)
             data_view = tensordict_data.reshape(-1)
             replay_buffer.extend(data_view.cpu())
             
@@ -199,18 +206,16 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 print(f"\nNew best eval reward: {best_eval_reward:.4f}")
                 torch.save({
                     'policy_state_dict': policy.state_dict(),
-                    'qvalue_state_dict': [qvalue_module.state_dict(), qvalue_module2.state_dict()],
-                    'best_reward': best_eval_reward,
-                    'latest_reward': eval_reward,
+                    'value_state_dict': value_module.state_dict(),
+                    'reward': best_eval_reward,
                     'episode': episode_count,
                 }, best_model_path)
 
             # Save latest model even if not the best
             torch.save({
                 'policy_state_dict': policy.state_dict(),
-                'qvalue_state_dict': [qvalue_module.state_dict(), qvalue_module2.state_dict()],
-                'best_reward': best_eval_reward,
-                'latest_reward': eval_reward,
+                'value_state_dict': value_module.state_dict(),
+                'reward': eval_reward,
                 'episode': episode_count,
             }, latest_model_path)
 
@@ -271,8 +276,11 @@ class HyperParameters:
     desired_num_minibatches: int = 16
     num_epochs: int = 10
     
-    # Training parameters
+    # PPO parameters
+    clip_epsilon: float = 0.2
     gamma: float = 0.99
+    lmbda: float = 0.97
+    entropy_eps: float = 1e-3
     lr: float = 1e-4
     max_grad_norm: float = 1.0
 
@@ -326,8 +334,11 @@ class HyperParameters:
                 ("desired_num_minibatches", "Target minibatches per update"),
                 ("num_epochs", "Training epochs per batch")
             ],
-            "Training Parameters": [
+            "PPO Parameters": [
+                ("clip_epsilon", "PPO clipping parameter"),
                 ("gamma", "Discount factor"),
+                ("lmbda", "GAE lambda parameter"),
+                ("entropy_eps", "Entropy bonus coefficient"),
                 ("lr", "Learning rate"),
                 ("max_grad_norm", "Gradient clipping norm")
             ],

@@ -1,12 +1,8 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from tqdm import tqdm
 from tensordict.nn import TensorDictModule
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
-from torchrl.collectors import SyncDataCollector
-from torchrl.objectives import ClipPPOLoss
-from torchrl.objectives.value import GAE
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.envs import (
     Compose,
@@ -14,11 +10,23 @@ from torchrl.envs import (
     TransformedEnv,
 )
 import matplotlib.pyplot as plt
+from .train import HyperParameters
+from pyfr.inifile import Inifile
+from pyfr.readers.native import NativeReader
+from pyfr.rl.env import PyFREnvironment
 
-def evaluate_policy(env, model_path, num_episodes=1):
+def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=None, episodes=1):
     """Evaluate trained policy"""
-    device = env.device
+    device = torch.device('cuda')
 
+    cfg = Inifile.load(cfg_file)
+    mesh = NativeReader(mesh_file)
+    if 'neuralnetwork-hyperparameters' not in cfg.sections():
+        print("No neuralnetwork-hyperparameters section found in config file. Proceeding to use default hyperparameters.")
+
+    hp = HyperParameters.from_config(cfg)
+
+    env = PyFREnvironment(mesh, cfg, backend_name, restart_soln)
     env = TransformedEnv(
         env,
         Compose(
@@ -32,9 +40,9 @@ def evaluate_policy(env, model_path, num_episodes=1):
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], 512),
         nn.Tanh(),
-        nn.Linear(512, 512),
+        nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
         nn.Tanh(),
-        nn.Linear(512, 2),
+        nn.Linear(hp.num_cells_policy, 2),
         NormalParamExtractor()
     ).to(device)
     
