@@ -135,7 +135,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     )
 
     buffer_size = 1000000
-    batch_size = 256
+    batch_size = 256 # this is the batch size of replay buffer sample
     replay_buffer = TensorDictReplayBuffer(
         pin_memory=False,
         prefetch=3,
@@ -179,7 +179,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             replay_buffer.extend(data_view.cpu())
             
             for _ in range(hp.frames_per_batch): #hp.frames_per_batch // sub_batch_size
-                subdata = replay_buffer.sample(batch_size)
+                subdata = replay_buffer.sample()
                 loss_vals = loss_module(subdata.to(device))
                 loss_value = (
                     loss_vals["loss_actor"] + 
