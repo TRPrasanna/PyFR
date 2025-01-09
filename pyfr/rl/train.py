@@ -171,27 +171,27 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     eval_str = ""
 
+    utd_ratio = 1.0 # update to data ratio
     for i, tensordict_data in enumerate(collector):
         collector.update_policy_weights_()
         # Training updates
-        for _ in range(hp.num_epochs):
-            data_view = tensordict_data.reshape(-1)
-            replay_buffer.extend(data_view.cpu())
-            
-            for _ in range(hp.actions_per_episode): #hp.frames_per_batch // sub_batch_size
-                subdata = replay_buffer.sample()
-                loss_vals = loss_module(subdata.to(device))
-                loss_value = (
-                    loss_vals["loss_actor"] + 
-                    loss_vals["loss_qvalue"] + 
-                    loss_vals["loss_alpha"]
-                )
+        data_view = tensordict_data.reshape(-1)
+        replay_buffer.extend(data_view.cpu())
+        
+        for _ in range(int(hp.frames_per_batch * utd_ratio)):
+            subdata = replay_buffer.sample()
+            loss_vals = loss_module(subdata.to(device))
+            loss_value = (
+                loss_vals["loss_actor"] + 
+                loss_vals["loss_qvalue"] + 
+                loss_vals["loss_alpha"]
+            )
 
-                loss_value.backward()
-                #nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
-                optim.step()
-                optim.zero_grad(set_to_none=True)
-                target_net_updater.step()
+            loss_value.backward()
+            #nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
+            optim.step()
+            optim.zero_grad(set_to_none=True)
+            target_net_updater.step()
 
         # Logging
         episode_count += hp.episodes_per_batch
