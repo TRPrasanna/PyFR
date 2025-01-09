@@ -7,19 +7,11 @@ from torch import nn
 from collections import defaultdict
 from tensordict.nn import TensorDictModule
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
-from torchrl.envs import (
-    Compose,
-    DoubleToFloat,
-    ObservationNorm,
-    StepCounter,
-    TransformedEnv,
-)
 from torchrl.collectors import SyncDataCollector
-from torchrl.data.replay_buffers import ReplayBuffer
-from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.objectives import SACLoss
-from torchrl.objectives.value import GAE
+from torchrl.data.replay_buffers import TensorDictReplayBuffer
+from torchrl.objectives import SoftUpdate
+from torchrl.objectives.sac import SACLoss
 from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
@@ -60,7 +52,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
      # Actor network with proper output handling
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_policy),
-        nn.ReLU(), # tanh activation function is most commonly used for small networks for PPO
+        nn.ReLU(),
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
         nn.ReLU(),
         nn.Linear(hp.num_cells_policy, 2),  # 2 outputs: mean and log_std
@@ -78,7 +70,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        return_log_prob=True,
+        return_log_prob=False,
         distribution_kwargs={
         "low": env.action_spec.space.low,
         "high": env.action_spec.space.high,
@@ -86,37 +78,51 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         #safe = True
     ).to(device)
 
-    # state-action value (Q) network; by default this will be duplicated to get 2 Q networks (critics)
+    # state-action value (Q) network
     # We won't use the third optional state value network
-    qvalue_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0] + env.action_spec.shape[0], hp.num_cells_value),
-        nn.ReLU(),
-        nn.Linear(hp.num_cells_value, hp.num_cells_value),
-        nn.ReLU(),
-        nn.Linear(hp.num_cells_value, 1)
+    class QValueNet(nn.Module):
+        def __init__(self, obs_dim, action_dim, hidden_dim):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(obs_dim + action_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1)
+            )
+
+        def forward(self, observation, action):
+            x = torch.cat([observation, action], dim=-1)
+            return self.net(x)
+
+    # Initialize Q-networks
+    qvalue_net = QValueNet(
+        obs_dim=env.observation_spec["observation"].shape[0],
+        action_dim=env.action_spec.shape[0],
+        hidden_dim=hp.num_cells_value
     ).to(device)
 
     qvalue_module = ValueOperator(
         module=qvalue_net,
         in_keys=["observation", "action"],
-    ).to(device)
-
-    qvalue_module2 = ValueOperator(
-        module=qvalue_net,
-        in_keys=["observation", "action"],
+        out_keys=["state_action_value"]
     ).to(device)
 
     loss_module = SACLoss(
         actor_network=policy,
-        qvalue_network=[qvalue_module,qvalue_module2], # here specified as a list so it will be convenient to save as pytorch model
+        qvalue_network=qvalue_module, #[qvalue_module,qvalue_module2], # here specified as a list so it will be convenient to save as pytorch model
         #num_qvalue_nets=2, 2 is default
+        #loss_function='l2',
+        #delay_actor=False,
+        #delay_qvalue=True,
+        #alpha_init=1.0
     )
+    loss_module.make_value_estimator(gamma=hp.gamma)
+    target_update_polyak = 0.995 # check what this is
+    target_net_updater = SoftUpdate(loss_module, eps=target_update_polyak)
 
     # Optimizer
     optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optim, hp.total_frames // hp.frames_per_batch, 0.0
-    )
 
     # Data collection
     collector = SyncDataCollector(
@@ -128,11 +134,13 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         device=device
     )
 
-    # Replay buffer here is not actually used for experience replay
-    # It is rather used for convenience to sample mini-batches from the collected data
-    replay_buffer = ReplayBuffer(
-        storage=LazyTensorStorage(max_size=hp.frames_per_batch),
-        sampler=SamplerWithoutReplacement(),
+    buffer_size = 1000000
+    batch_size = 256
+    replay_buffer = TensorDictReplayBuffer(
+        pin_memory=False,
+        prefetch=3,
+        storage=LazyTensorStorage(max_size=buffer_size),
+        batch_size=batch_size,
     )
 
     best_eval_reward = float('-inf')
@@ -142,7 +150,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         checkpoint = torch.load(load_model, map_location=device, weights_only=True)
         policy.load_state_dict(checkpoint['policy_state_dict'])
         qvalue_module.load_state_dict(checkpoint['qvalue_state_dict'][0])
-        qvalue_module2.load_state_dict(checkpoint['qvalue_state_dict'][1])
+        #qvalue_module2.load_state_dict(checkpoint['qvalue_state_dict'][1])
         best_eval_reward = checkpoint['best_reward']
         start_episode = checkpoint.get('episode', 0)
         print("\nLoaded existing model:")
@@ -164,24 +172,26 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     eval_str = ""
 
     for i, tensordict_data in enumerate(collector):
+        collector.update_policy_weights_()
         # Training updates
         for _ in range(hp.num_epochs):
             data_view = tensordict_data.reshape(-1)
             replay_buffer.extend(data_view.cpu())
             
-            for _ in range(hp.frames_per_batch // sub_batch_size):
-                subdata = replay_buffer.sample(sub_batch_size)
+            for _ in range(hp.frames_per_batch): #hp.frames_per_batch // sub_batch_size
+                subdata = replay_buffer.sample(batch_size)
                 loss_vals = loss_module(subdata.to(device))
                 loss_value = (
-                    loss_vals["loss_objective"] + 
-                    loss_vals["loss_critic"] + 
-                    loss_vals["loss_entropy"]
+                    loss_vals["loss_actor"] + 
+                    loss_vals["loss_qvalue"] + 
+                    loss_vals["loss_alpha"]
                 )
 
                 loss_value.backward()
-                nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
+                #nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
                 optim.step()
-                optim.zero_grad()
+                optim.zero_grad(set_to_none=True)
+                target_net_updater.step()
 
         # Logging
         episode_count += hp.episodes_per_batch
@@ -199,7 +209,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 print(f"\nNew best eval reward: {best_eval_reward:.4f}")
                 torch.save({
                     'policy_state_dict': policy.state_dict(),
-                    'qvalue_state_dict': [qvalue_module.state_dict(), qvalue_module2.state_dict()],
+                    'qvalue_state_dict': [qvalue_module.state_dict(), qvalue_module.state_dict()],
                     'best_reward': best_eval_reward,
                     'latest_reward': eval_reward,
                     'episode': episode_count,
@@ -208,7 +218,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             # Save latest model even if not the best
             torch.save({
                 'policy_state_dict': policy.state_dict(),
-                'qvalue_state_dict': [qvalue_module.state_dict(), qvalue_module2.state_dict()],
+                'qvalue_state_dict': [qvalue_module.state_dict(), qvalue_module.state_dict()],
                 'best_reward': best_eval_reward,
                 'latest_reward': eval_reward,
                 'episode': episode_count,
@@ -223,8 +233,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             "lr": f"{optim.param_groups[0]['lr']:.2e}",
         })
         pbar.update(hp.episodes_per_batch)
-
-        scheduler.step()
 
     collector.shutdown()
     env.close()
