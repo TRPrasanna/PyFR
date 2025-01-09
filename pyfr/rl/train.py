@@ -178,7 +178,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             data_view = tensordict_data.reshape(-1)
             replay_buffer.extend(data_view.cpu())
             
-            for _ in range(hp.frames_per_batch): #hp.frames_per_batch // sub_batch_size
+            for _ in range(hp.actions_per_episode): #hp.frames_per_batch // sub_batch_size
                 subdata = replay_buffer.sample()
                 loss_vals = loss_module(subdata.to(device))
                 loss_value = (
