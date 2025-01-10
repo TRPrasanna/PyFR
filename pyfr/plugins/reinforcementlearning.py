@@ -353,7 +353,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             # Time-averaged forces using trapezoid rule
             delta_t = self.force_times[-1] - self.force_times[0]
             avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
-            #avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+            avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
             #avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
             #print("averaging over time ", self.force_times[-1] - self.force_times[0])
         else:
@@ -365,8 +365,8 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
         # reward = - abs(avg_moment)
-        # reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
-        reward = -avg_drag
+        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
+        # reward = -avg_drag
         return float(reward)
         
 

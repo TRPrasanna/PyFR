@@ -27,21 +27,17 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
     hp = HyperParameters.from_config(cfg)
 
     env = PyFREnvironment(mesh, cfg, backend_name, restart_soln)
-    env = TransformedEnv(
-        env,
-        Compose(
-            StepCounter(),
-        ),
-    )
 
     # Load policy
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], 512),
-        nn.Tanh(),
+        #nn.Tanh(),
+        nn.ReLU(),
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        nn.Tanh(),
+        nn.ReLU(),
+        #nn.Tanh(),
         nn.Linear(hp.num_cells_policy, 2),
         NormalParamExtractor()
     ).to(device)
@@ -57,7 +53,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        return_log_prob=True,
+        return_log_prob=False, # True for PPO
         distribution_kwargs={
         "low": env.action_spec.space.low,
         "high": env.action_spec.space.high,
@@ -67,6 +63,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
     
     policy.load_state_dict(checkpoint['policy_state_dict'])
     policy.eval()
+    print("Best reward in deterministic mode is expected to be: ", checkpoint['best_reward'])
     
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         try:
@@ -76,7 +73,6 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
             # Extract actions and rewards
             actions = eval_rollout["action"].cpu().numpy()
             rewards = eval_rollout["next", "reward"].cpu().numpy()
-            times = eval_rollout["next", "step_count"].cpu().numpy()
             
             print("\nAction history:")
             print("Time\t\tAction\t\tReward")
@@ -99,14 +95,14 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
             
             # Plot action vs time
             ax1.plot(time_array, actions.flatten(), 'b-', label='Action')
-            ax1.set_xlabel('Time (s)')
+            ax1.set_xlabel('Time')
             ax1.set_ylabel('Action')
             ax1.grid(True)
             ax1.legend()
             
             # Plot reward vs time
             ax2.plot(time_array, rewards, 'r-', label='Reward')
-            ax2.set_xlabel('Time (s)')
+            ax2.set_xlabel('Time')
             ax2.set_ylabel('Reward')
             ax2.grid(True)
             ax2.legend()
