@@ -131,7 +131,7 @@ class PyFREnvironment(EnvBase):
     def _step(self, tensordict):
         # Update global control signals
         self.current_control = tensordict["action"].cpu().numpy()
-        print(f"Step called with actions: {tensordict['action'].cpu().numpy()}")
+        #print(f"Step called with actions: {tensordict['action'].cpu().numpy()}")
 
         self.current_time = self.solver.tcurr
         # Update the next action time
