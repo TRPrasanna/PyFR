@@ -307,3 +307,54 @@ class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
             self.control_params.set(np.array([[self._current_target, new_target, t]]))
             #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
             self._current_target = new_target
+
+class NavierStokesSubInflowFrvNeuralType3BCInters(NavierStokesBaseBCInters):
+    type = 'sub-in-frv-neural-type3'
+    cflux_state = 'ghost'
+
+    def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+        
+        # Basic initialization
+        self.c |= self._exp_opts(
+            ['rho', 'u', 'v', 'w'][:self.ndims + 1], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+        # some config parameters
+        self.t_act_interval = self.backend.matrix((1,1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
+                         value=self.t_act_interval)
+
+        # Neural network + control parameters
+        self.control_params = self.backend.matrix((1,3))
+        self._set_external('control_params', 'broadcast fpdtype_t[1][3]', 
+                         value=self.control_params)
+        self.control_params2 = self.backend.matrix((1,2))
+        self._set_external('control_params2', 'broadcast fpdtype_t[1][2]', 
+                         value=self.control_params2)
+
+        # Initial value
+        self.control_params.set(np.array([[0.0, 0.0, 0.0]])) #(Q0,Q1,t0)
+        self.control_params2.set(np.array([[0.0, 0.0]])) #(Q0,Q1) for 2nd control parameter
+
+        # Cache current parameter value 
+        self._current_target = 10.0 # find a way to match this with environment
+        self._current_target2 = 0.0
+
+    def prepare(self, t):
+        # Direct access to control signal from solver environment
+        new_targets = self.intg.system.env.current_control
+        #print(f"new_targets: {new_targets}")
+        #print(f"current_target: {self._current_target}")
+        #print(f"current_target2: {self._current_target2}")
+
+        # Only update backend if there is a new new_target
+        if new_targets[0] != self._current_target: # change in current_target implies change in current_target2
+            self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]])) # check how to avoid this
+            self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
+            self.control_params2.set(np.array([[self._current_target2, new_targets[1]]]))
+            self._current_target = new_targets[0]
+            self._current_target2 = new_targets[1]

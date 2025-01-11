@@ -5,6 +5,7 @@ from tensordict import TensorDict
 from pyfr.backends import get_backend
 from pyfr.rank_allocator import get_rank_allocation
 from pyfr.solvers import get_solver
+import numpy as np
 
 class PyFREnvironment(EnvBase):
     """PyFR environment compatible with TorchRL."""
@@ -21,14 +22,24 @@ class PyFREnvironment(EnvBase):
         self.backend = get_backend(backend_name, self.cfg)
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)
 
-        # Add global control signal storage
-        self.current_control = 0.0
+        self.tend = self.cfg.getfloat('solver-time-integrator', 'tend')
+        self.num_control_actions = self.cfg.getint('solver-plugin-reinforcementlearning', 'num_control_actions')
+        self.actions_low = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions_low')
+        self.actions_high = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions_high')
+        # check if there are num_control_actions action_lows and action_highs
+        assert len(self.actions_low) == self.num_control_actions
+        assert len(self.actions_high) == self.num_control_actions
+
+        print(f"Number of control actions: {self.num_control_actions}")
+        for i in range(self.num_control_actions):
+            print(f"Control action {i+1} range: {self.actions_low[i]} to {self.actions_high[i]}")
+
+        # Add global control signals storage array; initialize with action space low
+        self.current_control = np.array(self.actions_low)
 
         # Initialize the solver and other components
         self.restart_soln = restart_soln
         self._init_solver() # probably hard to get observation_size without doing this
-
-        self.tend = self.cfg.getfloat('solver-time-integrator', 'tend')
 
         # Get observation size from RL plugin
         obs_size = self.rl_plugin.observation_size
@@ -49,11 +60,9 @@ class PyFREnvironment(EnvBase):
 
         self.action_spec = Composite(
             {"action": Bounded(
-                low=torch.tensor(-0.088, device=self.device), # ideally get this from somewhere else
-                high=torch.tensor(0.088, device=self.device),
-                #low=torch.tensor(-60.0, device=self.device), # angular case
-                #high=torch.tensor(60.0, device=self.device),
-                shape=(1,),
+                low=torch.tensor(self.actions_low, device=self.device),
+                high=torch.tensor(self.actions_high, device=self.device),
+                shape=(self.num_control_actions,),
                 device=self.device
             )},
             batch_size=torch.Size([])
@@ -120,11 +129,9 @@ class PyFREnvironment(EnvBase):
         return state.update(self.full_done_spec.zero(shape))
 
     def _step(self, tensordict):
-        action = tensordict['action']
-        #print(f"Step called with action: {action.item()}")
-        
-        # Update global control signal
-        self.current_control = action.item()
+        # Update global control signals
+        self.current_control = tensordict["action"].cpu().numpy()
+        print(f"Step called with actions: {tensordict['action'].cpu().numpy()}")
 
         self.current_time = self.solver.tcurr
         # Update the next action time
@@ -137,7 +144,7 @@ class PyFREnvironment(EnvBase):
             reward = self._compute_reward()
             observation = self._get_observation()
         except RuntimeError as e:
-            print(f"Solver crashed: {str(e)}. Resetting. Last action was: {action.item()}")
+            print(f"Solver crashed: {str(e)}. Resetting. Last actions were: {self.current_control}")
             crashed = True
             # Return neutral state with zero reward
             observation = self.observation_spec.zero(torch.Size([]))["observation"]

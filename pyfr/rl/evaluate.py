@@ -33,11 +33,11 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
     
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], 512),
-        #nn.Tanh(),
-        nn.ReLU(),
+        nn.Tanh(),
+        #nn.ReLU(),
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        nn.ReLU(),
-        #nn.Tanh(),
+        #nn.ReLU(),
+        nn.Tanh(),
         nn.Linear(hp.num_cells_policy, 2),
         NormalParamExtractor()
     ).to(device)
@@ -63,7 +63,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
     
     policy.load_state_dict(checkpoint['policy_state_dict'])
     policy.eval()
-    print("Best reward in deterministic mode is expected to be: ", checkpoint['best_reward'])
+    #print("Best reward in deterministic mode is expected to be: ", checkpoint['best_reward'])
     
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         try:
@@ -82,7 +82,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
             for t in range(len(actions)):
                 action_val = float(actions[t].flatten()[0])  # Extract single value
                 reward_val = float(rewards[t])
-                print(f"{t*env.action_interval:.2f}\t\t{action_val:.3f}\t\t{reward_val:.3f}")
+                print(f"{t*env.action_interval:.2f}\t\t{action_val:.4e}\t\t{reward_val:.3f}")
             
             eval_reward = float(np.mean(rewards))  # Convert to float
             print(f"\nMean reward: {eval_reward:.4f}")
