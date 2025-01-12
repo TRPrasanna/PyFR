@@ -341,7 +341,7 @@ class NavierStokesSubInflowFrvNeuralType3BCInters(NavierStokesBaseBCInters):
         self.control_params2.set(np.array([[0.0, 0.0]])) #(Q0,Q1) for 2nd control parameter
 
         # Cache current parameter value 
-        self._current_target = 10.0 # find a way to match this with environment
+        self._current_target = 0.0 # find a way to match this with environment
         self._current_target2 = 0.0
 
     def prepare(self, t):

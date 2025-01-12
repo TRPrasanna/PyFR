@@ -72,6 +72,8 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
             
             # Extract actions and rewards
             actions = eval_rollout["action"].cpu().numpy()
+            actions_jet1 = actions[:, 0]  # angle
+            actions_jet2 = actions[:, 1]  # vmag
             rewards = eval_rollout["next", "reward"].cpu().numpy()
             
             print("\nAction history:")
@@ -81,8 +83,9 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
             # Handle array formatting explicitly
             for t in range(len(actions)):
                 action_val = float(actions[t].flatten()[0])  # Extract single value
+                action2_val = float(actions[t].flatten()[1])  # Extract single value
                 reward_val = float(rewards[t])
-                print(f"{t*env.action_interval:.2f}\t\t{action_val:.4e}\t\t{reward_val:.3f}")
+                print(f"{t*env.action_interval:.2f}\t\t{action_val:.4e}\t\t{action2_val:.4e}\t\t{reward_val:.4f}")
             
             eval_reward = float(np.mean(rewards))  # Convert to float
             print(f"\nMean reward: {eval_reward:.4f}")
@@ -91,10 +94,12 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
             time_array = np.arange(len(actions)) * env.action_interval
             
             # Create figure with 2 subplots
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+            #fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 8))
             
             # Plot action vs time
-            ax1.plot(time_array, actions.flatten(), 'b-', label='Action')
+            #ax1.plot(time_array, actions.flatten(), 'b-', label='Action')
+            ax1.plot(time_array, actions_jet1, 'b-', label='Action')
             ax1.set_xlabel('Time')
             ax1.set_ylabel('Action')
             ax1.grid(True)
@@ -106,7 +111,14 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
             ax2.set_ylabel('Reward')
             ax2.grid(True)
             ax2.legend()
-            
+
+            # Plot reward vs time
+            ax3.plot(time_array, actions_jet2, 'g-', label='Action 2')
+            ax3.set_xlabel('Time')
+            ax3.set_ylabel('Action 2')
+            ax3.grid(True)
+            ax3.legend()
+
             # Adjust layout and save
             plt.tight_layout()
             plt.savefig('evaluation_results.png')
