@@ -63,7 +63,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
     
     policy.load_state_dict(checkpoint['policy_state_dict'])
     policy.eval()
-    #print("Best reward in deterministic mode is expected to be: ", checkpoint['best_reward'])
+    print("Best reward in deterministic mode is expected to be: ", checkpoint['reward'])
     
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         try:

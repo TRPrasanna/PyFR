@@ -37,6 +37,8 @@ class PyFREnvironment(EnvBase):
         # Add global control signals storage array; initialize with action space low
         self.current_control = np.array(self.actions_low)
 
+        self.action_interval = self.cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')
+
         # Initialize the solver and other components
         self.restart_soln = restart_soln
         self._init_solver() # probably hard to get observation_size without doing this
@@ -108,8 +110,7 @@ class PyFREnvironment(EnvBase):
         self.solver = get_solver(self.backend, self.rallocs, self.mesh, 
                                initsoln=self.restart_soln, cfg=self.cfg, env=self)
         self.rl_plugin = next(p for p in self.solver.plugins 
-                            if p.name == 'reinforcementlearning')
-        self.action_interval = self.rl_plugin.action_interval
+                            if p.name == 'reinforcementlearning')      
         self.current_time = self.solver.tcurr
         self.next_action_time = self.current_time + self.action_interval
 

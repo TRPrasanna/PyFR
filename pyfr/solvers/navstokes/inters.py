@@ -248,19 +248,18 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
         self._current_target = 0.0
 
         # Fixed values
-        #self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]]))
+        self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
         #print(f"jcenter: {jcenter[0][0]}, polarity: {polarity[0][0]}")
 
     def prepare(self, t):
         # Direct access to control signal from solver environment
-        new_target = self.intg.system.env.current_control
+        new_targets = self.intg.system.env.current_control
 
         # Only update backend if there is a new new_target
-        if new_target != self._current_target:
-            self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]])) # check how to avoid this
-            self.control_params.set(np.array([[self._current_target, new_target, t]]))
+        if new_targets[0] != self._current_target:
+            self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
             #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
-            self._current_target = new_target
+            self._current_target = new_targets[0]
 
 class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
     type = 'sub-in-frv-neural-type2'
@@ -294,8 +293,7 @@ class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
         self._current_target = 0.0
 
         # Fixed values
-        #self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]]))
-        #print(f"jcenter: {jcenter[0][0]}, polarity: {polarity[0][0]}")
+        self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
 
     def prepare(self, t):
         # Direct access to control signal from solver environment
@@ -303,7 +301,6 @@ class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
 
         # Only update backend if there is a new new_target
         if new_target != self._current_target:
-            self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]])) # check how to avoid this
             self.control_params.set(np.array([[self._current_target, new_target, t]]))
             #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
             self._current_target = new_target
@@ -341,19 +338,18 @@ class NavierStokesSubInflowFrvNeuralType3BCInters(NavierStokesBaseBCInters):
         self.control_params2.set(np.array([[0.0, 0.0]])) #(Q0,Q1) for 2nd control parameter
 
         # Cache current parameter value 
-        self._current_target = 0.0 # find a way to match this with environment
+        self._current_target = 0.0
         self._current_target2 = 0.0
+
+        # Fixed values
+        self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
 
     def prepare(self, t):
         # Direct access to control signal from solver environment
         new_targets = self.intg.system.env.current_control
-        #print(f"new_targets: {new_targets}")
-        #print(f"current_target: {self._current_target}")
-        #print(f"current_target2: {self._current_target2}")
 
         # Only update backend if there is a new new_target
         if new_targets[0] != self._current_target: # change in current_target implies change in current_target2
-            self.t_act_interval.set(np.array([[self.intg.system.env.action_interval]])) # check how to avoid this
             self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
             self.control_params2.set(np.array([[self._current_target2, new_targets[1]]]))
             self._current_target = new_targets[0]
