@@ -136,10 +136,10 @@ class PyFREnvironment(EnvBase):
         self.step_count = tensordict["step_count"].item()
         
         self.current_time = self.solver.tcurr
-        print(f"Hello from env.py. Stepcount: {self.step_count}, Current time: {self.current_time}")
 
         # Update the next action time
         self.next_action_time = self.current_time + self.action_interval
+        #print(f"Stepcount: {self.step_count}, Current time: {self.current_time}, going to advance to {self.next_action_time}")
 
         try:
             self.solver.advance_to(self.next_action_time)
