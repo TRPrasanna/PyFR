@@ -122,6 +122,7 @@ class PyFREnvironment(EnvBase):
 
     def _reset(self, tensordict=None, **kwargs):
         #print("Reset called")
+        self.step_count = 0
         self._init_solver()
         #self.rl_plugin.reset()
         
@@ -143,7 +144,6 @@ class PyFREnvironment(EnvBase):
 
         try:
             self.solver.advance_to(self.next_action_time)
-            self.control_change_time = True
             crashed = False
             # Normal reward computation
             reward = self._compute_reward()

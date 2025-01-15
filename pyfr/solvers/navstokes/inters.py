@@ -259,12 +259,12 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
         new_targets = self.intg.system.env.current_control
 
         # Only update backend after environment has taken a step
-        if self.intg.system.env.step_count > self.last_step_count:
+        if self.intg.system.env.step_count != self.last_step_count:
             self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
             #print(f"Control signal: {new_targets[0]} at time t = {t}")
             self._current_target = new_targets[0]
+            #print(f"Control signal: {new_targets[0]} updated at time t = {t} and step count = {self.intg.system.env.step_count}, last step count = {self.last_step_count}")
             self.last_step_count = self.intg.system.env.step_count
-            #print(f"Control signal: {new_targets[0]} updated at time t = {t} and step count = {self.last_step_count}")
 
 class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
     type = 'sub-in-frv-neural-type2'
@@ -307,7 +307,7 @@ class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
         new_target = self.intg.system.env.current_control
 
         # Only update backend after environment has taken a step
-        if self.intg.system.env.step_count > self.last_step_count:
+        if self.intg.system.env.step_count != self.last_step_count:
             self.control_params.set(np.array([[self._current_target, new_target, t]]))
             #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
             self._current_target = new_target
@@ -359,7 +359,7 @@ class NavierStokesSubInflowFrvNeuralType3BCInters(NavierStokesBaseBCInters):
         new_targets = self.intg.system.env.current_control
 
         # Only update backend after environment has taken a step
-        if self.intg.system.env.step_count > self.last_step_count:
+        if self.intg.system.env.step_count != self.last_step_count:
             self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
             self.control_params2.set(np.array([[self._current_target2, new_targets[1]]]))
             self._current_target = new_targets[0]
