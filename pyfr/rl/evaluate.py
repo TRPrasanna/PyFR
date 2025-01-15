@@ -27,6 +27,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
     hp = HyperParameters.from_config(cfg)
 
     env = PyFREnvironment(mesh, cfg, backend_name, restart_soln)
+    env = TransformedEnv(env,StepCounter())
 
     # Load policy
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
@@ -68,69 +69,71 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         try:
             print("Starting evaluation...")
-            eval_rollout = env.rollout(100000, policy) # rollout will be stopped by tend
+            eval_rollout = env.rollout(100000, policy)
             
-            # Extract actions and rewards
+            # Extract data
             actions = eval_rollout["action"].cpu().numpy()
-            actions_jet1 = actions[:, 0]  # angle
-            actions_jet2 = actions[:, 1]  # vmag
-            rewards = eval_rollout["next", "reward"].cpu().numpy()
+            rewards = eval_rollout["next", "reward"].cpu().numpy().flatten()
+            expected_reward = checkpoint['reward']
             
-            print("\nAction history:")
-            print("Time\t\tAction\t\tReward")
-            print("-" * 40)
-            
-            # Handle array formatting explicitly
-            for t in range(len(actions)):
-                action_val = float(actions[t].flatten()[0])  # Extract single value
-                action2_val = float(actions[t].flatten()[1])  # Extract single value
-                reward_val = float(rewards[t])
-                print(f"{t*env.action_interval:.2f}\t\t{action_val:.4e}\t\t{action2_val:.4e}\t\t{reward_val:.4f}")
-            
-            eval_reward = float(np.mean(rewards))  # Convert to float
-            print(f"\nMean reward: {eval_reward:.4f}")
-
-            # Create time array
+            # Handle single vs multi-action case
+            if len(actions.shape) == 1:
+                actions = actions.reshape(-1, 1)
+            num_actions = actions.shape[1]
             time_array = np.arange(len(actions)) * env.action_interval
             
-            # Create figure with 2 subplots
-            #fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 8))
+            # Print action history
+            print("\nAction history:")
+            header = f"{'Time':>10}"
+            for i in range(num_actions):
+                header += f"{'Action_'+str(i):>15}"
+            header += f"{'Reward':>15}"
+            print(header)
+            print("-" * (10 + 15 * (num_actions + 1)))
             
-            # Plot action vs time
-            #ax1.plot(time_array, actions.flatten(), 'b-', label='Action')
-            ax1.plot(time_array, actions_jet1, 'b-', label='Action')
-            ax1.set_xlabel('Time')
-            ax1.set_ylabel('Action')
-            ax1.grid(True)
-            ax1.legend()
+            # Format and print data rows
+            for t in range(len(time_array)):
+                row = f"{time_array[t]:10.2f}"
+                for i in range(num_actions):
+                    row += f"{actions[t,i]:15.4f}"
+                row += f"{rewards[t]:15.4f}"
+                print(row)
             
-            # Plot reward vs time
-            ax2.plot(time_array, rewards, 'r-', label='Reward')
-            ax2.set_xlabel('Time')
-            ax2.set_ylabel('Reward')
-            ax2.grid(True)
-            ax2.legend()
+            # Calculate and print statistics
+            eval_reward = float(np.mean(rewards))
+            print("\nEvaluation Results:")
+            print("-" * 40)
+            print(f"Expected reward: {expected_reward:.4f}")
+            print(f"Actual reward:   {eval_reward:.4f}")
+            print(f"Difference:      {((eval_reward - expected_reward)/expected_reward)*100:.2f}%")
 
-            # Plot reward vs time
-            ax3.plot(time_array, actions_jet2, 'g-', label='Action 2')
-            ax3.set_xlabel('Time')
-            ax3.set_ylabel('Action 2')
-            ax3.grid(True)
-            ax3.legend()
+            # Create figure with proper axes
+            fig, axes = plt.subplots(num_actions + 1, 1, 
+                                   figsize=(12, 4*(num_actions + 1)),
+                                   sharex=True)
+            axes = np.atleast_1d(axes)
+            
+            # Plot actions
+            for i in range(num_actions):
+                axes[i].plot(time_array, actions[:,i], '-', label=f'Action {i}')
+                axes[i].set_ylabel(f'Action {i}')
+                axes[i].grid(True)
+                axes[i].legend()
+            
+            # Plot reward
+            axes[-1].plot(time_array, rewards, 'r-', label='Reward')
+            axes[-1].set_xlabel('Time')
+            axes[-1].set_ylabel('Reward')
+            axes[-1].grid(True)
+            axes[-1].legend()
 
-            # Adjust layout and save
             plt.tight_layout()
-            plt.savefig('evaluation_results.png')
+            plt.savefig('evaluation_results.png', dpi=300, bbox_inches='tight')
             plt.close()
             
             print(f"\nPlots saved as evaluation_results.png")
-
             return eval_reward
             
-        except RuntimeError as e:
-            print(f"Evaluation failed: {str(e)}")
-            return None
         except Exception as e:
-            print(f"Unexpected error: {str(e)}")
-            return None
+            print(f"Unexpected error in evaluation: {str(e)}")
+            raise  # Re-raise exception for debugging

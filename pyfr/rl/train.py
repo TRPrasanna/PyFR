@@ -56,6 +56,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     # Initialize environment
     env = PyFREnvironment(mesh, cfg, backend_name, restart_soln)
+    env = TransformedEnv(env,StepCounter())
 
      # Actor network with proper output handling
     actor_net = nn.Sequential(

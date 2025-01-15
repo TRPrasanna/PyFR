@@ -38,10 +38,11 @@ class PyFREnvironment(EnvBase):
         self.current_control = np.array(self.actions_low)
 
         self.action_interval = self.cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')
+        self.step_count = -1
 
         # Initialize the solver and other components
         self.restart_soln = restart_soln
-        self._init_solver() # probably hard to get observation_size without doing this
+        self._init_solver() # probably hard to get observation_size without doing this, but should preferably get rid of this
 
         # Get observation size from RL plugin
         obs_size = self.rl_plugin.observation_size
@@ -112,7 +113,6 @@ class PyFREnvironment(EnvBase):
         self.rl_plugin = next(p for p in self.solver.plugins 
                             if p.name == 'reinforcementlearning')      
         self.current_time = self.solver.tcurr
-        self.next_action_time = self.current_time + self.action_interval
 
     def _get_observation_size(self):
         # Implement logic to determine observation size
@@ -133,13 +133,17 @@ class PyFREnvironment(EnvBase):
         # Update global control signals
         self.current_control = tensordict["action"].cpu().numpy()
         #print(f"Step called with actions: {tensordict['action'].cpu().numpy()}")
-
+        self.step_count = tensordict["step_count"].item()
+        
         self.current_time = self.solver.tcurr
+        print(f"Hello from env.py. Stepcount: {self.step_count}, Current time: {self.current_time}")
+
         # Update the next action time
-        self.next_action_time += self.action_interval
+        self.next_action_time = self.current_time + self.action_interval
 
         try:
             self.solver.advance_to(self.next_action_time)
+            self.control_change_time = True
             crashed = False
             # Normal reward computation
             reward = self._compute_reward()

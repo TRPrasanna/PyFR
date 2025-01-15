@@ -251,15 +251,20 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
         self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
         #print(f"jcenter: {jcenter[0][0]}, polarity: {polarity[0][0]}")
 
+        # Helper to keep track of last step count
+        self.last_step_count = -1
+
     def prepare(self, t):
         # Direct access to control signal from solver environment
         new_targets = self.intg.system.env.current_control
 
-        # Only update backend if there is a new new_target
-        if new_targets[0] != self._current_target:
+        # Only update backend after environment has taken a step
+        if self.intg.system.env.step_count > self.last_step_count:
             self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
-            #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
+            #print(f"Control signal: {new_targets[0]} at time t = {t}")
             self._current_target = new_targets[0]
+            self.last_step_count = self.intg.system.env.step_count
+            #print(f"Control signal: {new_targets[0]} updated at time t = {t} and step count = {self.last_step_count}")
 
 class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
     type = 'sub-in-frv-neural-type2'
@@ -295,15 +300,18 @@ class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
         # Fixed values
         self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
 
+        self.last_step_count = -1
+
     def prepare(self, t):
         # Direct access to control signal from solver environment
         new_target = self.intg.system.env.current_control
 
-        # Only update backend if there is a new new_target
-        if new_target != self._current_target:
+        # Only update backend after environment has taken a step
+        if self.intg.system.env.step_count > self.last_step_count:
             self.control_params.set(np.array([[self._current_target, new_target, t]]))
             #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
             self._current_target = new_target
+            self.last_step_count = self.intg.system.env.step_count
 
 class NavierStokesSubInflowFrvNeuralType3BCInters(NavierStokesBaseBCInters):
     type = 'sub-in-frv-neural-type3'
@@ -344,13 +352,16 @@ class NavierStokesSubInflowFrvNeuralType3BCInters(NavierStokesBaseBCInters):
         # Fixed values
         self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
 
+        self.last_step_count = -1
+
     def prepare(self, t):
         # Direct access to control signal from solver environment
         new_targets = self.intg.system.env.current_control
 
-        # Only update backend if there is a new new_target
-        if new_targets[0] != self._current_target: # change in current_target implies change in current_target2
+        # Only update backend after environment has taken a step
+        if self.intg.system.env.step_count > self.last_step_count:
             self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
             self.control_params2.set(np.array([[self._current_target2, new_targets[1]]]))
             self._current_target = new_targets[0]
             self._current_target2 = new_targets[1]
+            self.last_step_count = self.intg.system.env.step_count
