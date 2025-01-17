@@ -211,7 +211,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         episode_count += hp.episodes_per_batch
         train_reward = tensordict_data["next", "reward"].mean().item()
         logs["train_reward"].append(train_reward)
-        print(f"\n Batch finished. Episode count is {episode_count}")
+        #print(f"\n Batch finished. Episode count is {episode_count}")
 
         # Evaluate every hp.eval_frequency batches
         if i % hp.eval_frequency == 0:
