@@ -15,7 +15,7 @@ from pyfr.inifile import Inifile
 from pyfr.readers.native import NativeReader
 from pyfr.rl.env import PyFREnvironment
 
-def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=None, episodes=1):
+def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, episodes=1):
     """Evaluate trained policy"""
     device = torch.device('cuda')
 
@@ -26,11 +26,11 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
 
     hp = HyperParameters.from_config(cfg)
 
-    env = PyFREnvironment(mesh, cfg, backend_name, restart_soln)
+    env = PyFREnvironment(mesh, cfg, backend_name, ic_dir=ic_dir)
     env = TransformedEnv(env,StepCounter())
 
     # Load policy
-    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(load_model, map_location=device, weights_only=True)
     
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], 512),
@@ -64,17 +64,33 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
     
     policy.load_state_dict(checkpoint['policy_state_dict'])
     policy.eval()
-    print("Best reward in deterministic mode is expected to be: ", checkpoint['reward'])
-    
-    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-        try:
+
+    # Get stored rewards
+    current_reward = checkpoint.get('current_reward', checkpoint.get('reward', None))
+    best_reward = checkpoint.get('best_reward', current_reward)
+    saved_episode = checkpoint.get('episode', 0)
+    best_episode = checkpoint.get('best_episode', saved_episode)
+
+    print("\nModel Information:")
+    print("-" * 40)
+    if current_reward is not None:
+        print(f"Current reward: {current_reward:.4f}")
+    if best_reward is not None:
+        print(f"Best reward: {best_reward:.4f}")
+        print(f"Best reward at episode: {best_episode}")
+    print(f"Model saved at episode: {saved_episode}")
+    print(f"Model path: {load_model}")
+
+    # Set evaluation mode and run
+    env.set_evaluation_mode(True)
+    try:
+        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
             print("Starting evaluation...")
             eval_rollout = env.rollout(100000, policy)
             
-            # Extract data
+            # Extract data and process for plotting
             actions = eval_rollout["action"].cpu().numpy()
             rewards = eval_rollout["next", "reward"].cpu().numpy().flatten()
-            expected_reward = checkpoint['reward']
             
             # Handle single vs multi-action case
             if len(actions.shape) == 1:
@@ -99,28 +115,27 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
                 row += f"{rewards[t]:15.4f}"
                 print(row)
             
-            # Calculate and print statistics
+             # Print evaluation results
             eval_reward = float(np.mean(rewards))
             print("\nEvaluation Results:")
             print("-" * 40)
-            print(f"Expected reward: {expected_reward:.4f}")
+            print(f"Expected reward: {current_reward:.4f}")
             print(f"Actual reward:   {eval_reward:.4f}")
-            print(f"Difference:      {((eval_reward - expected_reward)/expected_reward)*100:.2f}%")
-
-            # Create figure with proper axes
+            if current_reward is not None:
+                print(f"Difference:      {((eval_reward - current_reward)/current_reward)*100:.2f}%")
+            
+            # Create evaluation plots
             fig, axes = plt.subplots(num_actions + 1, 1, 
                                    figsize=(12, 4*(num_actions + 1)),
                                    sharex=True)
             axes = np.atleast_1d(axes)
             
-            # Plot actions
             for i in range(num_actions):
                 axes[i].plot(time_array, actions[:,i], '-', label=f'Action {i}')
                 axes[i].set_ylabel(f'Action {i}')
                 axes[i].grid(True)
                 axes[i].legend()
             
-            # Plot reward
             axes[-1].plot(time_array, rewards, 'r-', label='Reward')
             axes[-1].set_xlabel('Time')
             axes[-1].set_ylabel('Reward')
@@ -132,8 +147,11 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, model_path, restart_soln=
             plt.close()
             
             print(f"\nPlots saved as evaluation_results.png")
+            del eval_rollout
             return eval_reward
             
-        except Exception as e:
-            print(f"Unexpected error in evaluation: {str(e)}")
-            raise  # Re-raise exception for debugging
+    except Exception as e:
+        print(f"Unexpected error in evaluation: {str(e)}")
+        raise
+    finally:
+        env.set_evaluation_mode(False)

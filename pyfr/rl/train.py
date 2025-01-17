@@ -26,7 +26,7 @@ from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration
 import os
 import math
 
-def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', restart_soln=None, load_model=None):
+def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
     # Device setup
     #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
     #device = torch.device('cpu')
@@ -37,8 +37,14 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     if 'neuralnetwork-hyperparameters' not in cfg.sections():
         print("No neuralnetwork-hyperparameters section found in config file. Proceeding to use default hyperparameters.")
 
+    # Initialize environment
+    env = PyFREnvironment(mesh, cfg, backend_name, ic_dir=ic_dir)
+    env = TransformedEnv(env,StepCounter())
+
     hp = HyperParameters.from_config(cfg)
-    
+    # Calculate derived parameters using environment info
+    hp._calculate_derived(env)
+
     # Adjust num_minibatches if it does not divide frames_per_batch evenly
     sub_batch_size = hp.frames_per_batch // hp.desired_num_minibatches
     remainder = hp.frames_per_batch % hp.desired_num_minibatches
@@ -53,10 +59,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         hp.desired_num_minibatches = adjusted_num_minibatches
 
     hp.print_summary()
-
-    # Initialize environment
-    env = PyFREnvironment(mesh, cfg, backend_name, restart_soln)
-    env = TransformedEnv(env,StepCounter())
 
      # Actor network with proper output handling
     actor_net = nn.Sequential(
@@ -143,21 +145,37 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     )
 
     best_eval_reward = float('-inf')
+    best_eval_episode = 0
+    start_episode = 0
+    current_eval_reward = None
+
     # Load existing model if specified
-    best_reward = float('-inf')
     if load_model and os.path.exists(load_model):
         checkpoint = torch.load(load_model, map_location=device, weights_only=True)
         policy.load_state_dict(checkpoint['policy_state_dict'])
         value_module.load_state_dict(checkpoint['value_state_dict'])
-        best_eval_reward = checkpoint['reward']
-        start_episode = checkpoint.get('episode', 0)
         
+        # Handle both old and new checkpoint formats
+        current_eval_reward = checkpoint.get('current_reward', checkpoint.get('reward', None))
+        loaded_best_reward = checkpoint.get('best_reward', current_eval_reward)
+        start_episode = checkpoint.get('episode', 0)
+        loaded_best_episode = checkpoint.get('best_episode', start_episode)
+
         print("\nLoaded existing model:")
-        print(f"Previous best eval reward: {best_eval_reward:.4f}")
-        print(f"Previous episode count: {start_episode}")
+        if current_eval_reward is not None:
+            print(f"Current eval reward: {current_eval_reward:.4f}")
+        if loaded_best_reward is not None:
+            print(f"Best eval reward: {loaded_best_reward:.4f}")
+            print(f"Best reward achieved at episode: {loaded_best_episode}")
+        print(f"Current episode count: {start_episode}")
         print(f"Model path: {load_model}\n")
-    else:
-        start_episode = 0
+
+        # Only update best reward if loading the best model
+        if "best_model" in load_model:
+            best_eval_reward = loaded_best_reward
+            best_eval_episode = loaded_best_episode
+        else:
+            print("Note: Loading non-best model, will track new best reward from here\n")
 
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -193,36 +211,42 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         episode_count += hp.episodes_per_batch
         train_reward = tensordict_data["next", "reward"].mean().item()
         logs["train_reward"].append(train_reward)
-        
-        # Evaluate every 10 episodes
-        if episode_count % 10 < hp.episodes_per_batch:
-            eval_reward = evaluate_policy(env, policy, num_steps=hp.actions_per_episode)
+        print(f"\n Batch finished. Episode count is {episode_count}")
+
+        # Evaluate every hp.eval_frequency batches
+        if i % hp.eval_frequency == 0:
+            eval_reward = evaluate_policy(env, policy)
             logs["eval_reward"].append(eval_reward)
             
-            # Save best
+            # Save best model if new best achieved
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
-                print(f"\nNew best eval reward: {best_eval_reward:.4f}")
+                best_eval_episode = episode_count
+                print(f"\nNew best eval reward: {best_eval_reward:.5f} at episode {episode_count}")
                 torch.save({
                     'policy_state_dict': policy.state_dict(),
                     'value_state_dict': value_module.state_dict(),
-                    'reward': best_eval_reward,
+                    'current_reward': eval_reward,
+                    'best_reward': best_eval_reward,
                     'episode': episode_count,
+                    'best_episode': best_eval_episode,
                 }, best_model_path)
 
-            # Save latest model even if not the best
+            # Save latest model
             torch.save({
                 'policy_state_dict': policy.state_dict(),
                 'value_state_dict': value_module.state_dict(),
-                'reward': eval_reward,
+                'current_reward': eval_reward,
+                'best_reward': best_eval_reward,
                 'episode': episode_count,
+                'best_episode': best_eval_episode,
             }, latest_model_path)
 
-            eval_str = f"eval reward: {eval_reward:.2f} (best: {best_eval_reward:.2f})"
+            eval_str = f"eval reward: {eval_reward:.5f} (best: {best_eval_reward:.5f})"
 
         # Progress bar update
         pbar.set_postfix({
-            "train_reward": f"{train_reward:.2f}",
+            "train_reward": f"{train_reward:.5f}",
             "eval": eval_str,
             "lr": f"{optim.param_groups[0]['lr']:.2e}",
         })
@@ -233,12 +257,17 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     collector.shutdown()
     env.close()
 
-def evaluate_policy(env, policy, num_steps=1000000):
-    """Evaluate policy without exploration"""
-    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-        eval_rollout = env.rollout(num_steps, policy)
-        eval_reward = eval_rollout["next", "reward"].mean().item()
-        return eval_reward
+def evaluate_policy(env, policy, num_steps=1000000): # _check_done will take care of num_steps
+    """Evaluate policy without exploration using consistent IC"""
+    env.set_evaluation_mode(True)  # Use same IC
+    try:
+        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+            eval_rollout = env.rollout(num_steps, policy)
+            eval_reward = eval_rollout["next", "reward"].mean().item()
+            del eval_rollout
+            return eval_reward
+    finally:
+        env.set_evaluation_mode(False)  # Reset to training mode
 
 def get_closest_divisor(n, target):
     """
@@ -270,7 +299,6 @@ class HyperParameters:
     
     # Training schedule
     episodes: int = 1200
-    actions_per_episode: int = 480
     episodes_per_batch: int = 20
     desired_num_minibatches: int = 16
     num_epochs: int = 10
@@ -280,8 +308,11 @@ class HyperParameters:
     gamma: float = 0.99
     lmbda: float = 0.97
     entropy_eps: float = 1e-3
-    lr: float = 1e-4
+    lr: float = 3e-4
     max_grad_norm: float = 1.0
+
+    # Evaluation settings
+    eval_frequency: int = 1  # Evaluate every N policy updates
 
     def __post_init__(self):
         """Initialize parameter sources and calculate derived values"""
@@ -290,11 +321,14 @@ class HyperParameters:
             field_name: 'default' 
             for field_name in self.__dataclass_fields__.keys()
         }
-        self._derived_params = {'frames_per_batch', 'total_frames'}
-        self._calculate_derived()
+        self._derived_params = {'frames_per_batch', 'total_frames', 'actions_per_episode'}
+        self.actions_per_episode = None
+        self.frames_per_batch = None
+        self.total_frames = None
 
-    def _calculate_derived(self):
+    def _calculate_derived(self, env):
         """Calculate derived parameters"""
+        self.actions_per_episode = int(env.dtend / env.action_interval)
         self.frames_per_batch = self.episodes_per_batch * self.actions_per_episode
         self.total_frames = self.episodes * self.actions_per_episode
 
@@ -304,19 +338,19 @@ class HyperParameters:
         if 'neuralnetwork-hyperparameters' in cfg.sections():
             section = 'neuralnetwork-hyperparameters'
             for field_name, field in params.__dataclass_fields__.items():
-                if field_name not in params._derived_params and cfg.hasopt(section, field_name):
+                # Convert underscore to hyphen for config lookup
+                config_name = field_name.replace('_', '-')
+                if field_name not in params._derived_params and cfg.hasopt(section, config_name):
                     if field.type == int:
-                        value = cfg.getint(section, field_name)
+                        value = cfg.getint(section, config_name)
                     elif field.type == float:
-                        value = cfg.getfloat(section, field_name)
+                        value = cfg.getfloat(section, config_name)
                     elif field.type == bool:
-                        value = cfg.getbool(section, field_name)
+                        value = cfg.getbool(section, config_name)
                     else:
-                        value = cfg.get(section, field_name)
+                        value = cfg.get(section, config_name)
                     setattr(params, field_name, value)
                     params._param_sources[field_name] = 'config'
-        
-        params._calculate_derived()
         return params
 
     def print_summary(self) -> None:
@@ -328,7 +362,6 @@ class HyperParameters:
             ],
             "Training Schedule": [
                 ("episodes", "Total training episodes"),
-                ("actions_per_episode", "Actions per episode"),
                 ("episodes_per_batch", "Episodes per update batch"),
                 ("desired_num_minibatches", "Target minibatches per update"),
                 ("num_epochs", "Training epochs per batch")
@@ -343,7 +376,11 @@ class HyperParameters:
             ],
             "Derived Values": [
                 ("frames_per_batch", "Frames per batch"),
-                ("total_frames", "Total training frames")
+                ("total_frames", "Total training frames"),
+                ("actions_per_episode", "Actions per episode")
+            ],
+            "Evaluation Settings": [
+                ("eval_frequency", "Evaluate policy every N updates"),
             ]
         }
 

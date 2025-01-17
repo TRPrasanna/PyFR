@@ -6,11 +6,16 @@ from pyfr.backends import get_backend
 from pyfr.rank_allocator import get_rank_allocation
 from pyfr.solvers import get_solver
 import numpy as np
+import os
+import random
+from typing import List, Set
+from pyfr.readers.native import NativeReader
+from datetime import datetime
 
 class PyFREnvironment(EnvBase):
     """PyFR environment compatible with TorchRL."""
     
-    def __init__(self, mesh, cfg, backend_name, restart_soln=None):
+    def __init__(self, mesh, cfg, backend_name, ic_dir=None):
         #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
         #device = torch.device('cpu')
         device = torch.device('cuda')
@@ -23,9 +28,9 @@ class PyFREnvironment(EnvBase):
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)
 
         self.tend = self.cfg.getfloat('solver-time-integrator', 'tend')
-        self.num_control_actions = self.cfg.getint('solver-plugin-reinforcementlearning', 'num_control_actions')
-        self.actions_low = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions_low')
-        self.actions_high = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions_high')
+        self.num_control_actions = self.cfg.getint('solver-plugin-reinforcementlearning', 'num-control-actions')
+        self.actions_low = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-low')
+        self.actions_high = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-high')
         # check if there are num_control_actions action_lows and action_highs
         assert len(self.actions_low) == self.num_control_actions
         assert len(self.actions_high) == self.num_control_actions
@@ -37,11 +42,34 @@ class PyFREnvironment(EnvBase):
         # Add global control signals storage array; initialize with action space low
         self.current_control = np.array(self.actions_low)
 
+        self.dtend = self.cfg.getfloat('solver-time-integrator', 'dtend') # difference between initial and final time
+        # Get evaluation time if specified, otherwise use training time
+        self.eval_time = self.cfg.getfloat('solver-plugin-reinforcementlearning', 
+                                          'eval-time', 
+                                          self.dtend)
+        # Track current episode time limit
+        self._current_time_limit = self.dtend
+
         self.action_interval = self.cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')
         self.step_count = -1
 
-        # Initialize the solver and other components
-        self.restart_soln = restart_soln
+        # Initialize IC manager if directory provided
+        self.ic_manager = None
+        if ic_dir is not None:
+            try:
+                self.ic_manager = InitialConditionManager(ic_dir, mesh['mesh_uuid'])
+            except ValueError as e:
+                print(f"\nWarning: {str(e)}")
+                print("Continuing without initial condition snapshots...")
+        else:
+            print("\nNote: No initial condition directory provided.")
+            print("Training will use default initial conditions.")
+
+        self.eval_ic = None  # Store evaluation IC
+        self.is_evaluating = False  # Track evaluation mode
+
+        # Initialize the solver and other components; no need to pass initial solution for now
+        self.restart_soln = None 
         self._init_solver() # probably hard to get observation_size without doing this, but should preferably get rid of this
 
         # Get observation size from RL plugin
@@ -107,12 +135,15 @@ class PyFREnvironment(EnvBase):
         )
         print("Environment initialized.")
 
-    def _init_solver(self):
+    def _init_solver(self, initsoln=None):
+        self.restart_soln = initsoln
         self.solver = get_solver(self.backend, self.rallocs, self.mesh, 
                                initsoln=self.restart_soln, cfg=self.cfg, env=self)
         self.rl_plugin = next(p for p in self.solver.plugins 
                             if p.name == 'reinforcementlearning')      
         self.current_time = self.solver.tcurr
+        # Use current mode's time limit
+        self.max_time = self.current_time + self._current_time_limit
 
     def _get_observation_size(self):
         # Implement logic to determine observation size
@@ -123,7 +154,21 @@ class PyFREnvironment(EnvBase):
     def _reset(self, tensordict=None, **kwargs):
         #print("Reset called")
         self.step_count = 0
-        self._init_solver()
+
+        restart_soln = None
+        # Handle evaluation mode differently
+        if self.ic_manager is not None:
+            try:
+                if self.is_evaluating:
+                    restart_soln = self.ic_manager.get_eval_ic()
+                else:
+                    ic_file = self.ic_manager.get_random_ic()
+                    restart_soln = NativeReader(ic_file)
+            except Exception as e:
+                print(f"Warning: Failed to load IC file: {str(e)}")
+                print("Using default initial conditions.")
+
+        self._init_solver(initsoln=restart_soln)
         #self.rl_plugin.reset()
         
         shape = torch.Size([])
@@ -148,21 +193,22 @@ class PyFREnvironment(EnvBase):
             # Normal reward computation
             reward = self._compute_reward()
             observation = self._get_observation()
+            truncated = self._check_done()
+            terminated = False
+
         except RuntimeError as e:
             print(f"Solver crashed: {str(e)}. Resetting. Last actions were: {self.current_control}")
             crashed = True
             # Return neutral state with zero reward
             observation = self.observation_spec.zero(torch.Size([]))["observation"]
             reward = -10.0
-
-        done = crashed or self.current_time >= self.tend
-        terminated = crashed  
-        truncated = not crashed and self.current_time >= self.tend
+            truncated = False
+            terminated = True
 
         return TensorDict({
             'observation': observation,
             'reward': torch.tensor([reward], device=self.device),
-            'done': torch.tensor([done], device=self.device, dtype=torch.bool),
+            'done': torch.tensor([terminated or truncated], device=self.device, dtype=torch.bool),
             'terminated': torch.tensor([terminated], device=self.device, dtype=torch.bool),
             'truncated': torch.tensor([truncated], device=self.device, dtype=torch.bool),
         }, batch_size=torch.Size([]))
@@ -179,16 +225,72 @@ class PyFREnvironment(EnvBase):
         reward = self.rl_plugin._get_reward(self.solver)
         return reward
 
-    def _check_done(self): # not used now
-        # Implement your termination condition
-        max_time = self.cfg.getfloat('solver-time-integrator', 'tend')
-        return self.current_time >= max_time
+    def _check_done(self) -> bool:
+        """Check if episode should terminate due to time limit."""
+        return self.current_time >= self.max_time
 
-    def _set_seed(self, seed):
+    def _set_seed(self, seed): # this does nothing for now
         torch.manual_seed(seed)
+
+    def set_evaluation_mode(self, is_evaluating: bool):
+        """Set environment to evaluation mode."""
+        self.is_evaluating = is_evaluating
+        # Switch time limit based on mode
+        self._current_time_limit = self.eval_time if is_evaluating else self.dtend
 
     def close(self):
         """Clean up resources"""
         # Don't finalize MPI here since other parts might still need it
         #self.solver = None
         #self.rl_plugin = None
+
+class InitialConditionManager:
+    def __init__(self, ic_dir: str, mesh_uuid: str):
+        self.ic_dir = ic_dir
+        self.mesh_uuid = mesh_uuid
+        self.ic_files = self._find_valid_ics()
+        self.unused_files = set(self.ic_files)
+        self.eval_ic_file = self._get_oldest_ic()
+        print(f"\nFound {len(self.ic_files)} initial condition files in {ic_dir}")
+        if self.eval_ic_file:
+            print(f"Using {os.path.basename(self.eval_ic_file)} for evaluation")
+
+    def _get_oldest_ic(self) -> str:
+        """Get oldest .pyfrs file by creation time."""
+        if not self.ic_files:
+            return None
+        oldest = min(self.ic_files, key=os.path.getctime)
+        creation_time = datetime.fromtimestamp(os.path.getctime(oldest))
+        print(f"\nSelected evaluation IC: {os.path.basename(oldest)}")
+        print(f"Creation time: {creation_time:%Y-%m-%d %H:%M:%S}")
+        return oldest
+
+    def get_eval_ic(self) -> NativeReader:
+        """Get the evaluation IC."""
+        return NativeReader(self.eval_ic_file) if self.eval_ic_file else None
+        
+    def _find_valid_ics(self) -> List[str]:
+        """Find all valid .pyfrs files in directory."""
+        if not os.path.exists(self.ic_dir):
+            raise ValueError(f"IC directory {self.ic_dir} not found")
+            
+        ic_files = []
+        for f in os.listdir(self.ic_dir):
+            if f.endswith('.pyfrs'):
+                file_path = os.path.join(self.ic_dir, f)
+                try:
+                    soln = NativeReader(file_path)
+                    if soln['mesh_uuid'] == self.mesh_uuid:
+                        ic_files.append(file_path)
+                except:
+                    continue
+        return ic_files
+
+    def get_random_ic(self) -> str:
+        """Get random unused IC file, reset if all used."""
+        if not self.unused_files:
+            self.unused_files = set(self.ic_files)
+        
+        ic_file = random.choice(list(self.unused_files))
+        self.unused_files.remove(ic_file)
+        return ic_file

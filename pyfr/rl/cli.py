@@ -37,7 +37,8 @@ def main():
     ap_train.add_argument('cfg', type=FileType('r'), help='config file')
     ap_train.add_argument('--checkpoint-dir', default='checkpoints',
                          help='directory to save checkpoints')
-    ap_train.add_argument('--restart', help='restart solution file')
+    ap_train.add_argument('--ic-dir', default=None,
+                         help='directory of initial condition snapshots')
     ap_train.add_argument('--load-model', help='load existing model checkpoint to continue training')
     ap_train.set_defaults(process=process_train)
 
@@ -50,9 +51,10 @@ def main():
     ap_eval = sp.add_parser('evaluate', help='evaluate trained policy')
     ap_eval.add_argument('mesh', help='mesh file')
     ap_eval.add_argument('cfg', type=FileType('r'), help='config file')
-    ap_eval.add_argument('--model-path', required=True, help='path to model checkpoint')
     ap_eval.add_argument('--episodes', type=int, default=10, help='number of evaluation episodes')
-    ap_eval.add_argument('--restart', help='restart solution file')
+    ap_eval.add_argument('--load-model', required=True, help='path to model checkpoint')
+    ap_eval.add_argument('--ic-dir', default=None,
+                        help='directory of initial condition snapshots (optional)')
     ap_eval.add_argument('--backend', '-b', choices=backends, required=True)
     ap_eval.set_defaults(process=process_evaluate)
 
@@ -69,16 +71,6 @@ def process_train(args):
     # Manually initialise MPI
     init_mpi()
 
-    # Load restart solution if provided
-    restart_soln = None
-    if args.restart:
-        restart_soln = NativeReader(args.restart)
-        mesh = NativeReader(args.mesh)
-        
-        # Verify mesh UUID matches
-        if restart_soln['mesh_uuid'] != mesh['mesh_uuid']:
-            raise RuntimeError('Restart solution does not match mesh.')
-
     print(f"Starting training with checkpoint dir: {args.checkpoint_dir}")
     from .train import train_agent
 
@@ -87,28 +79,19 @@ def process_train(args):
         cfg_file=args.cfg,
         backend_name=args.backend,
         checkpoint_dir=args.checkpoint_dir,
-        restart_soln=restart_soln,
+        ic_dir=args.ic_dir,
         load_model=args.load_model
     )
 
 def process_evaluate(args):
     init_mpi()
-    
-    # Load restart solution if provided 
-    restart_soln = None
-    if args.restart:
-        restart_soln = NativeReader(args.restart)
-        mesh = NativeReader(args.mesh)
-        
-        if restart_soln['mesh_uuid'] != mesh['mesh_uuid']:
-            raise RuntimeError('Restart solution does not match mesh.')
             
     from .evaluate import evaluate_policy
     evaluate_policy(
         mesh_file=args.mesh,
         cfg_file=args.cfg,
         backend_name=args.backend,
-        model_path=args.model_path,
-        restart_soln=restart_soln,
+        load_model=args.load_model,
+        ic_dir=args.ic_dir,
         episodes=args.episodes
     )

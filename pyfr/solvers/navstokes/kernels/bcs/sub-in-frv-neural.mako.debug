@@ -9,8 +9,9 @@
 % for i, v in enumerate('uvw'[:ndims]):
     ur[${i + 1}] = ${control}*(${c['rho']}) * (${c[v]});
 % endfor
-    if(t>control_params[0][2]+t_act_interval[0][0]) printf("%e > %e \n", t,control_params[0][2]+t_act_interval[0][0]);
-    if(t<control_params[0][2]) printf("%e < %e \n", t,control_params[0][2]+t_act_interval[0][0]);
+    ##if(t>control_params[0][2]+t_act_interval[0][0]) printf("%e > %e \n", t,control_params[0][2]+t_act_interval[0][0]);
+    ##if(t<control_params[0][2]) printf("%e < %e \n", t,control_params[0][2]+t_act_interval[0][0]);
+    if(${control}>8.9e-2 || ${control}<-8.9e-2) printf("%e [%e %e %e] %e %e \n",${control}, control_params[0][0], control_params[0][1], control_params[0][2], t, t_act_interval[0][0]);
     ur[${nvars - 1}] = ul[${nvars - 1}]
                      - 0.5*(1.0/ul[0])*${pyfr.dot('ul[{i}]', i=(1, ndims + 1))}
                      + 0.5*(1.0/ur[0])*${pyfr.dot('ur[{i}]', i=(1, ndims + 1))};
