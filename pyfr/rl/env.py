@@ -156,7 +156,7 @@ class PyFREnvironment(EnvBase):
     # Mandatory methods: _step, _reset and _set_seed
 
     def _reset(self, tensordict=None, **kwargs):
-        print("Reset called")
+        #print("Reset called")
         self.step_count = 0
 
         restart_soln = None

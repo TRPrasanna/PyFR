@@ -134,6 +134,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         frames_per_batch=hp.frames_per_batch,
         total_frames=hp.total_frames,
         split_trajs=False,
+        reset_at_each_iter=True, # without this the collector seems to continue collecting in evaluation mode
         device=device
     )
 
@@ -257,7 +258,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     collector.shutdown()
     env.close()
 
-def evaluate_policy(env, policy, num_steps=1000000): # _check_done will take care of num_steps
+def evaluate_policy(env, policy, num_steps=1000000): 
+    # _check_done will take care of num_steps, but done is not resetting env for some reason
     """Evaluate policy without exploration using consistent IC"""
     #print("Evaluating policy...")
     env.set_evaluation_mode(True)  # Use same IC
@@ -269,6 +271,7 @@ def evaluate_policy(env, policy, num_steps=1000000): # _check_done will take car
             return eval_reward
     finally:
         env.set_evaluation_mode(False)  # Reset to training mode
+        #print("Evaluation complete.Returning to training mode.")
 
 def get_closest_divisor(n, target):
     """
