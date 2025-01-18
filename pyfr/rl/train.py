@@ -259,6 +259,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
 def evaluate_policy(env, policy, num_steps=1000000): # _check_done will take care of num_steps
     """Evaluate policy without exploration using consistent IC"""
+    #print("Evaluating policy...")
     env.set_evaluation_mode(True)  # Use same IC
     try:
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():

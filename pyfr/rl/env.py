@@ -51,7 +51,11 @@ class PyFREnvironment(EnvBase):
         self._current_time_limit = self.dtend
 
         self.action_interval = self.cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')
-        self.step_count = -1
+        # Calculate max steps from time limits
+        self.max_training_steps = int(self.dtend / self.action_interval)
+        self.max_eval_steps = int(self.eval_time / self.action_interval)
+        self._current_max_steps = self.max_training_steps
+        self.step_count = -1 # matching this with inters.py to prevent if condition from being true
 
         # Initialize IC manager if directory provided
         self.ic_manager = None
@@ -152,7 +156,7 @@ class PyFREnvironment(EnvBase):
     # Mandatory methods: _step, _reset and _set_seed
 
     def _reset(self, tensordict=None, **kwargs):
-        #print("Reset called")
+        print("Reset called")
         self.step_count = 0
 
         restart_soln = None
@@ -178,17 +182,17 @@ class PyFREnvironment(EnvBase):
     def _step(self, tensordict):
         # Update global control signals
         self.current_control = tensordict["action"].cpu().numpy()
-        #print(f"Step called with actions: {tensordict['action'].cpu().numpy()}")
         self.step_count = tensordict["step_count"].item()
         
         self.current_time = self.solver.tcurr
-
+        print(f"Step called with actions: {tensordict['action'].cpu().numpy()} at step {self.step_count} and time {self.current_time}")
         # Update the next action time
         self.next_action_time = self.current_time + self.action_interval
         #print(f"Stepcount: {self.step_count}, Current time: {self.current_time}, going to advance to {self.next_action_time}")
 
         try:
             self.solver.advance_to(self.next_action_time)
+            #print(f"Advanced to {self.solver.tcurr}")
             crashed = False
             # Normal reward computation
             reward = self._compute_reward()
@@ -226,8 +230,14 @@ class PyFREnvironment(EnvBase):
         return reward
 
     def _check_done(self) -> bool:
-        """Check if episode should terminate due to time limit."""
-        return self.current_time >= self.max_time
+        """Check if episode should terminate based on step count."""
+        # this sets the done state but resets are also handled by frames_per_batch in collector
+        #print(f"Checking done at the end of step {self.step_count}")
+        #if(self.step_count +1 >= self._current_max_steps):
+        #    print("We are done")
+        #else:
+        #    print("We are not done")
+        return self.step_count + 1 >= self._current_max_steps
 
     def _set_seed(self, seed): # this does nothing for now
         torch.manual_seed(seed)
@@ -235,8 +245,8 @@ class PyFREnvironment(EnvBase):
     def set_evaluation_mode(self, is_evaluating: bool):
         """Set environment to evaluation mode."""
         self.is_evaluating = is_evaluating
-        # Switch time limit based on mode
         self._current_time_limit = self.eval_time if is_evaluating else self.dtend
+        self._current_max_steps = self.max_eval_steps if is_evaluating else self.max_training_steps
 
     def close(self):
         """Clean up resources"""
