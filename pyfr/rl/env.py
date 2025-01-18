@@ -185,7 +185,7 @@ class PyFREnvironment(EnvBase):
         self.step_count = tensordict["step_count"].item()
         
         self.current_time = self.solver.tcurr
-        print(f"Step called with actions: {tensordict['action'].cpu().numpy()} at step {self.step_count} and time {self.current_time}")
+        #print(f"Step called with actions: {tensordict['action'].cpu().numpy()} at step {self.step_count} and time {self.current_time}")
         # Update the next action time
         self.next_action_time = self.current_time + self.action_interval
         #print(f"Stepcount: {self.step_count}, Current time: {self.current_time}, going to advance to {self.next_action_time}")
