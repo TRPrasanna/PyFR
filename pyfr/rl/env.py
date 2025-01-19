@@ -138,6 +138,13 @@ class PyFREnvironment(EnvBase):
             shape=torch.Size([])
         )
         print("Environment initialized.")
+        self.episode_count = 0
+        self.pbar = None  # Will be set externally
+        self.count_episodes = True  # Flag to control episode counting
+
+    def set_progress_bar(self, pbar):
+        """Set progress bar for episode tracking"""
+        self.pbar = pbar
 
     def _init_solver(self, initsoln=None):
         self.restart_soln = initsoln
@@ -205,6 +212,12 @@ class PyFREnvironment(EnvBase):
             observation = self._get_observation()
             truncated = self._check_done()
             terminated = False
+            # Count episode when step reaches max
+            if truncated and self.count_episodes:
+                self.episode_count += 1
+                if self.pbar is not None:
+                    self.pbar.update(1)
+                    self.pbar.set_postfix({'episodes': self.episode_count})
 
         except RuntimeError as e:
             print(f"Solver crashed: {str(e)}. Resetting. Last actions were: {self.current_control}")
@@ -214,6 +227,11 @@ class PyFREnvironment(EnvBase):
             reward = -10.0
             truncated = False
             terminated = True
+            if self.count_episodes:
+                self.episode_count += 1
+                if self.pbar is not None:
+                    self.pbar.update(1)
+                    self.pbar.set_postfix({'episodes': self.episode_count})
 
         #print if done is true
         #print(f"Step {self.step_count} done: {[terminated, truncated, crashed]}")
@@ -255,6 +273,7 @@ class PyFREnvironment(EnvBase):
         self.is_evaluating = is_evaluating
         self._current_time_limit = self.eval_time if is_evaluating else self.dtend
         self._current_max_steps = self.max_eval_steps if is_evaluating else self.max_training_steps
+        self.count_episodes = not is_evaluating  # Don't count during evaluation
 
     def close(self):
         """Clean up resources"""

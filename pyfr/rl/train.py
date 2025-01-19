@@ -190,8 +190,18 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     eval_str = ""
 
+    # Optional episode progress bar (new)
+    try:
+        episode_pbar = tqdm(total=hp.episodes, desc="Episodes", leave=False)
+        env.set_progress_bar(episode_pbar)
+    except:
+        print("Warning: Could not create episode progress bar")
+        episode_pbar = None
+        env.set_progress_bar(None)
+
     for i, tensordict_data in enumerate(collector):
-        print_tensordict_diagnostics(tensordict_data, verbose=True)
+        #print(f"\nBatch {i} starting...")
+        #print_tensordict_diagnostics(tensordict_data, verbose=True)
         # Training updates
         for _ in range(hp.num_epochs):
             advantage_module(tensordict_data)
@@ -256,6 +266,10 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         pbar.update(hp.episodes_per_batch)
 
         scheduler.step()
+
+    pbar.close()
+    if episode_pbar:
+        episode_pbar.close()
 
     collector.shutdown()
     env.close()
@@ -420,40 +434,45 @@ class HyperParameters:
         print("\nSource: [C]=From .ini config file, [D]=Default, [-]=Derived")
 
 def print_tensordict_diagnostics(td, verbose=True):
-    """Print human-readable diagnostics of tensordict data."""
+    """Enhanced diagnostics for debugging episode counting"""
     print("\n=== TensorDict Diagnostics ===")
+    print("\nTensorDict Structure:")
+    print("-" * 80)
     
-    batch_size = td.batch_size[0]
-    print(f"\nBatch contains {batch_size} transitions")
+    # Print all top-level keys
+    print("Top-level keys:", td.keys())
     
+    # Print nested keys
+    if "next" in td.keys():
+        print("\nNested 'next' keys:", td["next"].keys())
     
-    print(f"Next Done: {td['next','done']}")
+    print("\nBatch Information:")
+    print(f"Batch size: {td.batch_size}")
+    print(f"Device: {td.device}")
+    
+    print("\nDone Flags Status:")
+    print("-" * 80)
+    print(f"done shape: {td['done'].shape}")
+    print(f"done values: {td['done'].cpu().numpy()}")
+    print(f"terminated values: {td['terminated'].cpu().numpy()}")
+    print(f"truncated values: {td['truncated'].cpu().numpy()}")
+    
+    if "next" in td.keys():
+        print("\nNext State Done Flags:")
+        print(f"next done values: {td['next', 'done'].cpu().numpy()}")
+        print(f"next terminated values: {td['next', 'terminated'].cpu().numpy()}")
+        print(f"next truncated values: {td['next', 'truncated'].cpu().numpy()}")
+    
     if verbose:
-        print("\nTransition Details:")
+        print("\nStep-by-Step Transition Details:")
         print("-" * 80)
-        for i in range(batch_size):
-            print(f"\nStep {i}:")
-            print(f"Observation shape: {td['observation'][i].shape}")
-            print(f"Observation: {td['observation'][i].cpu().numpy()}")
-            #next_observation = td['next', 'observation'][i].cpu().numpy()
-            #print(f"Next Observation: {next_observation}")
-            
-            # Handle multi-dimensional actions
-            action = td['action'][i].cpu().numpy()
-            if len(action.shape) > 0:
-                action_str = ", ".join([f"{a:.4f}" for a in action])
-            else:
-                action_str = f"{action:.4f}"
-            print(f"Action: [{action_str}]")
-            
-            print(f"Reward: {td['next', 'reward'][i].cpu().item():.4f}")
+        for i in range(td.batch_size[0]):
+            print(f"\nTransition {i}:")
             print(f"Step count: {td['step_count'][i].cpu().item()}")
-            print(f"Done: {td['done'][i].cpu().item()}")
-            print(f"Terminated: {td['terminated'][i].cpu().item()}")
-            print(f"Truncated: {td['truncated'][i].cpu().item()}")
-            print(f"Next Done: {td['next','done'][i].cpu().item()}")
-            print(f"Next Terminated: {td['next','terminated'][i].cpu().item()}")
-            print(f"Next Truncated: {td['next','truncated'][i].cpu().item()}")
-        
+            print(f"Action: {td['action'][i].cpu().numpy()}")
+            print(f"Reward: {td['next', 'reward'][i].cpu().item():.4f}")
+            print(f"Done flags: done={td['done'][i].cpu().item()}, "
+                  f"terminated={td['terminated'][i].cpu().item()}, "
+                  f"truncated={td['truncated'][i].cpu().item()}")
     
     print("\n" + "="*80)
