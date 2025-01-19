@@ -174,10 +174,16 @@ class PyFREnvironment(EnvBase):
 
         self._init_solver(initsoln=restart_soln)
         #self.rl_plugin.reset()
+        observation = self._get_observation()
+        self.last_observation = observation  # Store first valid observation
         
         shape = torch.Size([])
-        state = self.state_spec.zero(shape)
-        return state.update(self.full_done_spec.zero(shape))
+        return TensorDict({
+            "observation": observation,
+            "done": torch.tensor(False, device=self.device, dtype=torch.bool),
+            "terminated": torch.tensor(False, device=self.device, dtype=torch.bool),
+            "truncated": torch.tensor(False, device=self.device, dtype=torch.bool),
+        }, batch_size=shape)
 
     def _step(self, tensordict):
         # Update global control signals
@@ -209,13 +215,15 @@ class PyFREnvironment(EnvBase):
             truncated = False
             terminated = True
 
+        #print if done is true
+        #print(f"Step {self.step_count} done: {[terminated, truncated, crashed]}")
         return TensorDict({
             'observation': observation,
             'reward': torch.tensor([reward], device=self.device),
             'done': torch.tensor([terminated or truncated], device=self.device, dtype=torch.bool),
             'terminated': torch.tensor([terminated], device=self.device, dtype=torch.bool),
             'truncated': torch.tensor([truncated], device=self.device, dtype=torch.bool),
-        }, batch_size=torch.Size([]))
+        }, tensordict.shape)
 
     def _get_observation(self):
         # Get raw observation

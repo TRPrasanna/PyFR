@@ -17,7 +17,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
     def __init__(self, intg, cfgsect, suffix=None):
         super().__init__(intg, cfgsect, suffix)
         #self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.device = torch.device('cpu')
+        self.device = torch.device('cuda')
         # Get sampling points configuration
         self.pts = self.cfg.getliteral(cfgsect, 'probe-pts')
         self.fmt = self.cfg.get(cfgsect, 'format', 'primitive')
@@ -365,8 +365,8 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
         # reward = - abs(avg_moment)
-        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
-        # reward = -avg_drag
+        #reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
+        reward = -avg_drag
         return float(reward)
         
 

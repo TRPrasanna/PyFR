@@ -25,6 +25,7 @@ from pyfr.rl.env import PyFREnvironment
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 import os
 import math
+import numpy as np
 
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
     # Device setup
@@ -190,6 +191,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     eval_str = ""
 
     for i, tensordict_data in enumerate(collector):
+        print_tensordict_diagnostics(tensordict_data, verbose=True)
         # Training updates
         for _ in range(hp.num_epochs):
             advantage_module(tensordict_data)
@@ -416,3 +418,42 @@ class HyperParameters:
 
         # Print legend
         print("\nSource: [C]=From .ini config file, [D]=Default, [-]=Derived")
+
+def print_tensordict_diagnostics(td, verbose=True):
+    """Print human-readable diagnostics of tensordict data."""
+    print("\n=== TensorDict Diagnostics ===")
+    
+    batch_size = td.batch_size[0]
+    print(f"\nBatch contains {batch_size} transitions")
+    
+    
+    print(f"Next Done: {td['next','done']}")
+    if verbose:
+        print("\nTransition Details:")
+        print("-" * 80)
+        for i in range(batch_size):
+            print(f"\nStep {i}:")
+            print(f"Observation shape: {td['observation'][i].shape}")
+            print(f"Observation: {td['observation'][i].cpu().numpy()}")
+            #next_observation = td['next', 'observation'][i].cpu().numpy()
+            #print(f"Next Observation: {next_observation}")
+            
+            # Handle multi-dimensional actions
+            action = td['action'][i].cpu().numpy()
+            if len(action.shape) > 0:
+                action_str = ", ".join([f"{a:.4f}" for a in action])
+            else:
+                action_str = f"{action:.4f}"
+            print(f"Action: [{action_str}]")
+            
+            print(f"Reward: {td['next', 'reward'][i].cpu().item():.4f}")
+            print(f"Step count: {td['step_count'][i].cpu().item()}")
+            print(f"Done: {td['done'][i].cpu().item()}")
+            print(f"Terminated: {td['terminated'][i].cpu().item()}")
+            print(f"Truncated: {td['truncated'][i].cpu().item()}")
+            print(f"Next Done: {td['next','done'][i].cpu().item()}")
+            print(f"Next Terminated: {td['next','terminated'][i].cpu().item()}")
+            print(f"Next Truncated: {td['next','truncated'][i].cpu().item()}")
+        
+    
+    print("\n" + "="*80)
