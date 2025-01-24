@@ -365,8 +365,8 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
         # reward = - abs(avg_moment)
-        #reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
-        reward = -avg_drag
+        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
+        #reward = -avg_drag
         return float(reward)
         
 
