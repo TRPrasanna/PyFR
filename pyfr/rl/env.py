@@ -196,6 +196,10 @@ class PyFREnvironment(EnvBase):
         # Update global control signals
         self.current_control = tensordict["action"].cpu().numpy()
         self.step_count = tensordict["step_count"].item()
+
+        #abort program if action is NaN
+        if np.isnan(self.current_control).any():
+            raise RuntimeError("Control signal is NaN. Aborting.")
         
         self.current_time = self.solver.tcurr
         #print(f"Step called with actions: {tensordict['action'].cpu().numpy()} at step {self.step_count} and time {self.current_time}")

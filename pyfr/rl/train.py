@@ -25,7 +25,8 @@ from pyfr.rl.env import PyFREnvironment
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 import os
 import math
-import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+import time
 
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
     # Device setup
@@ -199,38 +200,86 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         episode_pbar = None
         env.set_progress_bar(None)
 
-    for i, tensordict_data in enumerate(collector):
+    # Tensorboard writer: write different runs based on humean-readable time
+    wallclock_datetime = time.strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = os.path.join(checkpoint_dir, f"tensorboard_logs/{wallclock_datetime}")
+    writer = SummaryWriter(log_dir=log_path)
+    # loop through hyperparameters and write them to tensorboard in one go (except _param_sources_ and _derived_params)
+    # Collect all hyperparameters first
+    hparam_dict = {}
+    metric_dict = {}  # Required but empty for hparams logging
+    
+    for key, value in hp.__dict__.items():
+        if key not in ['_param_sources', '_derived_params']:
+            if isinstance(value, (int, float, str, bool)):
+                hparam_dict[key] = value
+    
+    # Write all hyperparameters at once
+    run_name = os.path.join(os.path.dirname(os.path.realpath(log_path)),f"{wallclock_datetime}")
+    print(f"Writing hyperparameters to tensorboard: {run_name}")
+    writer.add_hparams(hparam_dict, metric_dict, run_name=run_name)
+    #print(os.path.dirname(os.path.realpath(__file__)) + os.sep + log_path)
+    updates_per_batch = hp.num_epochs * (hp.frames_per_batch // sub_batch_size)
+
+    for batch_idx, tensordict_data in enumerate(collector):
         #print(f"\nBatch {i} starting...")
         #print_tensordict_diagnostics(tensordict_data, verbose=True)
+
+        episode_count += hp.episodes_per_batch
+        # Training performance metrics
+        train_reward = tensordict_data["next", "reward"].mean().item()
+        writer.add_scalar("batch/train_reward", train_reward, batch_idx)
+        writer.add_scalar("batch/episodes", episode_count, batch_idx)
+        writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
+
         # Training updates
-        for _ in range(hp.num_epochs):
+        for epoch_idx in range(hp.num_epochs):
             advantage_module(tensordict_data)
             data_view = tensordict_data.reshape(-1)
             replay_buffer.extend(data_view.cpu())
             
-            for _ in range(hp.frames_per_batch // sub_batch_size):
+            for sub_update_idx in range(hp.frames_per_batch // sub_batch_size):
                 subdata = replay_buffer.sample(sub_batch_size)
                 loss_vals = loss_module(subdata.to(device))
                 loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
                 if hp.entropy_eps > 0:
                     loss_value = loss_value + loss_vals["loss_entropy"]
 
+                policy_obj = loss_vals["loss_objective"].item()
+                val_loss = loss_vals["loss_critic"].item()
+                ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
+
                 loss_value.backward()
-                nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
+
+                global_update_idx = (batch_idx * updates_per_batch + 
+                                   epoch_idx * (hp.frames_per_batch // sub_batch_size) + 
+                                   sub_update_idx)
+                
+                # Log with global update index
+                writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
+                writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
+                writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
+                writer.add_scalar("grad/norm", grad_norm, global_update_idx)
+
                 optim.step()
                 optim.zero_grad()
 
+        collector.update_policy_weights_() # perhaps not needed
+
         # Logging
-        episode_count += hp.episodes_per_batch
-        train_reward = tensordict_data["next", "reward"].mean().item()
         logs["train_reward"].append(train_reward)
         #print(f"\n Batch finished. Episode count is {episode_count}")
 
         # Evaluate every hp.eval_frequency batches
-        if i % hp.eval_frequency == 0:
+        if batch_idx % hp.eval_frequency == 0:
             eval_reward = evaluate_policy(env, policy)
             logs["eval_reward"].append(eval_reward)
-            
+
+            writer.add_scalar("eval/mean_reward", eval_reward, batch_idx)
+            # Possibly log LR
+            writer.add_scalar("train/learning_rate", optim.param_groups[0]['lr'], batch_idx)
+
             # Save best model if new best achieved
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
@@ -272,6 +321,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         episode_pbar.close()
 
     collector.shutdown()
+    writer.close() # tensorboard writer
     env.close()
 
 def evaluate_policy(env, policy, num_steps=1000000): 
