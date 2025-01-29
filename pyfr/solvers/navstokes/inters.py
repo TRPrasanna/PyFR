@@ -217,7 +217,7 @@ class NavierStokesSubOutflowBCInters(NavierStokesBaseBCInters):
         self.c |= self._exp_opts(['p'], lhs)
 
 class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
-    type = 'sub-in-frv-neural'
+    type = 'sub-in-frv-neural' # for changing velocity/mass flow rate
     cflux_state = 'ghost'
 
     def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
@@ -267,7 +267,7 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
             self.last_step_count = self.intg.system.env.step_count
 
 class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
-    type = 'sub-in-frv-neural-type2'
+    type = 'sub-in-frv-neural-type2' # for changing angles
     cflux_state = 'ghost'
 
     def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
@@ -304,17 +304,16 @@ class NavierStokesSubInflowFrvNeuralType2BCInters(NavierStokesBaseBCInters):
 
     def prepare(self, t):
         # Direct access to control signal from solver environment
-        new_target = self.intg.system.env.current_control
+        new_targets = self.intg.system.env.current_control
 
         # Only update backend after environment has taken a step
         if self.intg.system.env.step_count != self.last_step_count:
-            self.control_params.set(np.array([[self._current_target, new_target, t]]))
-            #print(f"Control signal: {new_target}, action_interval: {self.intg.system.env.action_interval}")
-            self._current_target = new_target
+            self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
+            self._current_target = new_targets[0]
             self.last_step_count = self.intg.system.env.step_count
 
 class NavierStokesSubInflowFrvNeuralType3BCInters(NavierStokesBaseBCInters):
-    type = 'sub-in-frv-neural-type3'
+    type = 'sub-in-frv-neural-type3' # for changing both velocity/mfr and angles
     cflux_state = 'ghost'
 
     def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
