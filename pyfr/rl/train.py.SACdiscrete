@@ -5,8 +5,9 @@ from typing import Dict, Any
 import torch
 from torch import nn
 from collections import defaultdict
-from tensordict.nn import TensorDictModule
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
+from tensordict.nn import TensorDictModule, InteractionType
+from torchrl.data import Composite, TensorDictReplayBuffer
+from torchrl.modules import ProbabilisticActor, OneHotCategorical, ValueOperator, MLP
 from torchrl.envs import (
     Compose,
     DoubleToFloat,
@@ -18,7 +19,7 @@ from torchrl.collectors import SyncDataCollector
 from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.objectives import ClipPPOLoss
+from torchrl.objectives import DiscreteSACLoss, SoftUpdate
 from torchrl.objectives.value import GAE
 from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
@@ -62,66 +63,68 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     hp.print_summary()
 
-     # Actor network with proper output handling
-    actor_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_policy),
-        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
-        nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        nn.Tanh(),
-        nn.Linear(hp.num_cells_policy, 2),  # 2 outputs: mean and log_std
-        NormalParamExtractor()  # Use default scale_mapping
-    ).to(device)
+    actor_net_kwargs = {
+        "num_cells": [512,512],
+        "out_features": env.action_spec.shape[-1],
+        "activation_class": nn.LeakyReLU,
+    }
+    actor_net = MLP(**actor_net_kwargs).to(device)
 
     actor_module = TensorDictModule(
         actor_net,
         in_keys=["observation"],
-        out_keys=["loc", "scale"]  # NormalParamExtractor splits into these
+        out_keys=["logits"]
     ).to(device)
 
     policy = ProbabilisticActor(
+        spec=Composite(action=env.action_spec),
         module=actor_module,
-        spec=env.action_spec,
-        in_keys=["loc", "scale"],
-        distribution_class=TanhNormal,
-        return_log_prob=True,
-        distribution_kwargs={
-        "low": env.action_spec.space.low,
-        "high": env.action_spec.space.high,
-        },
-        #safe = True
-    ).to(device)
-
-    # Value network (critic)
-    value_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_value),
-        nn.Tanh(),
-        nn.Linear(hp.num_cells_value, hp.num_cells_value),
-        nn.Tanh(),
-        nn.Linear(hp.num_cells_value, 1)
-    ).to(device)
-
-    value_module = ValueOperator(
-        module=value_net,
-        in_keys=["observation"]
-    ).to(device)
-
-    # PPO components
-    advantage_module = GAE(
-        gamma=hp.gamma, 
-        lmbda=hp.lmbda,
-        value_network=value_module,
-        average_gae=True
+        in_keys=["logits"],
+        out_keys=["action"],
+        distribution_class=OneHotCategorical,
+        distribution_kwargs={},
+        default_interaction_type=InteractionType.RANDOM,
+        return_log_prob=False,
     )
 
-    loss_module = ClipPPOLoss(
+    qvalue_net_kwargs = {
+        "num_cells": [512, 512],
+        "out_features": env.action_spec.shape[-1],
+        "activation_class": nn.LeakyReLU,
+    }
+    qvalue_net = MLP(**qvalue_net_kwargs).to(device)
+
+    qvalue = TensorDictModule(
+        in_keys=["observation"],
+        out_keys=["action_value"],
+        module=qvalue_net,
+    ).to(device)
+
+    # init nets
+    model = torch.nn.ModuleList([policy, qvalue]).to(device)
+    with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):
+        td = env.reset()
+        td = td.to(device)
+        for net in model:
+            net(td)
+    del td
+    #eval_env.close()
+
+    loss_module = DiscreteSACLoss(
         actor_network=policy,
-        critic_network=value_module,
-        clip_epsilon=hp.clip_epsilon,
-        entropy_bonus=bool(hp.entropy_eps),
-        entropy_coef=hp.entropy_eps,
-        critic_coef=1.0,
-        loss_critic_type="smooth_l1",
+        action_space="one-hot",
+        qvalue_network=qvalue,
+        num_actions=policy.spec["action"].space.n,
+        num_qvalue_nets=2,
+        loss_function="l2",
+        target_entropy_weight=0.2,
+        delay_qvalue=True,
     )
+
+    loss_module.make_value_estimator(gamma=hp.gamma)
+
+    # Define Target Network Updater
+    target_net_updater = SoftUpdate(loss_module, eps=0.995)
 
     # Optimizer
     optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
@@ -140,11 +143,14 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         device=device
     )
 
-    # Replay buffer here is not actually used for experience replay
-    # It is rather used for convenience to sample mini-batches from the collected data
-    replay_buffer = ReplayBuffer(
-        storage=LazyTensorStorage(max_size=hp.frames_per_batch),
-        sampler=SamplerWithoutReplacement(),
+    # Replay buffer
+    buffer_size = hp.frames_per_batch # I made this up
+    batch_size = hp.actions_per_episode # this is the batch size of replay buffer sample
+    replay_buffer = TensorDictReplayBuffer(
+        pin_memory=False,
+        prefetch=3,
+        storage=LazyTensorStorage(max_size=buffer_size),
+        batch_size=batch_size,
     )
 
     best_eval_reward = float('-inf')
@@ -156,7 +162,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     if load_model and os.path.exists(load_model):
         checkpoint = torch.load(load_model, map_location=device, weights_only=True)
         policy.load_state_dict(checkpoint['policy_state_dict'])
-        value_module.load_state_dict(checkpoint['value_state_dict'])
+        #value_module.load_state_dict(checkpoint['value_state_dict'])
         
         # Handle both old and new checkpoint formats
         current_eval_reward = checkpoint.get('current_reward', checkpoint.get('reward', None))
@@ -219,7 +225,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     print(f"Writing hyperparameters to tensorboard: {run_name}")
     writer.add_hparams(hparam_dict, metric_dict, run_name=run_name)
     #print(os.path.dirname(os.path.realpath(__file__)) + os.sep + log_path)
-    updates_per_batch = hp.num_epochs * (hp.frames_per_batch // sub_batch_size)
+    global_update_idx = 0
 
     for batch_idx, tensordict_data in enumerate(collector):
         #print(f"\nBatch {i} starting...")
@@ -231,40 +237,32 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         writer.add_scalar("batch/train_reward", train_reward, batch_idx)
         writer.add_scalar("batch/episodes", episode_count, batch_idx)
         writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
-        advantage_module(tensordict_data)
-        
+
+        data_view = tensordict_data.reshape(-1)
+        replay_buffer.extend(data_view.cpu())
         # Training updates
-        for epoch_idx in range(hp.num_epochs):
-            #advantage_module(tensordict_data)
-            data_view = tensordict_data.reshape(-1)
-            replay_buffer.extend(data_view.cpu())
+        for _ in range(hp.actions_per_episode): #should be hp.frames_per_batch
+            subdata = replay_buffer.sample()
+            loss_vals = loss_module(subdata.to(device))
+            loss_value = loss_vals["loss_actor"] + loss_vals["loss_qvalue"]
+            loss_value = loss_value + loss_vals["loss_alpha"]
+
+            policy_obj = loss_vals["loss_actor"].item()
+            val_loss = loss_vals["loss_qvalue"].item()
+
+            loss_value.backward()
+            grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
+
+            global_update_idx += 1
             
-            for sub_update_idx in range(hp.frames_per_batch // sub_batch_size):
-                subdata = replay_buffer.sample(sub_batch_size)
-                loss_vals = loss_module(subdata.to(device))
-                loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
-                if hp.entropy_eps > 0:
-                    loss_value = loss_value + loss_vals["loss_entropy"]
+            # Log with global update index
+            writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
+            writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
+            writer.add_scalar("grad/norm", grad_norm, global_update_idx)
 
-                policy_obj = loss_vals["loss_objective"].item()
-                val_loss = loss_vals["loss_critic"].item()
-                ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
-
-                loss_value.backward()
-                grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
-
-                global_update_idx = (batch_idx * updates_per_batch + 
-                                   epoch_idx * (hp.frames_per_batch // sub_batch_size) + 
-                                   sub_update_idx)
-                
-                # Log with global update index
-                writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
-                writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
-                writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
-                writer.add_scalar("grad/norm", grad_norm, global_update_idx)
-
-                optim.step()
-                optim.zero_grad()
+            optim.step()
+            optim.zero_grad()
+            target_net_updater.step()
 
         collector.update_policy_weights_() # perhaps not needed
 
@@ -288,7 +286,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 print(f"\nNew best eval reward: {best_eval_reward:.5f} at episode {episode_count}")
                 torch.save({
                     'policy_state_dict': policy.state_dict(),
-                    'value_state_dict': value_module.state_dict(),
+                    #'value_state_dict': value_module.state_dict(),
                     'current_reward': eval_reward,
                     'best_reward': best_eval_reward,
                     'episode': episode_count,
@@ -298,7 +296,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             # Save latest model
             torch.save({
                 'policy_state_dict': policy.state_dict(),
-                'value_state_dict': value_module.state_dict(),
+                #'value_state_dict': value_module.state_dict(),
                 'current_reward': eval_reward,
                 'best_reward': best_eval_reward,
                 'episode': episode_count,

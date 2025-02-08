@@ -364,3 +364,108 @@ class NavierStokesSubInflowFrvNeuralType3BCInters(NavierStokesBaseBCInters):
             self._current_target = new_targets[0]
             self._current_target2 = new_targets[1]
             self.last_step_count = self.intg.system.env.step_count
+
+class NavierStokesSubInflowFrvNeuralType4BCInters(NavierStokesBaseBCInters):
+    type = 'sub-in-frv-neural-type4' # for changing velocity/mass flow rate; discrete action space
+    cflux_state = 'ghost'
+
+    def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+        
+        # Basic initialization
+        self.c |= self._exp_opts(
+            ['rho', 'u', 'v', 'w'][:self.ndims + 1], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+        # some config parameters
+        self.t_act_interval = self.backend.matrix((1,1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
+                         value=self.t_act_interval)
+
+        # Neural network + control parameters
+        self.control_params = self.backend.matrix((1,3))
+        self._set_external('control_params', 'broadcast fpdtype_t[1][3]', 
+                         value=self.control_params)
+
+        # Initial value
+        self.control_params.set(np.array([[0.0, 0.0, 0.0]])) #(Q0,Q1,t0)
+
+        # Cache current parameter value 
+        self._current_target = 0.0
+
+        # Fixed values
+        self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
+        self.actuator_id = cfg.getint(cfgsect, 'actuator-number')
+        #print(f"Actuator number: {self.actuator_id}")
+        if self.actuator_id < 1:
+            raise ValueError("actuator-number must be >= 1")
+
+        # Get and validate action range (here actions are just indices of possible configurations, not actions themselves)
+        try:
+            self.actions_low = int(self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-low')[0])
+            self.actions_high = int(self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-high')[0])
+            
+            if not isinstance(self.actions_low, int) or not isinstance(self.actions_high, int):
+                raise ValueError("Action bounds must be integers")
+                
+            if self.actions_low >= self.actions_high:
+                raise ValueError("actions-low must be less than actions-high")
+                
+            self.action_space_size = self.actions_high - self.actions_low + 1
+            
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid action bounds: {e}")
+
+        #active_configs = self._find_active_configs()
+        #print(f"\nActuator {self.actuator_id} configuration summary:")
+        #print(f"Will turn ON for configurations: {active_configs}")
+        #print(f"Binary patterns that activate this actuator:")
+        #for config in active_configs:
+        #    binary = format(config, f'0{int(np.log2(self.action_space_size))}b')
+        #    print(f"Config {config}: {binary}")
+
+        # Helper to keep track of last step count
+        self.last_step_count = -1
+
+    def _get_binary_config(self, one_hot_action):
+        """Convert one-hot action to binary configuration."""
+        if one_hot_action is None or len(one_hot_action) == 0:
+            # Return default configuration (all zeros)
+            return [0] * int(np.log2(self.action_space_size))
+            
+        try:
+            config_idx = np.where(one_hot_action == 1)[0][0]
+            binary = format(config_idx, f'0{int(np.log2(self.action_space_size))}b')
+            return [int(bit) for bit in binary]
+        except (IndexError, AttributeError):
+            # Return default configuration if something goes wrong
+            return [0] * int(np.log2(self.action_space_size))
+
+    def _find_active_configs(self):
+        """Find configurations where this actuator is active."""
+        active_configs = []
+        num_bits = int(np.log2(self.action_space_size))
+        
+        for config_idx in range(self.action_space_size):
+            # Convert to binary string with proper padding
+            binary = format(config_idx, f'0{num_bits}b')
+            # Check if bit at actuator position is 1 (right to left, 1-based)
+            if binary[-self.actuator_id] == '1':
+                active_configs.append(config_idx)
+        return active_configs
+
+    def prepare(self, t):
+        new_targets = getattr(self.intg.system.env, 'current_control', None)
+        
+        if self.intg.system.env.step_count != self.last_step_count:
+            binary_config = self._get_binary_config(new_targets)
+            is_active = binary_config[-self.actuator_id]
+            Q1 = float(is_active)
+            #print(f"Actuator {self.actuator_id} configuration: {binary_config}, active: {is_active}, Q: {Q1}")
+            
+            self.control_params.set(np.array([[self._current_target, Q1, t]]))
+            self._current_target = Q1
+            self.last_step_count = self.intg.system.env.step_count

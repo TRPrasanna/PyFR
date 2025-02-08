@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from collections import defaultdict
 from tensordict.nn import TensorDictModule
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
+from torchrl.modules import ProbabilisticActor, OneHotCategorical, ValueOperator
 from torchrl.envs import (
     Compose,
     DoubleToFloat,
@@ -68,26 +68,22 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
         nn.Tanh(),
-        nn.Linear(hp.num_cells_policy, 2),  # 2 outputs: mean and log_std
-        NormalParamExtractor()  # Use default scale_mapping
+        nn.Linear(hp.num_cells_policy, env.action_space_size)
     ).to(device)
 
     actor_module = TensorDictModule(
         actor_net,
         in_keys=["observation"],
-        out_keys=["loc", "scale"]  # NormalParamExtractor splits into these
+        out_keys=["logits"]
     ).to(device)
 
     policy = ProbabilisticActor(
         module=actor_module,
         spec=env.action_spec,
-        in_keys=["loc", "scale"],
-        distribution_class=TanhNormal,
-        return_log_prob=True,
-        distribution_kwargs={
-        "low": env.action_spec.space.low,
-        "high": env.action_spec.space.high,
-        },
+        in_keys=["logits"],
+        out_keys=["action"],
+        distribution_class=OneHotCategorical,
+        return_log_prob=True
         #safe = True
     ).to(device)
 
@@ -231,8 +227,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         writer.add_scalar("batch/train_reward", train_reward, batch_idx)
         writer.add_scalar("batch/episodes", episode_count, batch_idx)
         writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
-        advantage_module(tensordict_data)
-        
+
+        advantage_module(tensordict_data) # in torchrl tutorial, this is done every epoch
+
         # Training updates
         for epoch_idx in range(hp.num_epochs):
             #advantage_module(tensordict_data)

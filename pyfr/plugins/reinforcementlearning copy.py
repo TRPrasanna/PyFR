@@ -16,8 +16,6 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
     
     def __init__(self, intg, cfgsect, suffix=None):
         super().__init__(intg, cfgsect, suffix)
-
-        comm, rank, root = get_comm_rank_root()
         #self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device('cuda')
         # Get sampling points configuration
@@ -53,44 +51,70 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             if len(morigin) != self.ndims:
                 raise ValueError(f'morigin must have {self.ndims} components')
 
-        # Read multiple surface names
-        self.surf_bnames = self.cfg.getliteral(cfgsect, 'surfaces')
-        if not isinstance(self.surf_bnames, list):
-            self.surf_bnames = [self.surf_bnames]
-        if not self.surf_bnames:
-            raise ValueError("No surfaces specified for forces/moment calculation")
-
-        # Get the mesh and elements
+        self.surf_bname = self.cfg.get(cfgsect, 'surface', None)
+        if not self.surf_bname:
+            raise ValueError("No surface specified for forces/moment calculation for reward")
+        
+        #print(f"Calculating forces/moment over boundary: {self.surf_bname}")
+        # Get boundary info with specified name; check MPI calls
+        bc = f'bcon_{self.surf_bname}_p{intg.rallocs.prank}'
+        if bc not in intg.system.mesh:
+            raise ValueError(f"Boundary '{self.surf_bname}' not found")
         mesh, elemap = intg.system.mesh, intg.system.ele_map
 
-        # Store matrices for each surface
-        self._m0 = defaultdict(dict)
-        self._qwts = defaultdict(lambda: defaultdict(list))
-        self._eidxs = defaultdict(dict)
-        self._norms = defaultdict(dict)
-        self._rfpts = defaultdict(dict) if self._mcomp else None
-
+        # Initialize force calculation matrices
+        self._m0 = m0 = {}
+        self._qwts = qwts = defaultdict(list)
         if self._viscous:
-            self._m4 = defaultdict(dict)
-            self._rcpjact = defaultdict(dict)
+            self._m4 = m4 = {}
+            rcpjact = {}
+            
+        # Process boundary (similar to FluidForcePlugin)
+        if bc in mesh:
+            eidxs = defaultdict(list)
+            norms = defaultdict(list)
+            rfpts = defaultdict(list)
+            
+            for etype, eidx, fidx, flags in mesh[bc].tolist():
+                eles = elemap[etype]
+                itype, proj, norm = eles.basis.faces[fidx]
+                
+                # Get quadrature points
+                ppts, pwts = self._surf_quad(itype, proj, flags='s')
+                nppts = len(ppts)
+                
+                # Get physical normals
+                pnorm = eles.pnorm_at(ppts, [norm]*nppts)[:, eidx]
+                
+                eidxs[etype, fidx].append(eidx)
+                norms[etype, fidx].append(pnorm)
+                
+                if (etype, fidx) not in m0:
+                    m0[etype, fidx] = eles.basis.ubasis.nodal_basis_at(ppts)
+                    qwts[etype, fidx] = pwts
+                    
+                if self._viscous and etype not in m4:
+                    m4[etype] = eles.basis.m4
+                    smat = eles.smat_at_np('upts').transpose(2, 0, 1, 3)
+                    rcpdjac = eles.rcpdjac_at_np('upts')
+                    rcpjact[etype] = smat*rcpdjac
 
-        # Check each boundary's existence across ranks
-        self.rallocs = intg.rallocs # save for compute_fm
-        for surf in self.surf_bnames:
-            bc = f'bcon_{surf}_p{intg.rallocs.prank}'
-            bcranks = comm.gather(bc in mesh, root=root)
-
-            # Exit if boundary not found
-            if rank == root:
-                if not any(bcranks):
-                    raise RuntimeError(f'Boundary {surf} does not exist')
-
-            # Initialize matrices if boundary exists in this rank
-            if bc in intg.system.mesh:
-                self._init_surface(intg, bc, surf)
+                # Get the flux points position of the given face and element
+                # indices relative to the moment origin
+                if self._mcomp:
+                    ploc = eles.ploc_at_np(ppts)[..., eidx]
+                    rfpt = ploc - morigin
+                    rfpts[etype, fidx].append(rfpt)
+                    
+            self._eidxs = {k: np.array(v) for k, v in eidxs.items()}
+            self._norms = {k: np.array(v) for k, v in norms.items()}
+            self._rfpts = {k: np.array(v) for k, v in rfpts.items()}
+            if self._viscous:
+                self._rcpjact = {k: rcpjact[k[0]][..., v] 
+                                for k, v in self._eidxs.items()}
 
         # Add step-based sampling (like SamplerPlugin)
-        self.nsteps = self.cfg.getint(cfgsect, 'nsteps', 10)
+        self.nsteps = self.cfg.getint(cfgsect, 'nsteps')
         #print(f"Sampling forces every {self.nsteps} steps")
             
         # Initialize force history buffers
@@ -100,58 +124,6 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         self.moment_history = []
         self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
 
-    def _init_surface(self, intg, bc, surf):
-        """Initialize matrices for a single surface"""
-        mesh, elemap = intg.system.mesh, intg.system.ele_map
-        
-        # Grab sub-dictionaries for this surface instead of overwriting
-        m0 = self._m0[surf]
-        qwts = self._qwts[surf]
-        eidxs = self._eidxs[surf]
-        norms = self._norms[surf]
-        
-        if self._mcomp:
-            rfpts = self._rfpts[surf]
-        
-        if self._viscous:
-            m4 = self._m4[surf]
-            rcpjact = self._rcpjact[surf]
-
-        for etype, eidx_, fidx, flags in mesh[bc].tolist():
-            eles = elemap[etype]
-            itype, proj, norm = eles.basis.faces[fidx]
-            
-            ppts, pwts = self._surf_quad(itype, proj, flags='s')
-            pnorm = eles.pnorm_at(ppts, [norm]*len(ppts))[:, eidx_]
-            
-            key = (etype, fidx)
-            eidxs.setdefault(key, []).append(eidx_)
-            norms.setdefault(key, []).append(pnorm)
-
-            if key not in m0:
-                m0[key] = eles.basis.ubasis.nodal_basis_at(ppts)
-                qwts[key] = pwts
-
-                if self._viscous and etype not in m4:
-                    m4[etype] = eles.basis.m4
-                    smat = eles.smat_at_np('upts').transpose(2, 0, 1, 3)
-                    djac = eles.rcpdjac_at_np('upts')
-                    rcpjact[etype] = smat * djac
-
-            if self._mcomp:
-                ploc = eles.ploc_at_np(ppts)[..., eidx_]
-                rfpts.setdefault(key, []).append(ploc - self.morigin)
-
-        # Convert lists to arrays
-        self._eidxs[surf] = {k: np.array(v) for k, v in eidxs.items()}
-        self._norms[surf] = {k: np.array(v) for k, v in norms.items()}
-        if self._mcomp:
-            self._rfpts[surf] = {k: np.array(v) for k, v in rfpts.items()}
-        if self._viscous:
-            self._rcpjact[surf] = {
-                k: rcpjact[k[0]][..., self._eidxs[surf][k]] for k in self._eidxs[surf]
-            }
-
     def __call__(self, intg):
         """Called after each step - store forces/moments if needed""" # __call__ in every plugin is called every time step
         # Return if no sampling is due
@@ -160,133 +132,143 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
 
         # Get forces and store them
         comm, rank, root = get_comm_rank_root()
-        fm = self._compute_fm(intg, dict(zip(intg.system.ele_types, intg.soln)))
+        fm = self._compute_forces(dict(zip(intg.system.ele_types, intg.soln)))
         #print(fm) # check how to throw error if morigin is not given in .ini file
         if rank == root:
             t = intg.tcurr
             drag = (fm[0, 0] + (fm[1, 0] if self._viscous else 0) + fm[2, 0]) * 2
             lift = (fm[0, 1] + (fm[1, 1] if self._viscous else 0) + fm[2, 1]) * 2
-            if self._mcomp:
-                moment = (fm[0, 2] + (fm[1, 2] if self._viscous else 0) + fm[2, 2]) * 2
+            moment = (fm[0, 2] + (fm[1, 2] if self._viscous else 0) + fm[2, 2]) * 2
             # needs to be reconfigured for 3D cases! check;
             
             # Store forces
             self.force_times.append(t)
             self.drag_history.append(drag)
             self.lift_history.append(lift)
-            if self._mcomp:
-                self.moment_history.append(moment)
+            self.moment_history.append(moment)
             
             # Remove old data outside window
             while self.force_times[0] < t - self.avg_window:
                 self.force_times.pop(0)
                 self.drag_history.pop(0)
                 self.lift_history.pop(0)
-            if self._mcomp:
-                while self.force_times[0] < t - self.avg_window:
-                    self.moment_history.pop(0)
+                self.moment_history.pop(0)
 
-    def _compute_fm(self, intg, solns):
-        """Compute instantaneous forces/moments for all surfaces"""
+    def _compute_forces(self, solns):
+        """Compute instantaneous forces"""
         comm, rank, root = get_comm_rank_root()
         
-        # Initialize arrays
+        # Get solution matrices ; solns is already the solution dict
         ndims = self.ndims
         mcomp = self._mcomp
-        # Same array structure as original
+        
+        # Force and moment vectors
         fm = np.zeros((3 if self._viscous else 2, ndims + mcomp))
         
-        # Process each surface, accumulating forces in fm
-        for surf in self.surf_bnames:
-            bc = f'bcon_{surf}_p{intg.rallocs.prank}'
-            if bc not in intg.system.mesh:
-                continue
-                
-            # Process each element type, following original logic
-            for etype, fidx in self._m0[surf]:
-                # Get interpolation operator
-                m0 = self._m0[surf][etype, fidx]
-                nfpts, nupts = m0.shape
-                
-                # Get solution at points
-                uupts = solns[etype][..., self._eidxs[surf][etype, fidx]]
-                
-                # Interpolate to face
-                ufpts = m0 @ uupts.reshape(nupts, -1)
-                ufpts = ufpts.reshape(nfpts, self.nvars, -1)
-                ufpts = ufpts.swapaxes(0, 1)
-                
-                # Compute pressure
-                pidx = 0 if self._ac else -1
-                p = self.elementscls.con_to_pri(ufpts, self.cfg)[pidx]
-                
-                # Get weights and normals
-                qwts = self._qwts[surf][etype, fidx]
-                norms = self._norms[surf][etype, fidx]
-                
-                # Pressure force
-                fm[0, :ndims] += np.einsum('i...,ij,jik', qwts, p, norms)
-                
-                # Force from momentum flux (same as original)
-                pri_vars = self.elementscls.con_to_pri(ufpts, self.cfg)
-                vs = np.array(pri_vars[1:-1])
-                rho = np.ones_like(vs[0]) if self._ac else pri_vars[0]
-                rhovs = rho[None, :, :] * vs
-                fm[2, :ndims] += np.einsum('i,jim,mij,kim->k', qwts, rhovs, norms, vs)
-                
+        for etype, fidx in self._m0:
+            # Get interpolation operator
+            m0 = self._m0[etype, fidx]
+            nfpts, nupts = m0.shape
+            
+            # Get solution at points
+            uupts = solns[etype][..., self._eidxs[etype, fidx]]
+            
+            # Interpolate to face
+            ufpts = m0 @ uupts.reshape(nupts, -1)
+            ufpts = ufpts.reshape(nfpts, self.nvars, -1)
+            ufpts = ufpts.swapaxes(0, 1)
+            
+            # Compute pressure
+            pidx = 0 if self._ac else -1
+            p = self.elementscls.con_to_pri(ufpts, self.cfg)[pidx]
+            
+            # Get weights and normals
+            qwts = self._qwts[etype, fidx]
+            norms = self._norms[etype, fidx]
+            
+            # Pressure force
+            fm[0, :ndims] += np.einsum('i...,ij,jik', qwts, p, norms)
+
+            # Force from momentum flux
+            # Convert conservative variables to primitive variables
+            pri_vars = self.elementscls.con_to_pri(ufpts, self.cfg)
+            vs = np.array(pri_vars[1:-1])  # Velocity components
+            if self._ac:
+                # Artificial compressibility: density is not a primitive variable
+                # Set rho to 1 with the appropriate shape
+                rho = np.ones_like(vs[0])
+            else:
+                # Compressible flow: extract rho from primitive variables
+                rho = pri_vars[0]
+            # Compute rhovs: multiply rho and vs
+            rhovs = rho[None, :, :] * vs
+            fm[2, :ndims] += np.einsum('i,jim,mij,kim->k', qwts, rhovs, norms, vs)
+            
+            if self._viscous:
+                # Get operator and J^-T matrix
+                m4 = self._m4[etype]
+                rcpjact = self._rcpjact[etype, fidx]
+
+                # Transformed gradient at solution points
+                tduupts = m4 @ uupts.reshape(nupts, -1)
+                tduupts = tduupts.reshape(ndims, nupts, self.nvars, -1)
+
+                # Physical gradient at solution points
+                duupts = np.einsum('ijkl,jkml->ikml', rcpjact, tduupts)
+                duupts = duupts.reshape(ndims, nupts, -1)
+
+                # Interpolate gradient to flux points
+                dufpts = np.array([m0 @ du for du in duupts])
+                dufpts = dufpts.reshape(ndims, nfpts, self.nvars, -1)
+                dufpts = dufpts.swapaxes(1, 2)
+
+                # Viscous stress
+                if self._ac:
+                    vis = self.ac_stress_tensor(dufpts)
+                else:
+                    vis = self.stress_tensor(ufpts, dufpts)
+
+                # Do the quadrature
+                fm[1, :ndims] += np.einsum('i...,klij,jil', qwts, vis, norms)
+            
+            if self._mcomp:
+                # Get the flux points positions relative to the moment origin
+                rfpts = self._rfpts[etype, fidx]
+
+                # Do the cross product with the normal vectors
+                rcn = np.atleast_3d(np.cross(rfpts, norms))
+
+                # Pressure force moments
+                fm[0, ndims:] += np.einsum('i...,ij,jik->k', qwts, p, rcn)
+
+                # Moment from momentum flux
+                # Calculate momentum flux force at each point (rho v_k (v_j n_j))
+                momflux = np.einsum('jim,mij,kim->kim', rhovs, norms, vs)
+                # Cross product of position with force
+                rcf = np.atleast_3d(np.cross(rfpts, momflux.T))
+                # Do the quadrature for moments
+                fm[2, ndims:] += np.einsum('i,jik->k', qwts, rcf)
+
                 if self._viscous:
-                    # Get viscous terms (same as original)
-                    m4 = self._m4[surf][etype]
-                    rcpjact = self._rcpjact[surf][etype, fidx]
-                    
-                    # Transformed gradient at solution points
-                    tduupts = m4 @ uupts.reshape(nupts, -1)
-                    tduupts = tduupts.reshape(ndims, nupts, self.nvars, -1)
-                    
-                    # Physical gradient at solution points
-                    duupts = np.einsum('ijkl,jkml->ikml', rcpjact, tduupts)
-                    duupts = duupts.reshape(ndims, nupts, -1)
-                    
-                    # Interpolate gradient to flux points
-                    dufpts = np.array([m0 @ du for du in duupts])
-                    dufpts = dufpts.reshape(ndims, nfpts, self.nvars, -1)
-                    dufpts = dufpts.swapaxes(1, 2)
-                    
-                    # Viscous stress
-                    if self._ac:
-                        vis = self.ac_stress_tensor(dufpts)
-                    else:
-                        vis = self.stress_tensor(ufpts, dufpts)
-                    
-                    # Add to forces
-                    fm[1, :ndims] += np.einsum('i...,klij,jil', qwts, vis, norms)
+                    # Normal viscous force at each flux point
+                    viscf = np.einsum('ijkl,lkj->lki', vis, norms)
+
+                    # Normal viscous force moments at each flux point
+                    rcf = np.atleast_3d(np.cross(rfpts, viscf))
+
+                    # Do the quadrature
+                    fm[1, ndims:] += np.einsum('i,jik->k', qwts, rcf)
                 
-                if self._mcomp:
-                    # Moment calculations (same as original)
-                    rfpts = self._rfpts[surf][etype, fidx]
-                    rcn = np.atleast_3d(np.cross(rfpts, norms))
-                    
-                    # Pressure moments
-                    fm[0, ndims:] += np.einsum('i...,ij,jik->k', qwts, p, rcn)
-                    
-                    # Momentum flux moments
-                    momflux = np.einsum('jim,mij,kim->kim', rhovs, norms, vs)
-                    rcf = np.atleast_3d(np.cross(rfpts, momflux.T))
-                    fm[2, ndims:] += np.einsum('i,jik->k', qwts, rcf)
-                    
-                    if self._viscous:
-                        # Viscous moments
-                        viscf = np.einsum('ijkl,lkj->lki', vis, norms)
-                        rcf = np.atleast_3d(np.cross(rfpts, viscf))
-                        fm[1, ndims:] += np.einsum('i,jik->k', qwts, rcf)
-        
-        # Reduce across ranks (same as original)
+        # Reduce across ranks
         if rank != root:
             comm.Reduce(fm, None, op=mpi.SUM, root=root)
         else:
             comm.Reduce(mpi.IN_PLACE, fm, op=mpi.SUM, root=root)
-        
+
         return fm
+
+    #def set_action(self, action): # commented because this is done in _step (rl/env.py) instead
+    #    self.control_signal = torch.tensor([action], device=self.device)
 
     def _setup_sampling(self, intg):
         """Setup sampling infrastructure similar to SamplerPlugin"""
@@ -407,8 +389,8 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
         #reward = - abs(avg_moment)
-        #reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
-        reward = -avg_drag
+        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
+        #reward = -avg_drag
         return float(reward)
         
 

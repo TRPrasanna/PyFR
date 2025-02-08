@@ -35,14 +35,6 @@ class FluidFluxPlugin(SurfaceMixin, BaseSolnPlugin):
         # Boundary to integrate over
         bc = f'bcon_{suffix}_p{intg.rallocs.prank}'
 
-        # Moments
-        mcomp = 3 if self.ndims == 3 else 1
-        self._mcomp = mcomp if self.cfg.hasopt(cfgsect, 'morigin') else 0
-        if self._mcomp:
-            morigin = np.array(self.cfg.getliteral(cfgsect, 'morigin'))
-            if len(morigin) != self.ndims:
-                raise ValueError(f'morigin must have {self.ndims} components')
-
         # Get the mesh and elements
         mesh, elemap = intg.system.mesh, intg.system.ele_map
 
@@ -55,18 +47,7 @@ class FluidFluxPlugin(SurfaceMixin, BaseSolnPlugin):
                 raise RuntimeError(f'Boundary {suffix} does not exist')
 
             # CSV header
-            header = ['t', 'massflux']
-            # momentum flux
-            mf_labels = ['momflux_x', 'momflux_y', 'momflux_z'][:self.ndims]
-            header += mf_labels
-            # moment
-            if self._mcomp > 0:
-                # for 2D => 1 scalar "momz"
-                # for 3D => "momx, momy, momz"
-                if self.ndims == 2:
-                    header += ['moment_z']
-                else:
-                    header += ['moment_x', 'moment_y', 'moment_z']
+            header = ['t', 'massflux'][:2]
 
             # Open
             self.outf = init_csv(self.cfg, cfgsect, ','.join(header))
@@ -80,7 +61,6 @@ class FluidFluxPlugin(SurfaceMixin, BaseSolnPlugin):
             # Element indices and associated face normals
             eidxs = defaultdict(list)
             norms = defaultdict(list)
-            rfpts = defaultdict(list)
 
             for etype, eidx, fidx, flags in mesh[bc].tolist():
                 eles = elemap[etype]
@@ -99,16 +79,8 @@ class FluidFluxPlugin(SurfaceMixin, BaseSolnPlugin):
                     m0[etype, fidx] = eles.basis.ubasis.nodal_basis_at(ppts)
                     qwts[etype, fidx] = pwts
 
-                # Get the flux points position of the given face and element
-                # indices relative to the moment origin
-                if self._mcomp:
-                    ploc = eles.ploc_at_np(ppts)[..., eidx]
-                    rfpt = ploc - morigin
-                    rfpts[etype, fidx].append(rfpt)
-
             self._eidxs = {k: np.array(v) for k, v in eidxs.items()}
             self._norms = {k: np.array(v) for k, v in norms.items()}
-            self._rfpts = {k: np.array(v) for k, v in rfpts.items()}
 
     def __call__(self, intg):
         # Return if no output is due
@@ -120,9 +92,9 @@ class FluidFluxPlugin(SurfaceMixin, BaseSolnPlugin):
 
         # Solution matrices indexed by element type
         solns = dict(zip(intg.system.ele_types, intg.soln))
-        ndims, nvars, mcomp = self.ndims, self.nvars, self._mcomp
+        nvars = self.nvars
         # Flux
-        f = np.zeros(1 + ndims + mcomp)
+        f = np.zeros(1)
 
         for etype, fidx in self._m0:
             # Get the interpolation operator
@@ -156,28 +128,7 @@ class FluidFluxPlugin(SurfaceMixin, BaseSolnPlugin):
             qwts = self._qwts[etype, fidx]
             norms = self._norms[etype, fidx]
             # Do the quadrature
-            #
-            # 1) MASS FLUX (scalar)
-            #
             f[0] += np.einsum('i,jim,mij->', qwts, rhovs, norms)
-            #
-            # 2) MOMENTUM FLUX (vector of ndims)
-            #    each component k is integral of rho v_k (v_j n_j)
-            #
-            f[1:ndims+1] += np.einsum('i,jim,mij,kim->k', qwts, rhovs, norms, vs)
-
-            if self._mcomp:
-                # Get the flux points positions relative to the moment origin
-                rfpts = self._rfpts[etype, fidx]
-
-                # Calculate momentum flux force at each point (rho v_k (v_j n_j))
-                momflux = np.einsum('jim,mij,kim->kim', rhovs, norms, vs)
-                
-                # Cross product of position with force
-                rcf = np.atleast_3d(np.cross(rfpts, momflux.T))
-
-                # Do the quadrature for moments
-                f[ndims+1:] += np.einsum('i,jik->k', qwts, rcf)
 
         # Reduce and output if we're the root rank
         if rank != root:

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from tensordict.nn import TensorDictModule
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
+from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, OneHotCategorical
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.envs import (
     Compose,
@@ -33,33 +33,26 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     checkpoint = torch.load(load_model, map_location=device, weights_only=True)
     
     actor_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0], 512),
-        nn.Tanh(),
-        #nn.ReLU(),
+        nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_policy),
+        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        #nn.ReLU(),
         nn.Tanh(),
-        nn.Linear(hp.num_cells_policy, 2),
-        NormalParamExtractor()
+        nn.Linear(hp.num_cells_policy, env.action_space_size)
     ).to(device)
-    
+
     actor_module = TensorDictModule(
         actor_net,
         in_keys=["observation"],
-        out_keys=["loc", "scale"]
+        out_keys=["logits"]
     ).to(device)
-    
+
     policy = ProbabilisticActor(
         module=actor_module,
         spec=env.action_spec,
-        in_keys=["loc", "scale"],
-        distribution_class=TanhNormal,
-        return_log_prob=False, # True for PPO
-        distribution_kwargs={
-        "low": env.action_spec.space.low,
-        "high": env.action_spec.space.high,
-        },
-        #safe=True
+        in_keys=["logits"],
+        distribution_class=OneHotCategorical,
+        return_log_prob=True
+        #safe = True
     ).to(device)
     
     policy.load_state_dict(checkpoint['policy_state_dict'])
@@ -87,8 +80,6 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
             print("Starting evaluation...")
             eval_rollout = env.rollout(100000, policy)
-            print(eval_rollout)
-            print("rewards",eval_rollout["reward"].item())
             
             # Extract data and process for plotting
             actions = eval_rollout["action"].cpu().numpy()
