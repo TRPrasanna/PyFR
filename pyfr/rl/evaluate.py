@@ -7,6 +7,7 @@ from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration
 from torchrl.envs import (
     Compose,
     StepCounter,
+    DoubleToFloat,
     TransformedEnv,
 )
 import matplotlib.pyplot as plt
@@ -27,13 +28,14 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     hp = HyperParameters.from_config(cfg)
 
     env = PyFREnvironment(mesh, cfg, backend_name, ic_dir=ic_dir)
+    #env = TransformedEnv(env,Compose(StepCounter(), DoubleToFloat()))
     env = TransformedEnv(env,StepCounter())
 
     # Load policy
     checkpoint = torch.load(load_model, map_location=device, weights_only=True)
     
     actor_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0], 512),
+        nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_policy),
         nn.Tanh(),
         #nn.ReLU(),
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
@@ -54,7 +56,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        return_log_prob=False, # True for PPO
+        return_log_prob=True, # True for PPO
         distribution_kwargs={
         "low": env.action_spec.space.low,
         "high": env.action_spec.space.high,
@@ -87,8 +89,8 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
             print("Starting evaluation...")
             eval_rollout = env.rollout(100000, policy)
-            print(eval_rollout)
-            print("rewards",eval_rollout["reward"].item())
+            #print(eval_rollout)
+            #print("rewards",eval_rollout["reward"].item())
             
             # Extract data and process for plotting
             actions = eval_rollout["action"].cpu().numpy()
@@ -102,19 +104,20 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
             
             # Print action history
             print("\nAction history:")
-            header = f"{'Time':>10}"
+            column_width = 16
+            header = f"{'Time':>{column_width}}"
             for i in range(num_actions):
-                header += f"{'Action_'+str(i):>15}"
-            header += f"{'Reward':>15}"
+                header += f"{('Action_'+str(i)):>{column_width}}"
+            header += f"{'Reward':>{column_width}}"
             print(header)
-            print("-" * (10 + 15 * (num_actions + 1)))
+            print("-" * (column_width * (num_actions + 2)))
             
             # Format and print data rows
             for t in range(len(time_array)):
-                row = f"{time_array[t]:10.2f}"
+                row = f"{time_array[t]:>{column_width}.7e}"
                 for i in range(num_actions):
-                    row += f"{actions[t,i]:15.4f}"
-                row += f"{rewards[t]:15.4f}"
+                    row += f"{actions[t,i]:>{column_width}.7e}"
+                row += f"{rewards[t]:>{column_width}.7e}"
                 print(row)
             
              # Print evaluation results
@@ -126,6 +129,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
             if current_reward is not None:
                 print(f"Difference:      {((eval_reward - current_reward)/current_reward)*100:.2f}%")
             
+            print("eval reward by torch mean",eval_rollout["next", "reward"].mean().item())
             # Create evaluation plots
             fig, axes = plt.subplots(num_actions + 1, 1, 
                                    figsize=(12, 4*(num_actions + 1)),

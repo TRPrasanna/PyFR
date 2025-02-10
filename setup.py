@@ -120,6 +120,9 @@ install_requires = [
     'torch >= 2.5.1',
     'torchrl >= 0.6.0',
     'tensordict >= 0.6.2',
+    'tensorboard >= 2.18.0',
+    'scipy >= 1.13.1',
+    'matplotlib >= 3.10.0',
     'tqdm >= 4.67.0'
 ]
 

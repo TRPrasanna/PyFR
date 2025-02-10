@@ -49,7 +49,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         mcomp = 3 if self.ndims == 3 else 1
         self._mcomp = mcomp if self.cfg.hasopt(cfgsect, 'morigin') else 0
         if self._mcomp:
-            morigin = np.array(self.cfg.getliteral(cfgsect, 'morigin'))
+            self.morigin = morigin = np.array(self.cfg.getliteral(cfgsect, 'morigin'))
             if len(morigin) != self.ndims:
                 raise ValueError(f'morigin must have {self.ndims} components')
 
@@ -182,8 +182,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
                 self.force_times.pop(0)
                 self.drag_history.pop(0)
                 self.lift_history.pop(0)
-            if self._mcomp:
-                while self.force_times[0] < t - self.avg_window:
+                if self._mcomp:
                     self.moment_history.pop(0)
 
     def _compute_fm(self, intg, solns):
@@ -394,21 +393,21 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         if len(self.force_times) > 1:
             # Time-averaged forces using trapezoid rule
             delta_t = self.force_times[-1] - self.force_times[0]
-            avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
-            avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
-            #avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
+            #avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
+            #avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+            avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
             #print("averaging over time ", self.force_times[-1] - self.force_times[0])
         else:
             # Single point
-            avg_drag = self.drag_history[0]
-            avg_lift = self.lift_history[0]
-            #avg_moment = self.moment_history[0]
+            #avg_drag = self.drag_history[0]
+            #avg_lift = self.lift_history[0]
+            avg_moment = self.moment_history[0]
         
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
-        #reward = - abs(avg_moment)
+        reward = - abs(avg_moment)
         #reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
-        reward = -avg_drag
+        #reward = -avg_drag
         return float(reward)
         
 

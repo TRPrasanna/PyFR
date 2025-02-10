@@ -42,6 +42,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # Initialize environment
     env = PyFREnvironment(mesh, cfg, backend_name, ic_dir=ic_dir)
     env = TransformedEnv(env,StepCounter())
+    # todo, check: fix PyFR single precision and Pytorch double precision mismatch
 
     hp = HyperParameters.from_config(cfg)
     # Calculate derived parameters using environment info
@@ -232,7 +233,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         writer.add_scalar("batch/episodes", episode_count, batch_idx)
         writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
         advantage_module(tensordict_data)
-        
+
         # Training updates
         for epoch_idx in range(hp.num_epochs):
             #advantage_module(tensordict_data)
@@ -334,6 +335,8 @@ def evaluate_policy(env, policy, num_steps=1000000):
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
             eval_rollout = env.rollout(num_steps, policy)
             eval_reward = eval_rollout["next", "reward"].mean().item()
+            print(f"Eval rewards var: {eval_rollout['next', 'reward']}")
+            #print(f"Eval rewards: {eval_rollout['next', 'reward'].item()}")
             del eval_rollout
             return eval_reward
     finally:
