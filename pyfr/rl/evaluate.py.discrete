@@ -30,7 +30,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     env = TransformedEnv(env,StepCounter())
 
     # Load policy
-    checkpoint = torch.load(load_model, map_location=device, weights_only=True)
+    checkpoint = torch.load(load_model, map_location=device, weights_only=False)
     
     actor_net = nn.Sequential(
         nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_policy),
@@ -50,6 +50,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         module=actor_module,
         spec=env.action_spec,
         in_keys=["logits"],
+        out_keys=["action"],
         distribution_class=OneHotCategorical,
         return_log_prob=True
         #safe = True
@@ -112,8 +113,9 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
             eval_reward = float(np.mean(rewards))
             print("\nEvaluation Results:")
             print("-" * 40)
-            print(f"Expected reward: {current_reward:.4f}")
-            print(f"Actual reward:   {eval_reward:.4f}")
+            print(f"Expected reward: {current_reward:.11f}")
+            print(f"Actual reward:   {eval_reward:.11f}")
+            print("eval reward by torch mean",eval_rollout["next", "reward"].mean().item())
             if current_reward is not None:
                 print(f"Difference:      {((eval_reward - current_reward)/current_reward)*100:.2f}%")
             

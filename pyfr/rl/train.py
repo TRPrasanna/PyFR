@@ -276,6 +276,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         # Evaluate every hp.eval_frequency batches
         if batch_idx % hp.eval_frequency == 0:
             eval_reward = evaluate_policy(env, policy)
+            eval_reward = evaluate_policy(env, policy)
+            eval_reward = evaluate_policy(env, policy)
+            eval_reward = evaluate_policy(env, policy)
             logs["eval_reward"].append(eval_reward)
 
             writer.add_scalar("eval/mean_reward", eval_reward, batch_idx)
@@ -335,8 +338,8 @@ def evaluate_policy(env, policy, num_steps=1000000):
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
             eval_rollout = env.rollout(num_steps, policy)
             eval_reward = eval_rollout["next", "reward"].mean().item()
-            print(f"Eval rewards var: {eval_rollout['next', 'reward']}")
-            #print(f"Eval rewards: {eval_rollout['next', 'reward'].item()}")
+            #print(f"Eval rewards var: {eval_rollout['next', 'reward']}")
+            print(f"Eval rewards: {eval_reward}")
             del eval_rollout
             return eval_reward
     finally:

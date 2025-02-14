@@ -72,9 +72,19 @@ class PyFREnvironment(EnvBase):
         self.eval_ic = None  # Store evaluation IC
         self.is_evaluating = False  # Track evaluation mode
 
-        # Initialize the solver and other components; no need to pass initial solution for now
-        self.restart_soln = None 
-        self._init_solver() # probably hard to get observation_size without doing this, but should preferably get rid of this
+        # Initialize the solver to get # of obs
+        if self.ic_manager is not None:
+            try:
+                if self.is_evaluating:
+                    restart_soln = self.ic_manager.get_eval_ic()
+                else:
+                    ic_file = self.ic_manager.get_random_ic()
+                    restart_soln = NativeReader(ic_file)
+            except Exception as e:
+                print(f"Warning: Failed to load IC file: {str(e)}")
+                print("Using default initial conditions.")
+
+        self._init_solver(initsoln=restart_soln) # probably hard to get observation_size without doing this, but should preferably get rid of this
 
         # Get observation size from RL plugin
         obs_size = self.rl_plugin.observation_size
@@ -165,6 +175,7 @@ class PyFREnvironment(EnvBase):
     def _reset(self, tensordict=None, **kwargs):
         #print("Reset called")
         self.step_count = 0
+        self.current_control = np.array(self.actions_low)
 
         restart_soln = None
         # Handle evaluation mode differently
