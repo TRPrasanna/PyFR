@@ -20,6 +20,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         comm, rank, root = get_comm_rank_root()
         #self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device('cuda')
+        #self.device = torch.device('cpu')
         # Get sampling points configuration
         self.pts = self.cfg.getliteral(cfgsect, 'probe-pts')
         self.fmt = self.cfg.get(cfgsect, 'format', 'primitive')
@@ -393,20 +394,20 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         if len(self.force_times) > 1:
             # Time-averaged forces using trapezoid rule
             delta_t = self.force_times[-1] - self.force_times[0]
-            #avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
-            #avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
-            avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
+            avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
+            avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+            #avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
             #print("averaging over time ", self.force_times[-1] - self.force_times[0])
         else:
             # Single point
-            #avg_drag = self.drag_history[0]
-            #avg_lift = self.lift_history[0]
-            avg_moment = self.moment_history[0]
+            avg_drag = self.drag_history[0]
+            avg_lift = self.lift_history[0]
+            #avg_moment = self.moment_history[0]
         
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
-        reward = - abs(avg_moment)
-        #reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
+        #reward = - abs(avg_moment)
+        reward = -0.8 * avg_drag - 0.2 * abs(avg_lift)
         #reward = -avg_drag
         return float(reward)
         

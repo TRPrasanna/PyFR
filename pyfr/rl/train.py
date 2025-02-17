@@ -5,7 +5,7 @@ from typing import Dict, Any
 import torch
 from torch import nn
 from collections import defaultdict
-from tensordict.nn import TensorDictModule
+from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
 from torchrl.envs import (
     Compose,
@@ -64,19 +64,33 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     hp.print_summary()
 
      # Actor network with proper output handling
-    actor_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_policy),
+    action_dim = env.action_spec_unbatched.shape[-1]
+    input_shape = env.observation_spec["observation"].shape
+    actor_mlp = nn.Sequential(
+        nn.Linear(input_shape[-1], hp.num_cells_policy),
         nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
         nn.Tanh(),
-        nn.Linear(hp.num_cells_policy, 2),  # 2 outputs: mean and log_std
-        NormalParamExtractor()  # Use default scale_mapping
+        nn.Linear(hp.num_cells_policy, action_dim),  # only means are output
     ).to(device)
+    # Initialize policy weights
+    for layer in actor_mlp.modules():
+        if isinstance(layer, torch.nn.Linear):
+            torch.nn.init.orthogonal_(layer.weight, 1.0)
+            layer.bias.data.zero_()
+    # Add learnable scales (standard deviations)
+    actor_net = nn.Sequential(
+        actor_mlp,
+        AddStateIndependentNormalScale(
+            action_dim,  # Number of actions
+            scale_lb=1e-8,
+        ).to(device)
+    )
 
     actor_module = TensorDictModule(
         actor_net,
         in_keys=["observation"],
-        out_keys=["loc", "scale"]  # NormalParamExtractor splits into these
+        out_keys=["loc", "scale"]
     ).to(device)
 
     policy = ProbabilisticActor(
@@ -88,13 +102,14 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         distribution_kwargs={
         "low": env.action_spec.space.low,
         "high": env.action_spec.space.high,
+        "tanh_loc": False,
         },
         #safe = True
     ).to(device)
 
     # Value network (critic)
     value_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_value),
+        nn.Linear(input_shape[-1], hp.num_cells_value),
         nn.Tanh(),
         nn.Linear(hp.num_cells_value, hp.num_cells_value),
         nn.Tanh(),
@@ -232,11 +247,11 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         writer.add_scalar("batch/train_reward", train_reward, batch_idx)
         writer.add_scalar("batch/episodes", episode_count, batch_idx)
         writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
-        advantage_module(tensordict_data)
+        #advantage_module(tensordict_data) # classical approach?
 
         # Training updates
         for epoch_idx in range(hp.num_epochs):
-            #advantage_module(tensordict_data)
+            advantage_module(tensordict_data)
             data_view = tensordict_data.reshape(-1)
             replay_buffer.extend(data_view.cpu())
             
@@ -275,9 +290,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
         # Evaluate every hp.eval_frequency batches
         if batch_idx % hp.eval_frequency == 0:
-            eval_reward = evaluate_policy(env, policy)
-            eval_reward = evaluate_policy(env, policy)
-            eval_reward = evaluate_policy(env, policy)
             eval_reward = evaluate_policy(env, policy)
             logs["eval_reward"].append(eval_reward)
 
@@ -339,7 +351,7 @@ def evaluate_policy(env, policy, num_steps=1000000):
             eval_rollout = env.rollout(num_steps, policy)
             eval_reward = eval_rollout["next", "reward"].mean().item()
             #print(f"Eval rewards var: {eval_rollout['next', 'reward']}")
-            print(f"Eval rewards: {eval_reward}")
+            #print(f"Eval rewards: {eval_reward}")
             del eval_rollout
             return eval_reward
     finally:
