@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from tensordict.nn import TensorDictModule
+from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.envs import (
@@ -34,38 +34,51 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     # Load policy
     checkpoint = torch.load(load_model, map_location=device, weights_only=True)
     
-    actor_net = nn.Sequential(
-        nn.Linear(env.observation_spec["observation"].shape[0], hp.num_cells_policy),
-        nn.Tanh(),
-        #nn.ReLU(),
+    action_dim = env.action_spec_unbatched.shape[-1]
+    input_shape = env.observation_spec["observation"].shape
+    actor_mlp = nn.Sequential(
+        nn.Linear(input_shape[-1], hp.num_cells_policy),
+        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        #nn.ReLU(),
         nn.Tanh(),
-        nn.Linear(hp.num_cells_policy, 2),
-        NormalParamExtractor()
+        nn.Linear(hp.num_cells_policy, action_dim),  # only means are output
     ).to(device)
-    
+    # Initialize policy weights
+    for layer in actor_mlp.modules():
+        if isinstance(layer, torch.nn.Linear):
+            torch.nn.init.orthogonal_(layer.weight, 1.0)
+            layer.bias.data.zero_()
+    # Add learnable scales (standard deviations)
+    actor_net = nn.Sequential(
+        actor_mlp,
+        AddStateIndependentNormalScale(
+            action_dim,  # Number of actions
+            scale_lb=1e-8,
+        ).to(device)
+    )
+
     actor_module = TensorDictModule(
         actor_net,
         in_keys=["observation"],
         out_keys=["loc", "scale"]
     ).to(device)
-    
+
     policy = ProbabilisticActor(
         module=actor_module,
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        return_log_prob=True, # True for PPO
+        return_log_prob=True,
         distribution_kwargs={
         "low": env.action_spec.space.low,
         "high": env.action_spec.space.high,
+        "tanh_loc": False,
         },
-        #safe=True
+        #safe = True
     ).to(device)
     
     policy.load_state_dict(checkpoint['policy_state_dict'])
-    policy.eval()
+    #policy.eval()
 
     # Get stored rewards
     current_reward = checkpoint.get('current_reward', checkpoint.get('reward', None))
