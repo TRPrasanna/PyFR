@@ -43,7 +43,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         cfg_path = cfg_file
 
     # Initialize environment
-    env = PyFREnvironment(mesh_file, cfg_path, 'openmp', device_id=None, ic_dir=ic_dir)
+    env = PyFREnvironment(mesh_file, cfg_path, backend_name, 0, ic_dir=ic_dir)
     env = TransformedEnv(env,StepCounter())
     # todo, check: fix PyFR single precision and Pytorch double precision mismatch
 
