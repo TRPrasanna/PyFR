@@ -18,18 +18,23 @@ from pyfr.rl.env import PyFREnvironment
 
 def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, episodes=1):
     """Evaluate trained policy"""
-    device = torch.device('cuda')
+    #device = torch.device('cuda')
+    device = torch.device('cpu')
 
-    cfg = Inifile.load(cfg_file)
-    mesh = NativeReader(mesh_file)
-    if 'neuralnetwork-hyperparameters' not in cfg.sections():
-        print("No neuralnetwork-hyperparameters section found in config file. Proceeding to use default hyperparameters.")
+    # Get config path at the start
+    if hasattr(cfg_file, 'name'):
+        cfg_path = cfg_file.name
+    else:
+        cfg_path = cfg_file
 
-    hp = HyperParameters.from_config(cfg)
-
-    env = PyFREnvironment(mesh, cfg, backend_name, ic_dir=ic_dir)
+    env = PyFREnvironment(mesh_file, cfg_path, backend_name, device_id=0, ic_dir=ic_dir, print_diagnostic=True)
     #env = TransformedEnv(env,Compose(StepCounter(), DoubleToFloat()))
     env = TransformedEnv(env,StepCounter())
+
+    if 'neuralnetwork-hyperparameters' not in env.cfg.sections():
+        print("No neuralnetwork-hyperparameters section found in config file. Proceeding to use default hyperparameters.")
+
+    hp = HyperParameters.from_config(env.cfg)
 
     # Load policy
     checkpoint = torch.load(load_model, map_location=device, weights_only=True)

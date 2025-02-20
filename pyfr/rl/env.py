@@ -17,7 +17,7 @@ from pyfr.mpiutil import get_comm_rank_root, init_mpi
 class PyFREnvironment(EnvBase):
     """PyFR environment compatible with TorchRL."""
     
-    def __init__(self, mesh_file, cfg_file, backend_name, device_id, ic_dir=None):
+    def __init__(self, mesh_file, cfg_file, backend_name, device_id, ic_dir=None, print_diagnostic=False):
         #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
         init_mpi()
         device = torch.device('cpu')
@@ -30,7 +30,8 @@ class PyFREnvironment(EnvBase):
 
         if backend_name in ['hip', 'cuda']:
             self.cfg.set(f'backend-{backend_name}', 'device-id', device_id)
-            print(f"Using {backend_name} device {device_id}")
+            if print_diagnostic:
+                print(f"Using {backend_name} device {device_id}")
 
         self.backend = get_backend(backend_name, self.cfg)
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)
@@ -43,9 +44,10 @@ class PyFREnvironment(EnvBase):
         assert len(self.actions_low) == self.num_control_actions
         assert len(self.actions_high) == self.num_control_actions
 
-        print(f"Number of control actions: {self.num_control_actions}")
-        for i in range(self.num_control_actions):
-            print(f"Control action {i+1} range: {self.actions_low[i]} to {self.actions_high[i]}")
+        if print_diagnostic:
+            print(f"Number of control actions: {self.num_control_actions}")
+            for i in range(self.num_control_actions):
+                print(f"Control action {i+1} range: {self.actions_low[i]} to {self.actions_high[i]}")
 
         # Add global control signals storage array; initialize with action space low
         self.current_control = np.array(self.actions_low)
@@ -69,7 +71,7 @@ class PyFREnvironment(EnvBase):
         self.ic_manager = None
         if ic_dir is not None:
             try:
-                self.ic_manager = InitialConditionManager(ic_dir, self.mesh['mesh_uuid'])
+                self.ic_manager = InitialConditionManager(ic_dir, self.mesh['mesh_uuid'], print_diagnostic=print_diagnostic)
             except ValueError as e:
                 print(f"\nWarning: {str(e)}")
                 print("Continuing without initial condition snapshots...")
@@ -96,7 +98,8 @@ class PyFREnvironment(EnvBase):
 
         # Get observation size from RL plugin
         obs_size = self.rl_plugin.observation_size
-        print(f"Observation size: {obs_size}")
+        if print_diagnostic:
+            print(f"Observation size: {obs_size}")
 
         # *_specs
         self.observation_spec = Composite(
@@ -155,7 +158,8 @@ class PyFREnvironment(EnvBase):
             },
             shape=torch.Size([])
         )
-        print("Environment initialized.")
+        if print_diagnostic:
+            print("Environment initialized.")
         self.episode_count = 0
         self.pbar = None  # Will be set externally
         self.count_episodes = True  # Flag to control episode counting
@@ -238,9 +242,6 @@ class PyFREnvironment(EnvBase):
             # Count episode when step reaches max
             if truncated and self.count_episodes:
                 self.episode_count += 1
-                if self.pbar is not None:
-                    self.pbar.update(1)
-                    self.pbar.set_postfix({'episodes': self.episode_count})
 
         except RuntimeError as e:
             print(f"Solver crashed: {str(e)}. Resetting. Last actions were: {self.current_control}")
@@ -252,9 +253,6 @@ class PyFREnvironment(EnvBase):
             terminated = True
             if self.count_episodes:
                 self.episode_count += 1
-                if self.pbar is not None:
-                    self.pbar.update(1)
-                    self.pbar.set_postfix({'episodes': self.episode_count})
 
         #print if done is true
         #print(f"Step {self.step_count} done: {[terminated, truncated, crashed]}")
@@ -305,24 +303,29 @@ class PyFREnvironment(EnvBase):
         #self.rl_plugin = None
 
 class InitialConditionManager:
-    def __init__(self, ic_dir: str, mesh_uuid: str):
+    def __init__(self, ic_dir: str, mesh_uuid: str, print_diagnostic=False):
         self.ic_dir = ic_dir
         self.mesh_uuid = mesh_uuid
+        self.print_diagnostic = print_diagnostic
         self.ic_files = self._find_valid_ics()
         self.unused_files = set(self.ic_files)
         self.eval_ic_file = self._get_oldest_ic()
-        print(f"\nFound {len(self.ic_files)} initial condition files in {ic_dir}")
-        if self.eval_ic_file:
+        if self.print_diagnostic:
+            print(f"\nFound {len(self.ic_files)} initial condition files in {ic_dir}")
+        if self.eval_ic_file and self.print_diagnostic:
             print(f"Using {os.path.basename(self.eval_ic_file)} for evaluation")
 
     def _get_oldest_ic(self) -> str:
         """Get oldest .pyfrs file by creation time."""
         if not self.ic_files:
             return None
+        
         oldest = min(self.ic_files, key=os.path.getctime)
-        creation_time = datetime.fromtimestamp(os.path.getctime(oldest))
-        print(f"\nSelected evaluation IC: {os.path.basename(oldest)}")
-        print(f"Creation time: {creation_time:%Y-%m-%d %H:%M:%S}")
+        if self.print_diagnostic:
+            creation_time = datetime.fromtimestamp(os.path.getctime(oldest))
+            print(f"\nSelected evaluation IC: {os.path.basename(oldest)}")
+            print(f"Creation time: {creation_time:%Y-%m-%d %H:%M:%S}")
+
         return oldest
 
     def get_eval_ic(self) -> NativeReader:

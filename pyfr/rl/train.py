@@ -43,7 +43,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         cfg_path = cfg_file
 
     # Initialize environment
-    env = PyFREnvironment(mesh_file, cfg_path, backend_name, 0, ic_dir=ic_dir)
+    env = PyFREnvironment(mesh_file, cfg_path, backend_name, 0, ic_dir=ic_dir, print_diagnostic=True)
     env = TransformedEnv(env,StepCounter())
     # todo, check: fix PyFR single precision and Pytorch double precision mismatch
 
@@ -151,35 +151,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     optim, hp.total_frames // hp.frames_per_batch, 0.0
     )
 
-    # # Data collection
-    # num_workers = 2
-    # num_nodes = 1
-    # launcher = "submitit" #"mp"
-    # kwargs = {"backend": "mpi"}
-    # def PYFRenv_make():
-    #      env = PyFREnvironment(mesh_file, cfg_path, backend_name, ic_dir=ic_dir)
-    #      env = TransformedEnv(env,StepCounter())
-    #      return env
-
-    #env_maker = lambda: TransformedEnv(PyFREnvironment(mesh_file, cfg_path, backend_name, ic_dir=ic_dir),StepCounter())
-    # collector = DistributedDataCollector(
-    #     [make_env] * num_nodes,
-    #     policy,
-    #     num_workers_per_collector=num_workers,
-    #     frames_per_batch=hp.frames_per_batch,
-    #     total_frames=hp.total_frames,
-    #     collector_class=SyncDataCollector
-    #     if num_workers == 1
-    #     else MultiSyncDataCollector,
-    #     #collector_kwargs=collector_kwargs,
-    #     #slurm_kwargs=slurm_conf,
-    #     sync=True,
-    #     storing_device="cpu",
-    #     #launcher=launcher,
-    #     reset_at_each_iter=True,
-    #     **kwargs,
-    # )
-
     # Get number of available devices
     num_devices = get_device_count(backend_name)
     print(f"\nFound {num_devices} devices for backend '{backend_name}'")
@@ -191,7 +162,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             cfg_file=cfg_file,
             backend_name=backend,
             device_id=device_id,
-            ic_dir=ic_dir
+            ic_dir=ic_dir,
+            print_diagnostic=False
         )
         env = TransformedEnv(env, StepCounter())
         return env

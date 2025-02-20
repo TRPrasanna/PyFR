@@ -84,7 +84,7 @@ def process_train(args):
     )
 
 def process_evaluate(args):
-    init_mpi()
+    #init_mpi()
             
     from .evaluate import evaluate_policy
     evaluate_policy(
