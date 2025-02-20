@@ -19,8 +19,8 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
 
         comm, rank, root = get_comm_rank_root()
         #self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.device = torch.device('cuda')
-        #self.device = torch.device('cpu')
+        #self.device = torch.device('cuda')
+        self.device = torch.device('cpu')
         # Get sampling points configuration
         self.pts = self.cfg.getliteral(cfgsect, 'probe-pts')
         self.fmt = self.cfg.get(cfgsect, 'format', 'primitive')

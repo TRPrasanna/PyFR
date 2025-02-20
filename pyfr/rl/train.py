@@ -14,7 +14,9 @@ from torchrl.envs import (
     StepCounter,
     TransformedEnv,
 )
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
+from torchrl.collectors.distributed import DistributedDataCollector
+from torchrl.envs import EnvCreator
 from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
@@ -31,20 +33,24 @@ import time
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
     # Device setup
     #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
-    #device = torch.device('cpu')
-    device = torch.device('cuda')
+    device = torch.device('cpu')
+    #device = torch.device('cuda')
 
-    cfg = Inifile.load(cfg_file)
-    mesh = NativeReader(mesh_file)
-    if 'neuralnetwork-hyperparameters' not in cfg.sections():
-        print("No neuralnetwork-hyperparameters section found in config file. Proceeding to use default hyperparameters.")
+    # Get config path at the start
+    if hasattr(cfg_file, 'name'):
+        cfg_path = cfg_file.name
+    else:
+        cfg_path = cfg_file
 
     # Initialize environment
-    env = PyFREnvironment(mesh, cfg, backend_name, ic_dir=ic_dir)
+    env = PyFREnvironment(mesh_file, cfg_path, 'openmp', device_id=None, ic_dir=ic_dir)
     env = TransformedEnv(env,StepCounter())
     # todo, check: fix PyFR single precision and Pytorch double precision mismatch
 
-    hp = HyperParameters.from_config(cfg)
+    if 'neuralnetwork-hyperparameters' not in env.cfg.sections():
+        print("No neuralnetwork-hyperparameters section found in config file. Proceeding to use default hyperparameters.")
+
+    hp = HyperParameters.from_config(env.cfg)
     # Calculate derived parameters using environment info
     hp._calculate_derived(env)
 
@@ -145,10 +151,59 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     optim, hp.total_frames // hp.frames_per_batch, 0.0
     )
 
-    # Data collection
-    collector = SyncDataCollector(
-        env,
-        policy,
+    # # Data collection
+    # num_workers = 2
+    # num_nodes = 1
+    # launcher = "submitit" #"mp"
+    # kwargs = {"backend": "mpi"}
+    # def PYFRenv_make():
+    #      env = PyFREnvironment(mesh_file, cfg_path, backend_name, ic_dir=ic_dir)
+    #      env = TransformedEnv(env,StepCounter())
+    #      return env
+
+    #env_maker = lambda: TransformedEnv(PyFREnvironment(mesh_file, cfg_path, backend_name, ic_dir=ic_dir),StepCounter())
+    # collector = DistributedDataCollector(
+    #     [make_env] * num_nodes,
+    #     policy,
+    #     num_workers_per_collector=num_workers,
+    #     frames_per_batch=hp.frames_per_batch,
+    #     total_frames=hp.total_frames,
+    #     collector_class=SyncDataCollector
+    #     if num_workers == 1
+    #     else MultiSyncDataCollector,
+    #     #collector_kwargs=collector_kwargs,
+    #     #slurm_kwargs=slurm_conf,
+    #     sync=True,
+    #     storing_device="cpu",
+    #     #launcher=launcher,
+    #     reset_at_each_iter=True,
+    #     **kwargs,
+    # )
+
+    # Get number of available devices
+    num_devices = get_device_count(backend_name)
+    print(f"\nFound {num_devices} devices for backend '{backend_name}'")
+
+    def make_env(backend, device_id):
+        """Create environment with specified backend and device ID"""
+        env = PyFREnvironment(
+            mesh_file=mesh_file,
+            cfg_file=cfg_file,
+            backend_name=backend,
+            device_id=device_id,
+            ic_dir=ic_dir
+        )
+        env = TransformedEnv(env, StepCounter())
+        return env
+
+    # Create list of environment creators with device IDs
+    env_makers = [
+        (lambda id=i: make_env(backend_name, id))
+        for i in range(num_devices)
+    ]
+    collector = MultiSyncDataCollector(
+        create_env_fn=env_makers,
+        policy=policy,
         frames_per_batch=hp.frames_per_batch,
         total_frames=hp.total_frames,
         split_trajs=False,
@@ -545,3 +600,14 @@ def print_tensordict_diagnostics(td, verbose=True):
                   f"truncated={td['truncated'][i].cpu().item()}")
     
     print("\n" + "="*80)
+
+def get_device_count(backend_name):
+    """Get number of available devices for given backend"""
+    if backend_name == 'hip':
+        from pyfr.backends.hip.driver import HIP
+        return HIP().device_count()
+    elif backend_name == 'cuda':
+        from pyfr.backends.cuda.driver import CUDA
+        return CUDA().device_count()
+    else:
+        return 1  # For CPU backends like 'openmp'

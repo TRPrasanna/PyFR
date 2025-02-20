@@ -10,20 +10,28 @@ import os
 import random
 from typing import List, Set
 from pyfr.readers.native import NativeReader
+from pyfr.inifile import Inifile
 from datetime import datetime
+from pyfr.mpiutil import get_comm_rank_root, init_mpi
 
 class PyFREnvironment(EnvBase):
     """PyFR environment compatible with TorchRL."""
     
-    def __init__(self, mesh, cfg, backend_name, ic_dir=None):
+    def __init__(self, mesh_file, cfg_file, backend_name, device_id, ic_dir=None):
         #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
-        #device = torch.device('cpu')
-        device = torch.device('cuda')
+        init_mpi()
+        device = torch.device('cpu')
+        #device = torch.device('cuda')
         super().__init__(device=device)
-
+    
         # Load mesh and config once
-        self.mesh = mesh #NativeReader(mesh_file)
-        self.cfg = cfg
+        self.mesh = NativeReader(mesh_file)
+        self.cfg = Inifile.load(cfg_file)
+
+        if backend_name in ['hip', 'cuda']:
+            self.cfg.set(f'backend-{backend_name}', 'device-id', device_id)
+            print(f"Using {backend_name} device {device_id}")
+
         self.backend = get_backend(backend_name, self.cfg)
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)
 
@@ -61,7 +69,7 @@ class PyFREnvironment(EnvBase):
         self.ic_manager = None
         if ic_dir is not None:
             try:
-                self.ic_manager = InitialConditionManager(ic_dir, mesh['mesh_uuid'])
+                self.ic_manager = InitialConditionManager(ic_dir, self.mesh['mesh_uuid'])
             except ValueError as e:
                 print(f"\nWarning: {str(e)}")
                 print("Continuing without initial condition snapshots...")

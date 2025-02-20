@@ -69,7 +69,7 @@ def main():
 
 def process_train(args):
     # Manually initialise MPI
-    init_mpi()
+    #init_mpi()
 
     print(f"Starting training with checkpoint dir: {args.checkpoint_dir}")
     from .train import train_agent
