@@ -12,26 +12,41 @@ from typing import List, Set
 from pyfr.readers.native import NativeReader
 from pyfr.inifile import Inifile
 from datetime import datetime
-from pyfr.mpiutil import get_comm_rank_root, init_mpi
+from pyfr.mpiutil import get_comm_rank_root, get_local_rank, init_mpi
 
 class PyFREnvironment(EnvBase):
     """PyFR environment compatible with TorchRL."""
     
-    def __init__(self, mesh_file, cfg_file, backend_name, device_id, ic_dir=None, print_diagnostic=False):
+    def __init__(self, mesh_file, cfg_file, backend_name, ic_dir=None, print_diagnostic=False):
         #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
         init_mpi()
         device = torch.device('cpu')
         #device = torch.device('cuda')
         super().__init__(device=device)
     
-        # Load mesh and config once
+        # SLURM process identification
+        self.node_id = int(os.environ.get('SLURM_NODEID', 0))
+        self.local_id = int(os.environ.get('SLURM_LOCALID', 0))
+        self.gpus_per_task = int(os.environ.get('SLURM_GPUS_PER_TASK', 0))
+        self.gpus_on_node = int(os.environ.get('SLURM_GPUS_ON_NODE', 0))
+        
+        # Load mesh and config
         self.mesh = NativeReader(mesh_file)
         self.cfg = Inifile.load(cfg_file)
 
-        if backend_name in ['hip', 'cuda']:
+        # GPU backend setup
+        if backend_name in ['hip', 'cuda'] and self.gpus_per_task > 0:
+            # SLURM binds GPUs per task, so we use local_id
+            device_id = self.local_id
             self.cfg.set(f'backend-{backend_name}', 'device-id', device_id)
+            
             if print_diagnostic:
-                print(f"Using {backend_name} device {device_id}")
+                print(f"Node {self.node_id}, Local rank {self.local_id}: "
+                      f"Using {backend_name} device {device_id}")
+        else:
+            if print_diagnostic:
+                print(f"Warning: Using serial backend for rank {self.local_id}")
+            backend_name = 'serial'
 
         self.backend = get_backend(backend_name, self.cfg)
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)

@@ -43,7 +43,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         cfg_path = cfg_file
 
     # Initialize environment
-    env = PyFREnvironment(mesh_file, cfg_path, backend_name, 0, ic_dir=ic_dir, print_diagnostic=True)
+    env = PyFREnvironment(mesh_file, cfg_path, backend_name, ic_dir=ic_dir, print_diagnostic=True)
     env = TransformedEnv(env,StepCounter())
     # todo, check: fix PyFR single precision and Pytorch double precision mismatch
 
@@ -150,37 +150,53 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optim, hp.total_frames // hp.frames_per_batch, 0.0
     )
+    
+    # Get SLURM configuration
+    ntasks = int(os.environ.get('SLURM_NTASKS', 1))
+    gpus_per_task = int(os.environ.get('SLURM_GPUS_PER_TASK', 0))
+    nnodes = int(os.environ.get('SLURM_NNODES', 1))
+    cpus_on_node = int(os.environ.get('SLURM_CPUS_ON_NODE', 1))
+    gpus_on_node = int(os.environ.get('SLURM_GPUS_ON_NODE', 1))
+    cpus_per_task = int(os.environ.get('SLURM_CPUS_PER_TASK',1))
+    
+    print(f"\nSLURM Configuration:")
+    print(f"Total tasks: {ntasks}")
+    print(f"GPUs per task: {gpus_per_task}")
+    print(f"Number of nodes: {nnodes}")
+    print(f"CPUs per node: {cpus_on_node}")
+    print(f"GPUs per node: {gpus_on_node}")
+    print(f"Calculated CPUs per task: {cpus_per_task}")
 
-    # Get number of available devices
-    num_devices = get_device_count(backend_name)
-    print(f"\nFound {num_devices} devices for backend '{backend_name}'")
-
-    def make_env(backend, device_id):
-        """Create environment with specified backend and device ID"""
+    def make_env():
+        """Create environment - SLURM handles GPU binding"""
         env = PyFREnvironment(
             mesh_file=mesh_file,
             cfg_file=cfg_file,
-            backend_name=backend,
-            device_id=device_id,
+            backend_name=backend_name,
             ic_dir=ic_dir,
-            print_diagnostic=False
+            print_diagnostic=True
         )
         env = TransformedEnv(env, StepCounter())
         return env
 
-    # Create list of environment creators with device IDs
-    env_makers = [
-        (lambda id=i: make_env(backend_name, id))
-        for i in range(num_devices)
-    ]
-    collector = MultiSyncDataCollector(
-        create_env_fn=env_makers,
+    collector = DistributedDataCollector(
+        create_env_fn=[make_env] * ntasks,  # One env per task
         policy=policy,
         frames_per_batch=hp.frames_per_batch,
         total_frames=hp.total_frames,
-        split_trajs=False,
-        reset_at_each_iter=True, # without this the collector seems to continue collecting in evaluation mode
-        device=device
+        collector_class=MultiSyncDataCollector,
+        sync=True,
+        storing_device="cpu",
+        launcher="submitit",
+        slurm_kwargs={
+            "timeout_min": 4320,
+            "partition": "gpu",
+            "ntasks": ntasks,
+            "gpus_per_task": gpus_per_task,
+            "nodes": nnodes,
+            "cpus_per_task": cpus_per_task,  # Using calculated value
+        },
+        reset_at_each_iter=True,
     )
 
     # Replay buffer here is not actually used for experience replay
@@ -583,3 +599,22 @@ def get_device_count(backend_name):
         return CUDA().device_count()
     else:
         return 1  # For CPU backends like 'openmp'
+    
+def get_slurm_gpu_info():
+    """Get allocated GPU information from SLURM"""
+    total_gpus = int(os.environ.get('SLURM_GPUS', 0))
+    # Also check SLURM_GPUS_ON_NODE for total GPUs allocated to this node
+    gpus_on_node = int(os.environ.get('SLURM_GPUS_ON_NODE', 0))
+    node_id = int(os.environ.get('SLURM_NODEID', 0))
+    local_id = int(os.environ.get('SLURM_LOCALID', 0))
+    
+    # Get visible GPUs for this process
+    visible_gpus = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+    local_gpus = [int(x) for x in visible_gpus.split(',')] if visible_gpus else []
+    
+    print(f"\nSLURM GPU allocation for node {node_id}:")
+    print(f"Total GPUs allocated across all nodes: {total_gpus}")
+    print(f"GPUs on this node: {gpus_on_node}")
+    print(f"Local process ID: {local_id}")
+    print(f"Visible GPUs: {local_gpus}")
+    return total_gpus, local_gpus, node_id, local_id
