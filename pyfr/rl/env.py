@@ -40,6 +40,7 @@ class PyFREnvironment(EnvBase):
         self.num_control_actions = self.cfg.getint('solver-plugin-reinforcementlearning', 'num-control-actions')
         self.actions_low = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-low')
         self.actions_high = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-high')
+        self.actions_init = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-init')
         # check if there are num_control_actions action_lows and action_highs
         assert len(self.actions_low) == self.num_control_actions
         assert len(self.actions_high) == self.num_control_actions
@@ -187,7 +188,7 @@ class PyFREnvironment(EnvBase):
     def _reset(self, tensordict=None, **kwargs):
         #print("Reset called")
         self.step_count = 0
-        self.current_control = np.array(self.actions_low)
+        self.current_control = np.array(self.actions_init)
 
         restart_soln = None
         # Handle evaluation mode differently
