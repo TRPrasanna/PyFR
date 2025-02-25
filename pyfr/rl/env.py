@@ -19,34 +19,16 @@ class PyFREnvironment(EnvBase):
     
     def __init__(self, mesh_file, cfg_file, backend_name, ic_dir=None, print_diagnostic=False):
         #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
-        init_mpi()
+        from mpi4py import MPI
+        if not MPI.Is_initialized():
+            init_mpi()
         device = torch.device('cpu')
         #device = torch.device('cuda')
         super().__init__(device=device)
-    
-        # SLURM process identification
-        self.node_id = int(os.environ.get('SLURM_NODEID', 0))
-        self.local_id = int(os.environ.get('SLURM_LOCALID', 0))
-        self.gpus_per_task = int(os.environ.get('SLURM_GPUS_PER_TASK', 0))
-        self.gpus_on_node = int(os.environ.get('SLURM_GPUS_ON_NODE', 0))
-        
+            
         # Load mesh and config
         self.mesh = NativeReader(mesh_file)
         self.cfg = Inifile.load(cfg_file)
-
-        # GPU backend setup
-        if backend_name in ['hip', 'cuda'] and self.gpus_per_task > 0:
-            # SLURM binds GPUs per task, so we use local_id
-            device_id = self.local_id
-            self.cfg.set(f'backend-{backend_name}', 'device-id', device_id)
-            
-            if print_diagnostic:
-                print(f"Node {self.node_id}, Local rank {self.local_id}: "
-                      f"Using {backend_name} device {device_id}")
-        else:
-            if print_diagnostic:
-                print(f"Warning: Using serial backend for rank {self.local_id}")
-            backend_name = 'serial'
 
         self.backend = get_backend(backend_name, self.cfg)
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)
@@ -240,7 +222,7 @@ class PyFREnvironment(EnvBase):
             raise RuntimeError("Control signal is NaN. Aborting.")
         
         self.current_time = self.solver.tcurr
-        #print(f"Step called with actions: {tensordict['action'].cpu().numpy()} at step {self.step_count} and time {self.current_time}")
+        print(f"Step called with actions: {tensordict['action'].cpu().numpy()} at step {self.step_count} and time {self.current_time}")
         # Update the next action time
         self.next_action_time = self.current_time + self.action_interval
         #print(f"Stepcount: {self.step_count}, Current time: {self.current_time}, going to advance to {self.next_action_time}")

@@ -14,8 +14,8 @@ from torchrl.envs import (
     StepCounter,
     TransformedEnv,
 )
-from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
-from torchrl.collectors.distributed import DistributedDataCollector
+from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector, MultiaSyncDataCollector
+from torchrl.collectors.distributed import DistributedDataCollector, RPCDataCollector
 from torchrl.envs import EnvCreator
 from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
@@ -179,24 +179,29 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         env = TransformedEnv(env, StepCounter())
         return env
 
+    kwargs = {"backend": "mpi"}
     collector = DistributedDataCollector(
-        create_env_fn=[make_env] * ntasks,  # One env per task
+        create_env_fn=[make_env]*5, #5 jobs
         policy=policy,
+        num_workers_per_collector=1,
         frames_per_batch=hp.frames_per_batch,
         total_frames=hp.total_frames,
         collector_class=MultiSyncDataCollector,
         sync=True,
-        storing_device="cpu",
+        #storing_device="cpu",
         launcher="submitit",
         slurm_kwargs={
-            "timeout_min": 4320,
-            "partition": "gpu",
-            "ntasks": ntasks,
-            "gpus_per_task": gpus_per_task,
-            "nodes": nnodes,
-            "cpus_per_task": cpus_per_task,  # Using calculated value
+        "timeout_min": 4320,
+        "slurm_partition": "gpu_windfall",
+        "slurm_nodes":1,
+        "slurm_ntasks_per_node":1,
+        "slurm_cpus_per_task": 23,
+        "slurm_gpus_per_task": 1,
         },
         reset_at_each_iter=True,
+        #backend = "mpi",
+        tcp_port = 44321, #60060, # I picked an available port
+        **kwargs,
     )
 
     # Replay buffer here is not actually used for experience replay
