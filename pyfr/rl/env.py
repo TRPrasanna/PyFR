@@ -37,9 +37,11 @@ class PyFREnvironment(EnvBase):
         self.num_control_actions = self.cfg.getint('solver-plugin-reinforcementlearning', 'num-control-actions')
         self.actions_low = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-low')
         self.actions_high = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-high')
+        self.actions_init = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-init')
         # check if there are num_control_actions action_lows and action_highs
         assert len(self.actions_low) == self.num_control_actions
         assert len(self.actions_high) == self.num_control_actions
+        assert len(self.actions_init) == self.num_control_actions
 
         if print_diagnostic:
             print(f"Number of control actions: {self.num_control_actions}")
@@ -182,9 +184,9 @@ class PyFREnvironment(EnvBase):
     # Mandatory methods: _step, _reset and _set_seed
 
     def _reset(self, tensordict=None, **kwargs):
-        #print("Reset called")
+        print("Reset called")
         self.step_count = 0
-        self.current_control = np.array(self.actions_low)
+        self.current_control = np.array(self.actions_init)
 
         restart_soln = None
         # Handle evaluation mode differently
@@ -222,7 +224,7 @@ class PyFREnvironment(EnvBase):
             raise RuntimeError("Control signal is NaN. Aborting.")
         
         self.current_time = self.solver.tcurr
-        print(f"Step called with actions: {tensordict['action'].cpu().numpy()} at step {self.step_count} and time {self.current_time}")
+        #print(f"Step called with actions: {tensordict['action'].cpu().numpy()} at step {self.step_count} and time {self.current_time}")
         # Update the next action time
         self.next_action_time = self.current_time + self.action_interval
         #print(f"Stepcount: {self.step_count}, Current time: {self.current_time}, going to advance to {self.next_action_time}")

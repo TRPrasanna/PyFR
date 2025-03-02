@@ -179,29 +179,38 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         env = TransformedEnv(env, StepCounter())
         return env
 
-    kwargs = {"backend": "mpi"}
+    #kwargs = {"backend": "gloo"}
     collector = DistributedDataCollector(
-        create_env_fn=[make_env]*5, #5 jobs
+        create_env_fn=[make_env]*8, #5 jobs
         policy=policy,
         num_workers_per_collector=1,
         frames_per_batch=hp.frames_per_batch,
         total_frames=hp.total_frames,
-        collector_class=MultiSyncDataCollector,
+        collector_class=SyncDataCollector,
         sync=True,
-        #storing_device="cpu",
+        device="cpu",
         launcher="submitit",
         slurm_kwargs={
         "timeout_min": 4320,
-        "slurm_partition": "gpu_windfall",
+        "slurm_partition": "gpu_standard",
+        "slurm_account": "mashayek",
         "slurm_nodes":1,
         "slurm_ntasks_per_node":1,
-        "slurm_cpus_per_task": 23,
+        "slurm_cpus_per_task": 14,
         "slurm_gpus_per_task": 1,
+        "slurm_setup": ["conda activate conda_env",
+        "module unload gnu8 cmake",
+        "module load cuda11-sdk",
+        'export PATH="$CONDA_PREFIX/bin:$PATH"',
+        'which mpirun',
+        "export UCX_NET_DEVICES=mlx4_0:1",
+        'export CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc"',
+        'export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"'],
         },
         reset_at_each_iter=True,
-        #backend = "mpi",
-        tcp_port = 44321, #60060, # I picked an available port
-        **kwargs,
+        backend = "gloo",
+        #tcp_port = 44321, #60060, # I picked an available port
+        #**kwargs,
     )
 
     # Replay buffer here is not actually used for experience replay

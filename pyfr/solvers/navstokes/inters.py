@@ -469,3 +469,49 @@ class NavierStokesSubInflowFrvNeuralType4BCInters(NavierStokesBaseBCInters):
             self.control_params.set(np.array([[self._current_target, Q1, t]]))
             self._current_target = Q1
             self.last_step_count = self.intg.system.env.step_count
+            
+class NavierStokesCharRiemInvNeuralBCInters(NavierStokesBaseBCInters):
+    type = 'char-riem-inv-neural'
+    cflux_state = 'ghost'
+
+    def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+
+        self.c |= self._exp_opts(
+            ['rho', 'p', 'u', 'v', 'w'][:self.ndims + 2], lhs
+        )
+        
+        # some config parameters
+        self.t_act_interval = self.backend.matrix((1,1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
+                         value=self.t_act_interval)
+
+        # Neural network + control parameters
+        self.control_params = self.backend.matrix((1,3))
+        self._set_external('control_params', 'broadcast fpdtype_t[1][3]', 
+                         value=self.control_params)
+
+        # Initial value
+        self.control_params.set(np.array([[0.0, 0.0, 0.0]])) #(Q0,Q1,t0)
+
+        # Cache current parameter value 
+        self._current_target = 0.0
+
+        # Fixed values
+        self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
+        #print(f"jcenter: {jcenter[0][0]}, polarity: {polarity[0][0]}")
+
+        # Helper to keep track of last step count
+        self.last_step_count = -1
+
+    def prepare(self, t):
+        # Direct access to control signal from solver environment
+        new_targets = self.intg.system.env.current_control
+
+        # Only update backend after environment has taken a step
+        if self.intg.system.env.step_count != self.last_step_count:
+            self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
+            self._current_target = new_targets[0]
+            self.last_step_count = self.intg.system.env.step_count
