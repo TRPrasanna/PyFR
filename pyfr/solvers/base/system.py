@@ -172,7 +172,7 @@ class BaseSystem:
 
                 # Instantiate
                 bcclass = bcmap[self.cfg.get(cfgsect, 'type')]
-                if 'sub-in-frv-neural' in bc_type:
+                if 'sub-in-frv-neural' in bc_type or 'char-riem-inv-neural' in bc_type:
                     # Include 'intg' for your neural BC
                     bciface = bcclass(self.intg, self.backend, interarr, elemap, cfgsect, self.cfg)
                 else:

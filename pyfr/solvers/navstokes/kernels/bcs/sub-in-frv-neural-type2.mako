@@ -1,5 +1,3 @@
-<% import numpy as np %> 
-
 <%namespace module='pyfr.backends.base.makoutil' name='pyfr'/>
 <%include file='pyfr.solvers.navstokes.kernels.bcs.common'/>
 
