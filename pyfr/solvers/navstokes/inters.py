@@ -469,20 +469,22 @@ class NavierStokesSubInflowFrvNeuralType4BCInters(NavierStokesBaseBCInters):
             self.control_params.set(np.array([[self._current_target, Q1, t]]))
             self._current_target = Q1
             self.last_step_count = self.intg.system.env.step_count
-            
-class NavierStokesCharRiemInvNeuralBCInters(NavierStokesBaseBCInters):
-    type = 'char-riem-inv-neural'
+
+class NavierStokesSubInflowFrvNeuralType5BCInters(NavierStokesBaseBCInters):
+    type = 'sub-in-frv-neural-type5' # for changing velocity/mass flow rate for multiple actuators
     cflux_state = 'ghost'
 
     def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
         self.backend = be
         self.intg = intg
         super().__init__(be, lhs, elemap, cfgsect, cfg)
-
-        self.c |= self._exp_opts(
-            ['rho', 'p', 'u', 'v', 'w'][:self.ndims + 2], lhs
-        )
         
+        # Basic initialization
+        self.c |= self._exp_opts(
+            ['rho', 'u', 'v', 'w'][:self.ndims + 1], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
         # some config parameters
         self.t_act_interval = self.backend.matrix((1,1))
         self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
@@ -501,7 +503,7 @@ class NavierStokesCharRiemInvNeuralBCInters(NavierStokesBaseBCInters):
 
         # Fixed values
         self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
-        #print(f"jcenter: {jcenter[0][0]}, polarity: {polarity[0][0]}")
+        self.actuator_id = cfg.getint(cfgsect, 'actuator-number') # 0-indexed
 
         # Helper to keep track of last step count
         self.last_step_count = -1
@@ -509,9 +511,107 @@ class NavierStokesCharRiemInvNeuralBCInters(NavierStokesBaseBCInters):
     def prepare(self, t):
         # Direct access to control signal from solver environment
         new_targets = self.intg.system.env.current_control
+        required_target = new_targets[self.actuator_id]
 
+        # Only update backend after environment has taken a step
+        if self.intg.system.env.step_count != self.last_step_count:
+            self.control_params.set(np.array([[self._current_target, required_target, t]]))
+            #print(f"Control signal: {required_target} at time t = {t}")
+            self._current_target = required_target
+            #print(f"Control signal: {required_target} updated at time t = {t} and step count = {self.intg.system.env.step_count}, last step count = {self.last_step_count}")
+            self.last_step_count = self.intg.system.env.step_count
+
+class NavierStokesCharRiemInvNeuralBCInters(NavierStokesBaseBCInters):
+    type = 'char-riem-inv-neural' # for changing velocity/mass flow rate
+    cflux_state = 'ghost'
+
+    def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+        
+        # Basic initialization : careful, don't make rho or p a function of uvw
+        self.c |= self._exp_opts(
+            ['rho', 'p', 'u', 'v', 'w'][:self.ndims + 2], lhs
+        )
+
+        # some config parameters
+        self.t_act_interval = self.backend.matrix((1,1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
+                         value=self.t_act_interval)
+
+        # Neural network + control parameters
+        self.control_params = self.backend.matrix((1,3))
+        self._set_external('control_params', 'broadcast fpdtype_t[1][3]', 
+                         value=self.control_params)
+
+        # Initial value
+        self.control_params.set(np.array([[0.0, 0.0, 0.0]])) #(Q0,Q1,t0)
+
+        # Cache current parameter value 
+        self._current_target = 0.0
+
+        # Fixed values
+        self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
+
+        # Helper to keep track of last step count
+        self.last_step_count = -1
+
+    def prepare(self, t):
+        # Direct access to control signal from solver environment
+        new_targets = self.intg.system.env.current_control
+        #print("stepping")
         # Only update backend after environment has taken a step
         if self.intg.system.env.step_count != self.last_step_count:
             self.control_params.set(np.array([[self._current_target, new_targets[0], t]]))
             self._current_target = new_targets[0]
+            #print(f"Control signal: {new_targets[0]} at time t = {t}")
+            self.last_step_count = self.intg.system.env.step_count
+
+class NavierStokesCharRiemInvNeuralType5BCInters(NavierStokesBaseBCInters):
+    type = 'char-riem-inv-neural-type5' # for changing velocity or mass flow rate for multiple actuators
+    cflux_state = 'ghost'
+
+    def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+        
+        # Basic initialization : careful, don't make rho or p a function of uvw
+        self.c |= self._exp_opts(
+            ['rho', 'p', 'u', 'v', 'w'][:self.ndims + 2], lhs
+        )
+
+        # some config parameters
+        self.t_act_interval = self.backend.matrix((1,1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
+                         value=self.t_act_interval)
+
+        # Neural network + control parameters
+        self.control_params = self.backend.matrix((1,3))
+        self._set_external('control_params', 'broadcast fpdtype_t[1][3]', 
+                         value=self.control_params)
+
+        # Initial value
+        self.control_params.set(np.array([[0.0, 0.0, 0.0]])) #(Q0,Q1,t0)
+
+        # Cache current parameter value 
+        self._current_target = 0.0
+
+        # Fixed values
+        self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
+        self.actuator_id = cfg.getint(cfgsect, 'actuator-number') # 0-indexed
+
+        # Helper to keep track of last step count
+        self.last_step_count = -1
+
+    def prepare(self, t):
+        # Direct access to control signal from solver environment
+        new_targets = self.intg.system.env.current_control
+        required_target = new_targets[self.actuator_id]
+
+        # Only update backend after environment has taken a step
+        if self.intg.system.env.step_count != self.last_step_count:
+            self.control_params.set(np.array([[self._current_target, required_target, t]]))
+            self._current_target = required_target
             self.last_step_count = self.intg.system.env.step_count

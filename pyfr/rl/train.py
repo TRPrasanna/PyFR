@@ -181,7 +181,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     #kwargs = {"backend": "gloo"}
     collector = DistributedDataCollector(
-        create_env_fn=[make_env]*8, #5 jobs
+        create_env_fn=[make_env]*9, #5 jobs
         policy=policy,
         num_workers_per_collector=1,
         frames_per_batch=hp.frames_per_batch,
@@ -198,18 +198,11 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         "slurm_ntasks_per_node":1,
         "slurm_cpus_per_task": 14,
         "slurm_gpus_per_task": 1,
-        "slurm_setup": ["conda activate conda_env",
-        "module unload gnu8 cmake",
-        "module load cuda11-sdk",
-        'export PATH="$CONDA_PREFIX/bin:$PATH"',
-        'which mpirun',
-        "export UCX_NET_DEVICES=mlx4_0:1",
-        'export CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc"',
-        'export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"'],
+        "slurm_mail_type": "ALL",
         },
         reset_at_each_iter=True,
         backend = "gloo",
-        #tcp_port = 44321, #60060, # I picked an available port
+        tcp_port = 60060, # I picked an available port
         #**kwargs,
     )
 
