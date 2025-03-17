@@ -27,7 +27,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     else:
         cfg_path = cfg_file
 
-    env = PyFREnvironment(mesh_file, cfg_path, backend_name, device_id=0, ic_dir=ic_dir, print_diagnostic=True)
+    env = PyFREnvironment(mesh_file, cfg_path, backend_name, ic_dir=ic_dir, print_diagnostic=True)
     #env = TransformedEnv(env,Compose(StepCounter(), DoubleToFloat()))
     env = TransformedEnv(env,StepCounter())
 
