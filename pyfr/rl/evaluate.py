@@ -104,7 +104,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     # Set evaluation mode and run
     env.set_evaluation_mode(True)
     try:
-        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        with set_exploration_type(ExplorationType.RANDOM), torch.no_grad():
             print("Starting evaluation...")
             eval_rollout = env.rollout(100000, policy)
             #print(eval_rollout)

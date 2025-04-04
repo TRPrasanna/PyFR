@@ -35,10 +35,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         
         # Rest of initialization
         self.action_interval = self.cfg.getfloat(cfgsect, 'action-interval', 0.1)
-        self.control_signal = torch.tensor([0.0], device=self.device)
         self.last_action_time = intg.tcurr
-        self.latest_observation = torch.zeros(self.observation_size, device=self.device)
-        self.latest_reward = 0.0
 
         # Force and moments calculation setup (from FluidForcePlugin)
         self._viscous = 'navier-stokes' in intg.system.name
@@ -99,6 +96,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         self.drag_history = []
         self.lift_history = []
         self.moment_history = []
+        self.action_history = []
         self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
 
     def _init_surface(self, intg, bc, surf):
@@ -159,6 +157,17 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         if intg.nacptsteps % self.nsteps:
             return
 
+        previous_control_target = intg.system.env.previous_control
+        current_control_target = intg.system.env.current_control
+        current_control_value = (intg.system.env.current_control-intg.system.env.previous_control)/intg.system.env.action_interval*(intg.tcurr-intg.system.env.current_time) + intg.system.env.previous_control
+        #Q = (Q1-Q0)/Ta * (t-t0) + Q0; but this ramping behaviour may change in future; check
+        #print(f"Current control value: {current_control_value}", previous_control_target, current_control_target)
+        # values may overshoot range [Q0,Q1] if dt is large; check
+
+        # store sum of absolute values of actions
+        #self.sumabsact = np.sum(np.abs(current_control_value))
+        #print(f"Sum of absolute actions: {self.sumabsact}")
+
         # Get forces and store them
         comm, rank, root = get_comm_rank_root()
         fm = self._compute_fm(intg, dict(zip(intg.system.ele_types, intg.soln)))
@@ -177,12 +186,15 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             self.lift_history.append(lift)
             if self._mcomp:
                 self.moment_history.append(moment)
+            # store sum(|actions|)
+            self.action_history.append(np.sum(np.abs(current_control_value)))
             
             # Remove old data outside window
             while self.force_times[0] < t - self.avg_window:
                 self.force_times.pop(0)
                 self.drag_history.pop(0)
                 self.lift_history.pop(0)
+                self.action_history.pop(0)
                 if self._mcomp:
                     self.moment_history.pop(0)
 
@@ -396,27 +408,29 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             delta_t = self.force_times[-1] - self.force_times[0]
             avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
             avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+            avg_sumabsact = trapezoid(y=self.action_history, x=self.force_times) / delta_t
             #avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
             #print("averaging over time ", self.force_times[-1] - self.force_times[0])
         else:
             # Single point
             avg_drag = self.drag_history[0]
             avg_lift = self.lift_history[0]
+            avg_sumabsact = self.action_history[0]
             #avg_moment = self.moment_history[0]
         
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
         #reward = - abs(avg_moment+0.1625)
-        reward = -(avg_drag-3.1500712e-1) - 0.2 * abs(avg_lift-1.1437607e0)
+        reward = -(avg_drag-3.1500712e-1) - 0.2 * abs(avg_lift-1.1437607e0) - 0.05/3.0*(2.0*avg_sumabsact)
         #reward = -avg_drag
         return float(reward)
         
 
     def reset(self):
-        self.control_signal = torch.tensor([0.0], device=self.device)
+        #self.control_signal = torch.tensor([0.0], device=self.device)
         self.latest_observation.zero_()
-        self.latest_reward = 0.0
-        self.last_action_time = 0.0  # Reset time tracking
+        #self.latest_reward = 0.0
+        #self.last_action_time = 0.0  # Reset time tracking
 
     def stress_tensor(self, u, du):
         c = self._constants

@@ -44,6 +44,8 @@ class PyFREnvironment(EnvBase):
         # check if there are num_control_actions action_lows and action_highs
         assert len(self.actions_low) == self.num_control_actions
         assert len(self.actions_high) == self.num_control_actions
+        assert len(self.actions_init) == self.num_control_actions
+
 
         if print_diagnostic:
             print(f"Number of control actions: {self.num_control_actions}")
@@ -51,7 +53,8 @@ class PyFREnvironment(EnvBase):
                 print(f"Control action {i+1} range: {self.actions_low[i]} to {self.actions_high[i]}")
 
         # Add global control signals storage array; initialize with action space low
-        self.current_control = np.array(self.actions_low)
+        self.current_control = np.array(self.actions_init)
+        self.previous_control = np.array(self.actions_init)
 
         self.dtend = self.cfg.getfloat('solver-time-integrator', 'dtend') # difference between initial and final time
         # Get evaluation time if specified, otherwise use training time
@@ -189,6 +192,7 @@ class PyFREnvironment(EnvBase):
         #print("Reset called")
         self.step_count = 0
         self.current_control = np.array(self.actions_init)
+        self.previous_control = np.array(self.actions_init)
 
         restart_soln = None
         # Handle evaluation mode differently
@@ -218,6 +222,7 @@ class PyFREnvironment(EnvBase):
 
     def _step(self, tensordict):
         # Update global control signals
+        self.previous_control = self.current_control
         self.current_control = tensordict["action"].cpu().numpy()
         self.step_count = tensordict["step_count"].item()
 
