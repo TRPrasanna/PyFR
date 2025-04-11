@@ -191,7 +191,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         device="cpu",
         launcher="submitit",
         slurm_kwargs={
-        "timeout_min": 4320,
+        "timeout_min": 14000, #4320,
         "slurm_partition": "gpu_standard",
         "slurm_account": "mashayek",
         "slurm_nodes":1,
