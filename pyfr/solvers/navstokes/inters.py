@@ -262,7 +262,7 @@ class NavierStokesSubInflowFrvNeuralBCInters(NavierStokesBaseBCInters):
             required_target = self.intg.system.env.current_control[0]
             
             self.control_params.set(np.array([[self._current_target, required_target, t]]))
-            print(f"Control signal: {required_target} at time t = {t}") #first setting will be overriden
+            #print(f"Control signal: {required_target} at time t = {t}") #first setting will be overriden
             self._current_target = required_target
             #print(f"Control signal: {required_target} updated at time t = {t} and step count = {self.intg.system.env.step_count}, last step count = {self.last_step_count}")
             if self._init_complete:
