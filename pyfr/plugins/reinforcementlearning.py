@@ -30,7 +30,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         
         # Calculate observation size based on probe points and variables
         nvars = len(self.elementscls.privarmap[self.ndims]) if self.fmt == 'primitive' else len(self.elementscls.convarmap[self.ndims])
-        self.observation_size = len(self.pts) * 3 # * nvars for all variables
+        self.observation_size = len(self.pts) * 2 #* 3 # * nvars for all variables
         self.nvars = nvars
         
         # Rest of initialization
@@ -157,12 +157,12 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         if intg.nacptsteps % self.nsteps:
             return
 
-        previous_control_target = intg.system.env.previous_control
-        current_control_target = intg.system.env.current_control
-        current_control_value = (intg.system.env.current_control-intg.system.env.previous_control)/intg.system.env.action_interval*(intg.tcurr-intg.system.env.current_time) + intg.system.env.previous_control
+        #previous_control_target = intg.system.env.previous_control
+        #current_control_target = intg.system.env.current_control
+        #current_control_value = (intg.system.env.current_control-intg.system.env.previous_control)/intg.system.env.action_interval*(intg.tcurr-intg.system.env.current_time) + intg.system.env.previous_control
         #Q = (Q1-Q0)/Ta * (t-t0) + Q0; but this ramping behaviour may change in future; check
         #print(f"Current control value: {current_control_value}", previous_control_target, current_control_target)
-        # values may overshoot range [Q0,Q1] if dt is large; check
+        # values will overshoot range [Q0,Q1] if dt is large; fix this before using
 
         # store sum of absolute values of actions
         #self.sumabsact = np.sum(np.abs(current_control_value))
@@ -187,14 +187,14 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             if self._mcomp:
                 self.moment_history.append(moment)
             # store sum(|actions|)
-            self.action_history.append(np.sum(np.abs(current_control_value)))
+            #self.action_history.append(np.sum(np.abs(current_control_value)))
             
             # Remove old data outside window
             while self.force_times[0] < t - self.avg_window:
                 self.force_times.pop(0)
                 self.drag_history.pop(0)
                 self.lift_history.pop(0)
-                self.action_history.pop(0)
+                #self.action_history.pop(0)
                 if self._mcomp:
                     self.moment_history.pop(0)
 
@@ -390,7 +390,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             samples = np.array(samples).T
 
             # Extract only u,v velocities, p (indices 1,2,3 in primitive variables)
-            var_indices = [1, 2, 3]  # u,v,p are at indices 1,2,3 (after density)
+            var_indices = [1,2] #[1, 2, 3]  # u,v,p are at indices 1,2,3 (after density)
             samples = samples[:, var_indices]
             
         # Convert to tensor of 32-bit floats, check
@@ -408,20 +408,20 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             delta_t = self.force_times[-1] - self.force_times[0]
             avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
             avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
-            avg_sumabsact = trapezoid(y=self.action_history, x=self.force_times) / delta_t
+            #avg_sumabsact = trapezoid(y=self.action_history, x=self.force_times) / delta_t
             #avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
             #print("averaging over time ", self.force_times[-1] - self.force_times[0])
         else:
             # Single point
             avg_drag = self.drag_history[0]
             avg_lift = self.lift_history[0]
-            avg_sumabsact = self.action_history[0]
+            #avg_sumabsact = self.action_history[0]
             #avg_moment = self.moment_history[0]
         
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
         #reward = - abs(avg_moment+0.1625)
-        reward = -(avg_drag-0.0284) - 0.2 * abs(avg_lift-0.1034) - 0.05/3.0*(2.0*avg_sumabsact)
+        reward = -(avg_drag-0.0284) - 0.2 * abs(avg_lift-0.1034) #- 0.05/3.0*(2.0*avg_sumabsact)
         #reward = -avg_drag
         return float(reward)
         
@@ -462,4 +462,3 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         gradu, nu = du[:, 1:], self._constants['nu']
 
         return -nu*(gradu + gradu.swapaxes(0, 1))
-    

@@ -2,10 +2,13 @@
 <%include file='pyfr.solvers.navstokes.kernels.bcs.common'/>
 
 <%pyfr:macro name='bc_rsolve_state' params='ul, nl, ur' externs='ploc, t, control_params, t_act_interval'>
-    <% control = "(control_params[0][1]-control_params[0][0])/t_act_interval[0][0]*(t-control_params[0][2]) + control_params[0][0]"%>
+    fpdtype_t control = (control_params[0][1]-control_params[0][0])/t_act_interval[0][0]*(t-control_params[0][2]) + control_params[0][0];
+    fpdtype_t lower_bound = min(control_params[0][0], control_params[0][1]);
+    fpdtype_t upper_bound = max(control_params[0][0], control_params[0][1]);
+    control = max(lower_bound, min(control, upper_bound));
     ur[0] = ${c['rho']};
 % for i, v in enumerate('uvw'[:ndims]):
-    ur[${i + 1}] = ${control}*(${c['rho']}) * (${c[v]});
+    ur[${i + 1}] = control*(${c['rho']}) * (${c[v]});
 % endfor
     ur[${nvars - 1}] = ul[${nvars - 1}]
                      - 0.5*(1.0/ul[0])*${pyfr.dot('ul[{i}]', i=(1, ndims + 1))}
