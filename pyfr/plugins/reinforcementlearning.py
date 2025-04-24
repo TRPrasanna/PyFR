@@ -436,7 +436,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         #reward = -(avg_drag-0.1608) - 0.2 * abs(avg_lift-0.5428) # free case
         #reward = -abs(avg_moment) - abs(avg_lift-0.5428) # free case
         #print(f"moment at last step: {self.moment_at_last_step}")
-        reward = -(self.moment_history[-1])**2 - 0.99*(self.moment_at_last_step)**2 - abs(avg_lift-0.5428) # free case
+        reward = 0.99*(self.moment_at_last_step)**2 - (self.moment_history[-1])**2 - (avg_lift-0.5428)**2 # free case
         self.moment_at_last_step = self.moment_history[-1]
         return float(reward)
         
