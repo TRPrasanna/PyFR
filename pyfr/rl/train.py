@@ -147,9 +147,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     # Optimizer
     optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optim, hp.total_frames // hp.frames_per_batch, 0.0
-    )
+    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #optim, hp.total_frames // hp.frames_per_batch, 0.0
+    #)
 
     # Get number of available devices
     num_devices = get_device_count(backend_name)

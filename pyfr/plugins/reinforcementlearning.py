@@ -99,6 +99,9 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         self.action_history = []
         self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
 
+        # may need these for incremental version of reward; check if initialization is correct
+        self.moment_at_last_step = 0.0
+
     def _init_surface(self, intg, bc, surf):
         """Initialize matrices for a single surface"""
         mesh, elemap = intg.system.mesh, intg.system.ele_map
@@ -400,29 +403,41 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
 
     def _get_reward(self, solver):
         """Compute reward using stored force history"""
-        if len(self.force_times) < 1:
-            return 0.0
+        #if len(self.force_times) < 1: #unlikely to reach this state
+        #    print("checkpoint: no forces yet")
+        #    return 0.0
             
-        if len(self.force_times) > 1:
+        delta_t = self.force_times[-1] - self.force_times[0]
+        avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+
+        #if len(self.force_times) > 1:
             # Time-averaged forces using trapezoid rule
-            delta_t = self.force_times[-1] - self.force_times[0]
-            avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
-            avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+            #delta_t = self.force_times[-1] - self.force_times[0]
+            #avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
+            #avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
             #avg_sumabsact = trapezoid(y=self.action_history, x=self.force_times) / delta_t
             #avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
             #print("averaging over time ", self.force_times[-1] - self.force_times[0])
-        else:
+        #else:
             # Single point
-            avg_drag = self.drag_history[0]
-            avg_lift = self.lift_history[0]
+            #avg_drag = self.drag_history[0]
+            #avg_lift = self.lift_history[0]
+            #print(f"avg_lift: {avg_lift}")
             #avg_sumabsact = self.action_history[0]
             #avg_moment = self.moment_history[0]
+            #self.moment_at_last_step = self.moment_history[0]
+            #print("checkpoint: only one force value")
         
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
         #reward = - abs(avg_moment+0.1625)
-        reward = -(avg_drag-0.0284) - 0.2 * abs(avg_lift-0.1034) #- 0.05/3.0*(2.0*avg_sumabsact)
-        #reward = -avg_drag
+        #reward = -(avg_drag-0.0284) - 0.2 * abs(avg_lift-0.1034) #- 0.05/3.0*(2.0*avg_sumabsact)
+        #reward = -avg_drag - 0.2 * abs(avg_lift)
+        #reward = -(avg_drag-0.1608) - 0.2 * abs(avg_lift-0.5428) # free case
+        #reward = -abs(avg_moment) - abs(avg_lift-0.5428) # free case
+        #print(f"moment at last step: {self.moment_at_last_step}")
+        reward = -(self.moment_history[-1])**2 - 0.99*(self.moment_at_last_step)**2 - abs(avg_lift-0.5428) # free case
+        self.moment_at_last_step = self.moment_history[-1]
         return float(reward)
         
 
