@@ -358,7 +358,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         })
         pbar.update(hp.episodes_per_batch)
 
-        scheduler.step()
+        #scheduler.step()
 
     pbar.close()
     if episode_pbar:
