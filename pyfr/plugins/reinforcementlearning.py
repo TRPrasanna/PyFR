@@ -30,7 +30,9 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         
         # Calculate observation size based on probe points and variables
         nvars = len(self.elementscls.privarmap[self.ndims]) if self.fmt == 'primitive' else len(self.elementscls.convarmap[self.ndims])
-        self.observation_size = len(self.pts) * 2 #* 3 # * nvars for all variables
+        # new: samples + mean Cm + var Cm
+        self.observation_size = len(self.pts) * 2 + 2
+
         self.nvars = nvars
         
         # Rest of initialization
@@ -402,7 +404,20 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         # Convert to tensor of 32-bit floats, check
         #print(f"Samples: {samples}")
         obs = torch.tensor(samples, device=self.device).flatten().float()
-        return obs
+
+        # --- extra MDP features: mean and variance of Cm ---
+        if self.force_times:
+            t0, t1 = self.force_times[0], self.force_times[-1]
+            dt = t1 - t0
+            avg_m = trapezoid(self.moment_history, self.force_times) / dt
+            ms_m  = trapezoid([m*m for m in self.moment_history], self.force_times) / dt
+            var_m = ms_m - avg_m*avg_m
+        else:
+            avg_m = var_m = 0.0
+
+        extra = torch.tensor([avg_m, var_m], device=self.device, dtype=torch.float32)
+        return torch.cat((obs, extra), dim=0)
+
 
     def _get_reward(self, solver):
         """Compute reward using stored force history"""
