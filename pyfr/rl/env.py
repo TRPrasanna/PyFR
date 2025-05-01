@@ -190,6 +190,7 @@ class PyFREnvironment(EnvBase):
 
     def _reset(self, tensordict=None, **kwargs):
         #print("Reset called")
+        self.rl_plugin.reset()
         self.step_count = 0
         self.current_control = np.array(self.actions_init)
         self.previous_control = np.array(self.actions_init)

@@ -99,9 +99,6 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         self.action_history = []
         self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
 
-        # may need these for incremental version of reward; check if initialization is correct
-        self.moment_at_last_step = 0.0
-
     def _init_surface(self, intg, bc, surf):
         """Initialize matrices for a single surface"""
         mesh, elemap = intg.system.mesh, intg.system.ele_map
@@ -160,15 +157,21 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         if intg.nacptsteps % self.nsteps:
             return
 
-        #previous_control_target = intg.system.env.previous_control
-        #current_control_target = intg.system.env.current_control
+        previous_control_target = intg.system.env.previous_control
+        current_control_target = intg.system.env.current_control
         #current_control_value = (intg.system.env.current_control-intg.system.env.previous_control)/intg.system.env.action_interval*(intg.tcurr-intg.system.env.current_time) + intg.system.env.previous_control
+        # possibly can minmax time instead
+        current_control_value = (current_control_target-previous_control_target)/intg.system.env.action_interval*(intg.tcurr-intg.system.env.current_time) + previous_control_target
+        lower_bound = np.minimum(previous_control_target,current_control_target)
+        upper_bound = np.maximum(previous_control_target,current_control_target)
+        current_control_value = np.maximum(lower_bound, np.minimum(current_control_value, upper_bound));
         #Q = (Q1-Q0)/Ta * (t-t0) + Q0; but this ramping behaviour may change in future; check
         #print(f"Current control value: {current_control_value}", previous_control_target, current_control_target)
         # values will overshoot range [Q0,Q1] if dt is large; fix this before using
 
         # store sum of absolute values of actions
-        #self.sumabsact = np.sum(np.abs(current_control_value))
+        #self.sumabsact = np.sum(np.abs(current_control_value))+abs(np.sum(current_control_value)) # DRL jets + opposing ZNMF jet
+        self.sumabsact = np.sum(current_control_value**2)+np.sum(current_control_value)**2 # not really sub of absolute
         #print(f"Sum of absolute actions: {self.sumabsact}")
 
         # Get forces and store them
@@ -190,14 +193,14 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             if self._mcomp:
                 self.moment_history.append(moment)
             # store sum(|actions|)
-            #self.action_history.append(np.sum(np.abs(current_control_value)))
+            self.action_history.append(self.sumabsact)
             
             # Remove old data outside window
             while self.force_times[0] < t - self.avg_window:
                 self.force_times.pop(0)
                 self.drag_history.pop(0)
                 self.lift_history.pop(0)
-                #self.action_history.pop(0)
+                self.action_history.pop(0)
                 if self._mcomp:
                     self.moment_history.pop(0)
 
@@ -403,50 +406,38 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
 
     def _get_reward(self, solver):
         """Compute reward using stored force history"""
-        #if len(self.force_times) < 1: #unlikely to reach this state
-        #    print("checkpoint: no forces yet")
-        #    return 0.0
-            
-        delta_t = self.force_times[-1] - self.force_times[0]
-        avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
 
-        #if len(self.force_times) > 1:
-            # Time-averaged forces using trapezoid rule
-            #delta_t = self.force_times[-1] - self.force_times[0]
-            #avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
-            #avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
-            #avg_sumabsact = trapezoid(y=self.action_history, x=self.force_times) / delta_t
-            #avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
-            #print("averaging over time ", self.force_times[-1] - self.force_times[0])
-        #else:
-            # Single point
-            #avg_drag = self.drag_history[0]
-            #avg_lift = self.lift_history[0]
-            #print(f"avg_lift: {avg_lift}")
-            #avg_sumabsact = self.action_history[0]
-            #avg_moment = self.moment_history[0]
-            #self.moment_at_last_step = self.moment_history[0]
-            #print("checkpoint: only one force value")
-        
+        # Time-averaged forces using trapezoid rule
+        delta_t = self.force_times[-1] - self.force_times[0]
+        #avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
+        avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+        avg_sumabsact = trapezoid(y=self.action_history, x=self.force_times) / delta_t
+        avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
+        ms_moment = trapezoid(y=[m**2 for m in self.moment_history],
+                              x=self.force_times) / delta_t # mean-square moment
+        var_moment = ms_moment - avg_moment**2 #variance = E[Cm^2] - (E[Cm])^2
+
+        #print("averaging over time ", self.force_times[-1] - self.force_times[0])
+
         # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
         # -|<C_m>| : Airfoil
         #reward = - abs(avg_moment+0.1625)
         #reward = -(avg_drag-0.0284) - 0.2 * abs(avg_lift-0.1034) #- 0.05/3.0*(2.0*avg_sumabsact)
-        #reward = -avg_drag - 0.2 * abs(avg_lift)
         #reward = -(avg_drag-0.1608) - 0.2 * abs(avg_lift-0.5428) # free case
-        #reward = -abs(avg_moment) - abs(avg_lift-0.5428) # free case
-        #print(f"moment at last step: {self.moment_at_last_step}")
-        reward = 0.99*(self.moment_at_last_step)**2 - (self.moment_history[-1])**2 - (avg_lift-0.5428)**2 # free case
-        self.moment_at_last_step = self.moment_history[-1]
+        #reward = -avg_drag
+        reward = - 0.65*((avg_moment/5.883649e-02)**2) - 0.2* (((avg_lift-0.5428)/1.458435e-01)**2) - 0.1*var_moment/(5.883649e-02)**2 - 0.05 * avg_sumabsact/1.433533e+01 # 6.0*1.5457105**2
         return float(reward)
         
 
     def reset(self):
-        #self.control_signal = torch.tensor([0.0], device=self.device)
-        self.latest_observation.zero_()
-        #self.latest_reward = 0.0
-        #self.last_action_time = 0.0  # Reset time tracking
-
+        #self.latest_observation.zero_()
+        self.force_times.clear()
+        self.drag_history.clear()
+        self.lift_history.clear()
+        self.moment_history.clear()
+        self.action_history.clear()
+        self.sumabsact = 0.0
+        
     def stress_tensor(self, u, du):
         c = self._constants
 
