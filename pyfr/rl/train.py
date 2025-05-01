@@ -147,9 +147,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     # Optimizer
     optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optim, hp.total_frames // hp.frames_per_batch, 0.0
-    )
+    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #optim, hp.total_frames // hp.frames_per_batch, 0.0
+    #)
     
     # Get SLURM configuration
     ntasks = int(os.environ.get('SLURM_NTASKS', 1))
@@ -381,7 +381,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         })
         pbar.update(hp.episodes_per_batch)
 
-        scheduler.step()
+        #scheduler.step()
 
     pbar.close()
     if episode_pbar:
