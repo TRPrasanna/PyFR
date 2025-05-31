@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from collections import defaultdict
 from tensordict.nn import TensorDictModule, InteractionType
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
+from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, MLP
 from torchrl.envs import (
     StepCounter,
     TransformedEnv,
@@ -98,32 +98,30 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         #safe = True
     ).to(device)
 
-    # Value network (critic)
-    qvalue_net = nn.Sequential(
-        nn.Linear(input_shape[-1]+action_spec.shape[-1], hp.num_cells_value),
-        nn.ReLU(),
-        nn.Linear(hp.num_cells_value, hp.num_cells_value),
-        nn.ReLU(),
-        nn.Linear(hp.num_cells_value, 1)
-    ).to(device)
+    # Value network (critic) - Use TorchRL's MLP like reference implementation
+    qvalue_net = MLP(
+        num_cells=[hp.num_cells_value, hp.num_cells_value],
+        out_features=1,
+        activation_class=nn.ReLU,
+        device=device,
+    )
 
     qvalue_module = ValueOperator(
+        in_keys=["action", "observation"],
         module=qvalue_net,
-        in_keys=["action","observation"]
     ).to(device)
 
     model = nn.ModuleList([policy, qvalue_module])
     # init nets
     with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):
-        td = env.fake_tensordict() # check
-        td = td.to(device)
+        td = env.fake_tensordict().to(device) # check
         for net in model:
             net(td)
 
     # SAC components
     loss_module = SACLoss(
         actor_network=policy,
-        critic_network=qvalue_module,
+        qvalue_network=qvalue_module,
         num_qvalue_nets=2,
         loss_function="l2",
         delay_actor=False,
