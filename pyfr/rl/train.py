@@ -52,20 +52,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     hp = HyperParameters.from_config(env.cfg)
     # Calculate derived parameters using environment info
     hp._calculate_derived(env)
-
-    # Adjust num_minibatches if it does not divide frames_per_batch evenly
-    sub_batch_size = hp.frames_per_batch // hp.desired_num_minibatches
-    remainder = hp.frames_per_batch % hp.desired_num_minibatches
-    if remainder != 0:
-        adjusted_num_minibatches = get_closest_divisor(hp.frames_per_batch, hp.desired_num_minibatches)
-        sub_batch_size = hp.frames_per_batch // adjusted_num_minibatches
-        print(
-            f"Warning: frames_per_batch ({hp.frames_per_batch}) is not perfectly divisible by "
-            f"num_minibatches ({hp.desired_num_minibatches}). "
-            f"Adjusted num_minibatches to {adjusted_num_minibatches} with sub_batch_size {sub_batch_size}."
-        )
-        hp.desired_num_minibatches = adjusted_num_minibatches
-
     hp.print_summary()
 
      # Actor network with proper output handling
@@ -185,7 +171,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         init_random_frames=hp.init_random_frames,
         split_trajs=False,
         reset_at_each_iter=True, # without this the collector seems to continue collecting in evaluation mode
-        device=device
+        device=device,
+        #exploration_type=ExplorationType.RANDOM, default?
     )
 
     # Replay buffer
