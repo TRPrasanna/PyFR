@@ -109,7 +109,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     qvalue_module = ValueOperator(
         module=qvalue_net,
-        in_keys=["action"]+["observation"]
+        in_keys=["action","observation"]
     ).to(device)
 
     model = nn.ModuleList([policy, qvalue_module])
