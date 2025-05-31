@@ -100,7 +100,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     # Value network (critic)
     qvalue_net = nn.Sequential(
-        nn.Linear(input_shape[-1], hp.num_cells_value),
+        nn.Linear(input_shape[-1]+action_spec.shape[-1], hp.num_cells_value),
         nn.ReLU(),
         nn.Linear(hp.num_cells_value, hp.num_cells_value),
         nn.ReLU(),
