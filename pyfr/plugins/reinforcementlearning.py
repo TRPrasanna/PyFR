@@ -416,6 +416,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         ms_moment = trapezoid(y=[m**2 for m in self.moment_history],
                               x=self.force_times) / delta_t # mean-square moment
         var_moment = ms_moment - avg_moment**2 #variance = E[Cm^2] - (E[Cm])^2
+        var_moment = max(0.0, var_moment) # avoid small negative value
 
         #print("averaging over time ", self.force_times[-1] - self.force_times[0])
 
@@ -425,7 +426,10 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         #reward = -(avg_drag-0.0284) - 0.2 * abs(avg_lift-0.1034) #- 0.05/3.0*(2.0*avg_sumabsact)
         #reward = -(avg_drag-0.1608) - 0.2 * abs(avg_lift-0.5428) # free case
         #reward = -avg_drag
-        reward = - 0.65*((avg_moment/5.883649e-02)**2) - 0.2* (((avg_lift-0.5428)/1.458435e-01)**2) - 0.1*var_moment/(5.883649e-02)**2 - 0.05 * avg_sumabsact/1.433533e+01 # 6.0*1.5457105**2
+        #reward = - 0.65*((avg_moment/5.883649e-02)**2) - 0.2* (((avg_lift-0.5428)/1.458435e-01)**2) - 0.1*var_moment/(5.883649e-02)**2 - 0.05 * avg_sumabsact/1.433533e+01 # 6.0*1.5457105**2
+        #reward = -3.0 * abs(avg_moment) / 5.883649e-2 -0.1 * ((avg_lift - 0.5428) / 1.458435e-1)**2 -0.05 * var_moment / 5.883649e-2 # Cmv3
+        #reward = -abs(avg_moment) - 3.0*np.sqrt(var_moment)
+        reward = -abs(avg_moment)
         return float(reward)
         
 
