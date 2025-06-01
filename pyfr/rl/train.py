@@ -223,10 +223,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         policy.load_state_dict(checkpoint['policy_state_dict'])
         qvalue_module.load_state_dict(checkpoint['qvalue_state_dict'])
         
-        # Load both critic networks from SAC loss module
-        if 'critic_1_state_dict' in checkpoint and 'critic_2_state_dict' in checkpoint:
-            loss_module.qvalue_network[0].load_state_dict(checkpoint['critic_1_state_dict'])
-            loss_module.qvalue_network[1].load_state_dict(checkpoint['critic_2_state_dict'])
+        # Load both critic networks from SAC loss module (SAC creates internal copies)
+        # Note: The loss_module handles internal critic networks automatically
+        # so we don't need to manually load separate critic states
         
         # Load optimizer states if available
         if 'optimizer_state_dict' in checkpoint:
@@ -348,8 +347,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         logs["train_reward"].append(train_reward)
         #print(f"\n Batch finished. Episode count is {episode_count}")
 
-        # Evaluate every hp.eval_frequency batches
-        if batch_idx % hp.eval_frequency == 0:
+        # Evaluate every hp.eval_frequency batches (skip first batch)
+        if batch_idx > 0 and batch_idx % hp.eval_frequency == 0:
             eval_reward = evaluate_policy(env, policy)
             logs["eval_reward"].append(eval_reward)
 
@@ -365,8 +364,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 torch.save({
                     'policy_state_dict': policy.state_dict(),
                     'qvalue_state_dict': qvalue_module.state_dict(),
-                    'critic_1_state_dict': loss_module.qvalue_network[0].state_dict(),
-                    'critic_2_state_dict': loss_module.qvalue_network[1].state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'current_reward': eval_reward,
                     'best_reward': best_eval_reward,
@@ -378,8 +375,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             torch.save({
                 'policy_state_dict': policy.state_dict(),
                 'qvalue_state_dict': qvalue_module.state_dict(),
-                'critic_1_state_dict': loss_module.qvalue_network[0].state_dict(),
-                'critic_2_state_dict': loss_module.qvalue_network[1].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'current_reward': eval_reward,
                 'best_reward': best_eval_reward,
