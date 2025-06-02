@@ -51,6 +51,8 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         nn.ReLU(),
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
         nn.ReLU(),
+        nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
+        nn.ReLU(),
         nn.Linear(hp.num_cells_policy, 2 * action_spec.shape[-1]),
     ).to(device)
     
