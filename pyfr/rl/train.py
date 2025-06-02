@@ -59,7 +59,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     input_shape = env.observation_spec["observation"].shape
     actor_mlp = nn.Sequential(
         nn.Linear(input_shape[-1], hp.num_cells_policy),
-        nn.ReLU(), # tanh activation function is most commonly used for small networks for PPO
+        nn.ReLU(),
+        nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
+        nn.ReLU(),
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
         nn.ReLU(),
         nn.Linear(hp.num_cells_policy,2 * action_spec.shape[-1]),
@@ -98,9 +100,10 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         #safe = True
     ).to(device)
 
-    # Value network (critic) - Use TorchRL's MLP like reference implementation
+    # Value network (critic)
     qvalue_net = MLP(
-        num_cells=[hp.num_cells_value, hp.num_cells_value],
+        depth=3,
+        num_cells=hp.num_cells_value,
         out_features=1,
         activation_class=nn.ReLU,
         device=device,
@@ -522,6 +525,7 @@ class HyperParameters:
                 ("alpha_lr", "Learning rate for alpha (entropy)"),
                 ("target_update_polyak", "Polyak averaging for target networks"),
                 ("replay_buffer_size", "Size of experience replay buffer"),
+                ("init_random_frames", "Random frames before training starts"),
                 ("batch_size", "Batch size for training"),
                 ("utd_ratio", "Update-to-data ratio"),
             ],
