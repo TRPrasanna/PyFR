@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pyfr.readers.native import NativeReader
 from typing import Dict, Any
 import torch
-from torch import nn
+from torch import nn, optim
 from collections import defaultdict
 from tensordict.nn import TensorDictModule, InteractionType
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, MLP
@@ -12,11 +12,10 @@ from torchrl.envs import (
     TransformedEnv,
 )
 from torchrl.collectors import MultiSyncDataCollector
-from torchrl.envs import EnvCreator
 from torchrl.data import TensorDictReplayBuffer
-from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
-from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.objectives import SACLoss, SoftUpdate, group_optimizers
+from torchrl.data.replay_buffers.storages import LazyMemmapStorage
+from torchrl.objectives import CrossQLoss, group_optimizers
+from torchrl.modules.models.batchrenorm import BatchRenorm1d
 from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
@@ -56,91 +55,94 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
      # Actor network with proper output handling
     action_spec = env.action_spec_unbatched.to(device)
-    input_shape = env.observation_spec["observation"].shape
-    actor_mlp = nn.Sequential(
-        nn.Linear(input_shape[-1], hp.num_cells_policy),
-        nn.ReLU(),
-        nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        nn.ReLU(),
-        nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        nn.ReLU(),
-        nn.Linear(hp.num_cells_policy,2 * action_spec.shape[-1]),
-    ).to(device)
-    # Initialize policy weights
-    #for layer in actor_mlp.modules():
-    #    if isinstance(layer, torch.nn.Linear):
-    #        torch.nn.init.orthogonal_(layer.weight, 1.0)
-    #        layer.bias.data.zero_()
-    actor_net = nn.Sequential(
-        actor_mlp,
-        NormalParamExtractor(
-            scale_mapping="biased_softplus_1.0",
-            scale_lb=0.1,   # lower bound for scale
-        ).to(device)
+    actor_hidden_sizes = [hp.num_cells_policy, hp.num_cells_policy]
+    actor_net_kwargs = {
+        "num_cells": actor_hidden_sizes,
+        "out_features": 2 * action_spec.shape[-1],
+        "activation_class": "ReLU",
+        "norm_class": BatchRenorm1d,
+        "norm_kwargs": {
+            "momentum": 0.01,
+            "num_features": actor_hidden_sizes[-1],
+            "warmup_steps": hp.warmup_steps, # not sure, check
+        },
+    }
+    actor_mlp = MLP(**actor_net_kwargs).to(device)
+
+    dist_class = TanhNormal
+    dist_kwargs = {
+        "low": torch.as_tensor(action_spec.space.low, device=device),
+        "high": torch.as_tensor(action_spec.space.high, device=device),
+        "tanh_loc": False,
+    }
+
+    actor_extractor = NormalParamExtractor(
+        scale_mapping=f"biased_softplus_1.0",
+        scale_lb=0.1,
     )
+    actor_net = nn.Sequential(actor_mlp, actor_extractor)
 
     actor_module = TensorDictModule(
         actor_net,
         in_keys=["observation"],
-        out_keys=["loc", "scale"]
-    ).to(device)
-
+        out_keys=[
+            "loc",
+            "scale",
+        ],
+    )
     policy = ProbabilisticActor(
-        module=actor_module,
-        spec=env.action_spec,
+        spec=action_spec,
         in_keys=["loc", "scale"],
-        distribution_class=TanhNormal,
-        return_log_prob=False, #for SAC?
-        distribution_kwargs={
-        "low": env.action_spec.space.low,
-        "high": env.action_spec.space.high,
-        "tanh_loc": False,
-        },
+        module=actor_module,
+        distribution_class=dist_class,
+        distribution_kwargs=dist_kwargs,
         default_interaction_type=InteractionType.RANDOM,
-        #safe = True
-    ).to(device)
+        return_log_prob=False,
+    )
 
-    # Value network (critic)
+    # Define Critic Network
+    critic_hidden_sizes = [hp.num_cells_value, hp.num_cells_value]
+    qvalue_net_kwargs = {
+        "num_cells": critic_hidden_sizes,
+        "out_features": 1,
+        "activation_class": "ReLU",
+        "norm_class": BatchRenorm1d,
+        "norm_kwargs": {
+            "momentum": 0.01,
+            "num_features": critic_hidden_sizes[-1],
+            "warmup_steps": hp.warmup_steps,
+        },
+    }
+
     qvalue_net = MLP(
-        depth=3,
-        num_cells=hp.num_cells_value,
-        out_features=1,
-        activation_class=nn.ReLU,
-        device=device,
+        **qvalue_net_kwargs,
     )
 
     qvalue_module = ValueOperator(
-        in_keys=["action", "observation"],
+        in_keys=["action"] + ["observation"],
         module=qvalue_net,
-    ).to(device)
+    )
 
-    model = nn.ModuleList([policy, qvalue_module])
+    model = nn.ModuleList([policy, qvalue_module]).to(device)
     # init nets
     with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):
         td = env.fake_tensordict().to(device) # check
+        td = td.to(device)
         for net in model:
+            net.eval()
             net(td)
+            net.train()
+    del td
 
-    # SAC components
-    loss_module = SACLoss(
-        actor_network=policy,
-        qvalue_network=qvalue_module,
+    # CrossQ components
+    loss_module = CrossQLoss(
+        actor_network=model[0],
+        qvalue_network=model[1],
         num_qvalue_nets=2,
         loss_function="l2",
-        delay_actor=False,
-        delay_qvalue=True,
         alpha_init=hp.alpha_init,
     )
-    loss_module.make_value_estimator(gamma=hp.gamma)
-
-    # Define Target Network Updater
-    target_net_updater = SoftUpdate(loss_module, eps=hp.target_update_polyak)
-
-    # Optimizer
-    #optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
-    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    #optim, hp.total_frames // hp.frames_per_batch, 0.0
-    #)
+    loss_module.make_value_estimator(gamma=hp.gamma, device=device)
 
     # Get number of available devices
     num_devices = get_device_count(backend_name)
@@ -173,42 +175,39 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         split_trajs=False,
         reset_at_each_iter=True, # without this the collector seems to continue collecting in evaluation mode
         device=device,
-        #exploration_type=ExplorationType.RANDOM, default?
     )
 
     # Replay buffer
-    storage_cls = (
-        functools.partial(LazyTensorStorage, device=device)
-        #if not scratch_dir
-        #else functools.partial(LazyMemmapStorage, device="cpu", scratch_dir=scratch_dir)
-    )
     replay_buffer = TensorDictReplayBuffer(
         pin_memory=False,
         prefetch=3,
-        storage=storage_cls(
+        storage=LazyMemmapStorage(
             hp.replay_buffer_size,
+            scratch_dir=None,
         ),
         batch_size=hp.batch_size,
-        shared=False,
     )
+    replay_buffer.append_transform(lambda x: x.to(device, non_blocking=True))
 
     # optimizers
     critic_params = list(loss_module.qvalue_network_params.flatten_keys().values())
     actor_params = list(loss_module.actor_network_params.flatten_keys().values())
 
-    optimizer_actor = torch.optim.Adam(
+    optimizer_actor = optim.Adam(
         actor_params,
         lr=hp.lr,
         weight_decay=0.0,
-        eps=1e-8, # Adam epsilon, hp?
+        eps=1e-8,
+        betas=(0.5, 0.999),
     )
-    optimizer_critic = torch.optim.Adam(
+    optimizer_critic = optim.Adam(
         critic_params,
         lr=hp.lr,
         weight_decay=0.0,
         eps=1e-8,
+        betas=(0.5, 0.999),
     )
-    optimizer_alpha = torch.optim.Adam(
+    optimizer_alpha = optim.Adam(
         [loss_module.log_alpha],
         lr=hp.alpha_lr,
     )
@@ -296,13 +295,12 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     writer.add_hparams(hparam_dict, metric_dict, run_name=run_name)
     num_updates = int(hp.frames_per_batch * hp.utd_ratio)
 
-    collector_iter = iter(collector)
-    total_iter = len(collector)
     collected_frames = 0
+    update_counter = 0
+    delayed_updates = hp.policy_update_delay
 
     for batch_idx, tensordict in enumerate(collector):
         #print(f"\nBatch {i} starting...")
-        #tensordict = next(collector_iter)
         # Update weights of the inference policy
         collector.update_policy_weights_()
 
@@ -321,30 +319,59 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
         collected_frames += current_frames
         if collected_frames >= hp.init_random_frames:
+            tds = []
             # Optimization steps
-            #losses = TensorDict(batch_size=[num_updates])
             for i in range(num_updates):
-                sampled_tensordict = replay_buffer.sample()
+                # Update actor every delayed_updates
+                update_counter += 1
+                update_actor = update_counter % delayed_updates == 0
+                sampled_tensordict = replay_buffer.sample().to(device)
+                global_update_idx = (batch_idx * num_updates + i) # for logging
                 # Compute loss
-                loss_td = loss_module(sampled_tensordict)
+                if update_actor:
+                    optimizer.zero_grad(set_to_none=True)
+                    td_loss = {}
+                    q_loss, value_meta = loss_module.qvalue_loss(sampled_tensordict)
+                    sampled_tensordict.set(loss_module.tensor_keys.priority, value_meta["td_error"])
+                    q_loss = q_loss.mean()
 
-                actor_loss = loss_td["loss_actor"]
-                q_loss = loss_td["loss_qvalue"]
-                alpha_loss = loss_td["loss_alpha"]
+                    actor_loss, metadata_actor = loss_module.actor_loss(sampled_tensordict)
+                    actor_loss = actor_loss.mean()
+                    alpha_loss = loss_module.alpha_loss(
+                        log_prob=metadata_actor["log_prob"].detach()
+                    ).mean()
 
-                (actor_loss + q_loss + alpha_loss).sum().backward()
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    # Updates
+                    (q_loss + actor_loss + alpha_loss).backward()
+                    optimizer.step()
 
-                # Update qnet_target params
-                target_net_updater.step()
-                #return loss_td.detach()
+                    # Update critic
+                    td_loss["loss_qvalue"] = q_loss
+                    td_loss["loss_actor"] = actor_loss
+                    td_loss["loss_alpha"] = alpha_loss
+
+                    # Log with global update index
+                    writer.add_scalar("loss/policy_objective", actor_loss, global_update_idx)
+                    writer.add_scalar("loss/alpha_loss", alpha_loss, global_update_idx)
+                else:
+                    optimizer.zero_grad(set_to_none=True)
+                    td_loss = {}
+                    q_loss, value_meta = loss_module.qvalue_loss(sampled_tensordict)
+                    sampled_tensordict.set(loss_module.tensor_keys.priority, value_meta["td_error"])
+                    q_loss = q_loss.mean()
+
+                    # Update critic
+                    q_loss.backward()
+                    optimizer.step()
+                    td_loss["loss_qvalue"] = q_loss
+                    td_loss["loss_actor"] = float("nan")
+                    td_loss["loss_alpha"] = float("nan")
+
+                tds.append(td_loss.clone())
             
-                global_update_idx = (batch_idx * num_updates + i)
-                # Log with global update index
-                writer.add_scalar("loss/policy_objective", actor_loss, global_update_idx)
                 writer.add_scalar("loss/qvalue_loss", q_loss, global_update_idx)
-                writer.add_scalar("loss/alpha_loss", alpha_loss, global_update_idx)
+
+            tds = TensorDict.stack(tds).nanmean()
 
         # Logging
         logs["train_reward"].append(train_reward)
@@ -422,28 +449,6 @@ def evaluate_policy(env, policy, num_steps=1000000):
         env.set_evaluation_mode(False)  # Reset to training mode
         #print("Evaluation complete.Returning to training mode.")
 
-def get_closest_divisor(n, target):
-    """
-    Finds the closest divisor of n to the target value.
-    
-    Args:
-        n (int): The number to find divisors for.
-        target (int): The target divisor to approach.
-        
-    Returns:
-        int: The closest divisor to the target.
-    """
-    # Find all divisors of n
-    divisors = set()
-    for i in range(1, int(math.sqrt(n)) + 1):
-        if n % i == 0:
-            divisors.add(i)
-            divisors.add(n // i)
-    
-    # Find the divisor with the minimum absolute difference to the target
-    closest = min(divisors, key=lambda x: (abs(x - target), -x))  # Prefer larger divisor if tie
-    return closest
-
 @dataclass
 class HyperParameters:
     # Network architecture
@@ -459,7 +464,8 @@ class HyperParameters:
     lr: float = 3e-4
     alpha_init: float = 1.0
     alpha_lr: float = 3e-4
-    target_update_polyak: float = 0.995
+    warmup_steps: int = 100000 # Warmup steps for BatchRenorm
+    policy_update_delay: int = 3  # Delay for policy updates
     replay_buffer_size: int = 1000000
     init_random_frames: int = 28800 # e.g. frames_per_batch * 24
     batch_size: int = 300 #256
@@ -518,12 +524,13 @@ class HyperParameters:
                 ("episodes", "Total training episodes"),
                 ("episodes_per_batch", "Episodes per update batch"),
             ],
-            "SAC Parameters": [
+            "CrossQ Parameters": [
                 ("gamma", "Discount factor"),
                 ("lr", "Learning rate for actor/critic"),
                 ("alpha_init", "Initial entropy regularization coefficient"),
                 ("alpha_lr", "Learning rate for alpha (entropy)"),
-                ("target_update_polyak", "Polyak averaging for target networks"),
+                ("warmup_steps", "Warmup steps for BatchRenorm"),
+                ("policy_update_delay", "Delay for policy updates"),
                 ("replay_buffer_size", "Size of experience replay buffer"),
                 ("init_random_frames", "Random frames before training starts"),
                 ("batch_size", "Batch size for training"),
