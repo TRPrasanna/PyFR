@@ -25,6 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 import time
 import functools
 from tensordict import TensorDict
+from torchrl.envs.transforms import UnsqueezeTransform, Compose
 
 torch.set_float32_matmul_precision("high")
 
@@ -42,7 +43,13 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     # Initialize environment
     env = PyFREnvironment(mesh_file, cfg_path, backend_name, 0, ic_dir=ic_dir, print_diagnostic=True)
-    env = TransformedEnv(env,StepCounter())
+    env = TransformedEnv(
+            env,
+            Compose(
+                UnsqueezeTransform(in_keys=["observation"], dim=0, allow_positive_dim=True), # check, we need this for BatchNorm
+                StepCounter(),
+            )
+        )
     # todo, check: fix PyFR single precision and Pytorch double precision mismatch
 
     if 'neuralnetwork-hyperparameters' not in env.cfg.sections():
@@ -59,7 +66,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     actor_net_kwargs = {
         "num_cells": actor_hidden_sizes,
         "out_features": 2 * action_spec.shape[-1],
-        "activation_class": "ReLU",
+        "activation_class": nn.ReLU,
         "norm_class": BatchRenorm1d,
         "norm_kwargs": {
             "momentum": 0.01,
@@ -77,7 +84,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     }
 
     actor_extractor = NormalParamExtractor(
-        scale_mapping=f"biased_softplus_1.0",
+        scale_mapping="biased_softplus_1.0",
         scale_lb=0.1,
     )
     actor_net = nn.Sequential(actor_mlp, actor_extractor)
@@ -105,7 +112,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     qvalue_net_kwargs = {
         "num_cells": critic_hidden_sizes,
         "out_features": 1,
-        "activation_class": "ReLU",
+        "activation_class": nn.ReLU,
         "norm_class": BatchRenorm1d,
         "norm_kwargs": {
             "momentum": 0.01,
@@ -126,7 +133,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     model = nn.ModuleList([policy, qvalue_module]).to(device)
     # init nets
     with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):
-        td = env.fake_tensordict().to(device) # check
+        td = env.fake_tensordict() # check
         td = td.to(device)
         for net in model:
             net.eval()
@@ -150,7 +157,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     def make_env(backend, device_id):
         """Create environment with specified backend and device ID"""
-        env = PyFREnvironment(
+        base = PyFREnvironment(
             mesh_file=mesh_file,
             cfg_file=cfg_file,
             backend_name=backend,
@@ -158,7 +165,13 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             ic_dir=ic_dir,
             print_diagnostic=False
         )
-        env = TransformedEnv(env, StepCounter())
+        env = TransformedEnv(
+            base,
+            Compose(
+                UnsqueezeTransform(in_keys=["observation"], dim=0, allow_positive_dim=True), # check, we need this for BatchNorm
+                StepCounter(),
+            )
+        )
         return env
 
     # Create list of environment creators with device IDs
