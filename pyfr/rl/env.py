@@ -109,11 +109,11 @@ class PyFREnvironment(EnvBase):
         self.observation_spec = Composite(
             {
                 "observation": Unbounded(
-                    shape=(obs_size,),
+                    shape=(),
                     device=self.device
                 )
             },
-            shape=torch.Size([])
+            shape=(),
         )
 
         self.state_spec = self.observation_spec.clone() # not sure if this is correct
