@@ -46,7 +46,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     env = TransformedEnv(
             env,
             Compose(
-                UnsqueezeTransform(in_keys=["observation"], dim=0, allow_positive_dim=True), # check, we need this for BatchNorm
+                #UnsqueezeTransform(in_keys=["observation"], dim=0, allow_positive_dim=True), # check, we need this for BatchNorm
                 StepCounter(),
             )
         )
@@ -168,7 +168,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         env = TransformedEnv(
             base,
             Compose(
-                UnsqueezeTransform(in_keys=["observation"], dim=0, allow_positive_dim=True), # check, we need this for BatchNorm
+                #UnsqueezeTransform(in_keys=["observation"], dim=0, allow_positive_dim=True), # check, we need this for BatchNorm
                 StepCounter(),
             )
         )
