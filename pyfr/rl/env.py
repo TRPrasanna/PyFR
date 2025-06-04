@@ -22,7 +22,7 @@ class PyFREnvironment(EnvBase):
         init_mpi()
         device = torch.device('cpu')
         #device = torch.device('cuda')
-        super().__init__(device=device)
+        super().__init__(device=device, batch_size=[])
     
         # Load mesh and config once
         self.mesh = NativeReader(mesh_file)
