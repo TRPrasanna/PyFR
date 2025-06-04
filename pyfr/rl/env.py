@@ -109,7 +109,7 @@ class PyFREnvironment(EnvBase):
         self.observation_spec = Composite(
             {
                 "observation": Unbounded(
-                    shape=(),
+                    shape=(obs_size,),
                     device=self.device
                 )
             },
