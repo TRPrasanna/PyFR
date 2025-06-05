@@ -1,7 +1,11 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
+import os
+import time
+import functools
+import math
+from tensordict.nn import TensorDictModule, InteractionType
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.envs import (
@@ -39,26 +43,25 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     # Load policy
     checkpoint = torch.load(load_model, map_location=device, weights_only=True)
     
-    action_dim = env.action_spec_unbatched.shape[-1]
+    # Actor network with proper output handling - MUST match train.py exactly
+    action_spec = env.action_spec_unbatched.to(device)
     input_shape = env.observation_spec["observation"].shape
     actor_mlp = nn.Sequential(
         nn.Linear(input_shape[-1], hp.num_cells_policy),
-        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
+        nn.ReLU(),
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        nn.Tanh(),
-        nn.Linear(hp.num_cells_policy, action_dim),  # only means are output
+        nn.ReLU(),
+        nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
+        nn.ReLU(),
+        nn.Linear(hp.num_cells_policy, 2 * action_spec.shape[-1]),
     ).to(device)
-    # Initialize policy weights
-    for layer in actor_mlp.modules():
-        if isinstance(layer, torch.nn.Linear):
-            torch.nn.init.orthogonal_(layer.weight, 1.0)
-            layer.bias.data.zero_()
-    # Add learnable scales (standard deviations)
+    
+    # Use the same parameter extractor as train.py
     actor_net = nn.Sequential(
         actor_mlp,
-        AddStateIndependentNormalScale(
-            action_dim,  # Number of actions
-            scale_lb=1e-8,
+        NormalParamExtractor(
+            scale_mapping="biased_softplus_1.0",
+            scale_lb=0.1,
         ).to(device)
     )
 
@@ -73,11 +76,11 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        return_log_prob=True,
+        return_log_prob=False,  # Match train.py setting
         distribution_kwargs={
-        "low": env.action_spec.space.low,
-        "high": env.action_spec.space.high,
-        "tanh_loc": False,
+            "low": env.action_spec.space.low,
+            "high": env.action_spec.space.high,
+            "tanh_loc": False,
         },
         #safe = True
     ).to(device)
