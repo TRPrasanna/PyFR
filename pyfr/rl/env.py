@@ -22,7 +22,7 @@ class PyFREnvironment(EnvBase):
         init_mpi()
         device = torch.device('cpu')
         #device = torch.device('cuda')
-        super().__init__(device=device, batch_size=[])
+        super().__init__(device=device)
     
         # Load mesh and config once
         self.mesh = NativeReader(mesh_file)
@@ -113,7 +113,7 @@ class PyFREnvironment(EnvBase):
                     device=self.device
                 )
             },
-            shape=(),
+            shape=torch.Size([])
         )
 
         self.state_spec = self.observation_spec.clone() # not sure if this is correct
@@ -188,7 +188,7 @@ class PyFREnvironment(EnvBase):
 
     # Mandatory methods: _step, _reset and _set_seed
 
-    def _reset(self, tensordict, **kwargs):
+    def _reset(self, tensordict=None, **kwargs):
         #print("Reset called")
         self.rl_plugin.reset()
         self.step_count = 0
@@ -213,12 +213,13 @@ class PyFREnvironment(EnvBase):
         observation = self._get_observation()
         self.last_observation = observation  # Store first valid observation
         
+        shape = torch.Size([])
         return TensorDict({
             "observation": observation,
             "done": torch.tensor(False, device=self.device, dtype=torch.bool),
             "terminated": torch.tensor(False, device=self.device, dtype=torch.bool),
             "truncated": torch.tensor(False, device=self.device, dtype=torch.bool),
-        }, batch_size=tensordict.shape)
+        }, batch_size=shape)
 
     def _step(self, tensordict):
         # Update global control signals
