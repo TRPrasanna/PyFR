@@ -5,18 +5,23 @@ from typing import Dict, Any
 import torch
 from torch import nn
 from collections import defaultdict
-from tensordict.nn import TensorDictModule, InteractionType, AddStateIndependentNormalScale
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, MLP
+from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
+from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
 from torchrl.envs import (
+    Compose,
+    DoubleToFloat,
+    ObservationNorm,
     StepCounter,
     TransformedEnv,
 )
-from torchrl.collectors import MultiSyncDataCollector
+from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
+from torchrl.collectors.distributed import DistributedDataCollector
 from torchrl.envs import EnvCreator
-from torchrl.data import TensorDictReplayBuffer
+from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.objectives import SACLoss, SoftUpdate, group_optimizers
+from torchrl.objectives import ClipPPOLoss
+from torchrl.objectives.value import GAE
 from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
@@ -24,10 +29,6 @@ import os
 import math
 from torch.utils.tensorboard import SummaryWriter
 import time
-import functools
-from tensordict import TensorDict
-
-torch.set_float32_matmul_precision("high")
 
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
     # Device setup
@@ -52,29 +53,43 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     hp = HyperParameters.from_config(env.cfg)
     # Calculate derived parameters using environment info
     hp._calculate_derived(env)
+
+    # Adjust num_minibatches if it does not divide frames_per_batch evenly
+    sub_batch_size = hp.frames_per_batch // hp.desired_num_minibatches
+    remainder = hp.frames_per_batch % hp.desired_num_minibatches
+    if remainder != 0:
+        adjusted_num_minibatches = get_closest_divisor(hp.frames_per_batch, hp.desired_num_minibatches)
+        sub_batch_size = hp.frames_per_batch // adjusted_num_minibatches
+        print(
+            f"Warning: frames_per_batch ({hp.frames_per_batch}) is not perfectly divisible by "
+            f"num_minibatches ({hp.desired_num_minibatches}). "
+            f"Adjusted num_minibatches to {adjusted_num_minibatches} with sub_batch_size {sub_batch_size}."
+        )
+        hp.desired_num_minibatches = adjusted_num_minibatches
+
     hp.print_summary()
 
      # Actor network with proper output handling
-    action_dim = env.action_spec_unbatched.shape[-1]
+    action_spec = env.action_spec_unbatched.to(device)
     input_shape = env.observation_spec["observation"].shape
     actor_mlp = nn.Sequential(
         nn.Linear(input_shape[-1], hp.num_cells_policy),
-        nn.Tanh(),
+        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
         nn.Tanh(),
-        nn.Linear(hp.num_cells_policy, action_dim),  # only means are output
+        nn.Linear(hp.num_cells_policy,2 * action_spec.shape[-1]),
     ).to(device)
     # Initialize policy weights
-    for layer in actor_mlp.modules():
-        if isinstance(layer, torch.nn.Linear):
-            torch.nn.init.orthogonal_(layer.weight, 1.0)
-            layer.bias.data.zero_()
+    #for layer in actor_mlp.modules():
+    #    if isinstance(layer, torch.nn.Linear):
+    #        torch.nn.init.orthogonal_(layer.weight, 1.0)
+    #        layer.bias.data.zero_()
     # Add learnable scales (standard deviations)
     actor_net = nn.Sequential(
         actor_mlp,
-        AddStateIndependentNormalScale(
-            action_dim,  # Number of actions
-            scale_lb=1e-8,
+        NormalParamExtractor(
+            scale_mapping="biased_softplus_1.0",
+            scale_lb=0.1,   # lower bound for scale
         ).to(device)
     )
 
@@ -89,54 +104,49 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        return_log_prob=False, #for SAC?
+        return_log_prob=True,
         distribution_kwargs={
         "low": env.action_spec.space.low,
         "high": env.action_spec.space.high,
         "tanh_loc": False,
         },
-        default_interaction_type=InteractionType.RANDOM,
         #safe = True
     ).to(device)
 
     # Value network (critic)
-    qvalue_net = MLP(
-        depth=3,
-        num_cells=hp.num_cells_value,
-        out_features=1,
-        activation_class=nn.ReLU,
-        device=device,
-    )
-
-    qvalue_module = ValueOperator(
-        in_keys=["action", "observation"],
-        module=qvalue_net,
+    value_net = nn.Sequential(
+        nn.Linear(input_shape[-1], hp.num_cells_value),
+        nn.Tanh(),
+        nn.Linear(hp.num_cells_value, hp.num_cells_value),
+        nn.Tanh(),
+        nn.Linear(hp.num_cells_value, 1)
     ).to(device)
 
-    model = nn.ModuleList([policy, qvalue_module])
-    # init nets
-    with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):
-        td = env.fake_tensordict().to(device) # check
-        for net in model:
-            net(td)
+    value_module = ValueOperator(
+        module=value_net,
+        in_keys=["observation"]
+    ).to(device)
 
-    # SAC components
-    loss_module = SACLoss(
-        actor_network=policy,
-        qvalue_network=qvalue_module,
-        num_qvalue_nets=2,
-        loss_function="l2",
-        delay_actor=False,
-        delay_qvalue=True,
-        alpha_init=hp.alpha_init,
+    # PPO components
+    advantage_module = GAE(
+        gamma=hp.gamma, 
+        lmbda=hp.lmbda,
+        value_network=value_module,
+        average_gae=True
     )
-    loss_module.make_value_estimator(gamma=hp.gamma)
 
-    # Define Target Network Updater
-    target_net_updater = SoftUpdate(loss_module, eps=hp.target_update_polyak)
+    loss_module = ClipPPOLoss(
+        actor_network=policy,
+        critic_network=value_module,
+        clip_epsilon=hp.clip_epsilon,
+        entropy_bonus=bool(hp.entropy_eps),
+        entropy_coef=hp.entropy_eps,
+        critic_coef=1.0,
+        loss_critic_type="smooth_l1",
+    )
 
     # Optimizer
-    #optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
+    optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
     #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     #optim, hp.total_frames // hp.frames_per_batch, 0.0
     #)
@@ -168,51 +178,17 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         policy=policy,
         frames_per_batch=hp.frames_per_batch,
         total_frames=hp.total_frames,
-        init_random_frames=hp.init_random_frames,
         split_trajs=False,
         reset_at_each_iter=True, # without this the collector seems to continue collecting in evaluation mode
-        device=device,
-        #exploration_type=ExplorationType.RANDOM, default?
+        device=device
     )
 
-    # Replay buffer
-    storage_cls = (
-        functools.partial(LazyTensorStorage, device=device)
-        #if not scratch_dir
-        #else functools.partial(LazyMemmapStorage, device="cpu", scratch_dir=scratch_dir)
+    # Replay buffer here is not actually used for experience replay
+    # It is rather used for convenience to sample mini-batches from the collected data
+    replay_buffer = ReplayBuffer(
+        storage=LazyTensorStorage(max_size=hp.frames_per_batch),
+        sampler=SamplerWithoutReplacement(),
     )
-    replay_buffer = TensorDictReplayBuffer(
-        pin_memory=False,
-        prefetch=3,
-        storage=storage_cls(
-            hp.replay_buffer_size,
-        ),
-        batch_size=hp.batch_size,
-        shared=False,
-    )
-
-    # optimizers
-    critic_params = list(loss_module.qvalue_network_params.flatten_keys().values())
-    actor_params = list(loss_module.actor_network_params.flatten_keys().values())
-
-    optimizer_actor = torch.optim.Adam(
-        actor_params,
-        lr=hp.lr,
-        weight_decay=0.0,
-        eps=1e-8, # Adam epsilon, hp?
-    )
-    optimizer_critic = torch.optim.Adam(
-        critic_params,
-        lr=hp.lr,
-        weight_decay=0.0,
-        eps=1e-8,
-    )
-    optimizer_alpha = torch.optim.Adam(
-        [loss_module.log_alpha],
-        lr=hp.alpha_lr,
-    )
-    optimizer = group_optimizers(optimizer_actor, optimizer_critic, optimizer_alpha)
-    del optimizer_actor, optimizer_critic, optimizer_alpha
 
     best_eval_reward = float('-inf')
     best_eval_episode = 0
@@ -223,15 +199,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     if load_model and os.path.exists(load_model):
         checkpoint = torch.load(load_model, map_location=device, weights_only=True)
         policy.load_state_dict(checkpoint['policy_state_dict'])
-        qvalue_module.load_state_dict(checkpoint['qvalue_state_dict'])
-        
-        # Load both critic networks from SAC loss module (SAC creates internal copies)
-        # Note: The loss_module handles internal critic networks automatically
-        # so we don't need to manually load separate critic states
-        
-        # Load optimizer states if available
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        value_module.load_state_dict(checkpoint['value_state_dict'])
         
         # Handle both old and new checkpoint formats
         current_eval_reward = checkpoint.get('current_reward', checkpoint.get('reward', None))
@@ -293,70 +261,68 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     run_name = os.path.join(os.path.dirname(os.path.realpath(log_path)),f"{wallclock_datetime}")
     print(f"Writing hyperparameters to tensorboard: {run_name}")
     writer.add_hparams(hparam_dict, metric_dict, run_name=run_name)
-    num_updates = int(hp.frames_per_batch * hp.utd_ratio)
+    #print(os.path.dirname(os.path.realpath(__file__)) + os.sep + log_path)
+    updates_per_batch = hp.num_epochs * (hp.frames_per_batch // sub_batch_size)
 
-    collector_iter = iter(collector)
-    total_iter = len(collector)
-    collected_frames = 0
-
-    for batch_idx, tensordict in enumerate(collector):
+    for batch_idx, tensordict_data in enumerate(collector):
         #print(f"\nBatch {i} starting...")
-        #tensordict = next(collector_iter)
-        # Update weights of the inference policy
-        collector.update_policy_weights_()
-
-        current_frames = tensordict.numel()
-
-        # Add to replay buffer
-        tensordict = tensordict.reshape(-1)
-        replay_buffer.extend(tensordict)    
+        #print_tensordict_diagnostics(tensordict_data, verbose=True)
 
         episode_count += hp.episodes_per_batch
         # Training performance metrics
-        train_reward = tensordict["next", "reward"].mean().item()
+        train_reward = tensordict_data["next", "reward"].mean().item()
         writer.add_scalar("batch/train_reward", train_reward, batch_idx)
         writer.add_scalar("batch/episodes", episode_count, batch_idx)
-        writer.add_scalar("batch/learning_rate", hp.lr, batch_idx) #change when using lr scheduler
+        writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
+        #advantage_module(tensordict_data) # classical approach?
 
-        collected_frames += current_frames
-        if collected_frames >= hp.init_random_frames:
-            # Optimization steps
-            #losses = TensorDict(batch_size=[num_updates])
-            for i in range(num_updates):
-                sampled_tensordict = replay_buffer.sample()
-                # Compute loss
-                loss_td = loss_module(sampled_tensordict)
-
-                actor_loss = loss_td["loss_actor"]
-                q_loss = loss_td["loss_qvalue"]
-                alpha_loss = loss_td["loss_alpha"]
-
-                (actor_loss + q_loss + alpha_loss).sum().backward()
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-                # Update qnet_target params
-                target_net_updater.step()
-                #return loss_td.detach()
+        # Training updates
+        for epoch_idx in range(hp.num_epochs):
+            advantage_module(tensordict_data)
+            data_view = tensordict_data.reshape(-1)
+            replay_buffer.extend(data_view.cpu())
             
-                global_update_idx = (batch_idx * num_updates + i)
+            for sub_update_idx in range(hp.frames_per_batch // sub_batch_size):
+                subdata = replay_buffer.sample(sub_batch_size)
+                loss_vals = loss_module(subdata.to(device))
+                loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
+                if hp.entropy_eps > 0:
+                    loss_value = loss_value + loss_vals["loss_entropy"]
+
+                policy_obj = loss_vals["loss_objective"].item()
+                val_loss = loss_vals["loss_critic"].item()
+                ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
+
+                loss_value.backward()
+                grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
+
+                global_update_idx = (batch_idx * updates_per_batch + 
+                                   epoch_idx * (hp.frames_per_batch // sub_batch_size) + 
+                                   sub_update_idx)
+                
                 # Log with global update index
-                writer.add_scalar("loss/policy_objective", actor_loss, global_update_idx)
-                writer.add_scalar("loss/qvalue_loss", q_loss, global_update_idx)
-                writer.add_scalar("loss/alpha_loss", alpha_loss, global_update_idx)
+                writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
+                writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
+                writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
+                writer.add_scalar("grad/norm", grad_norm, global_update_idx)
+
+                optim.step()
+                optim.zero_grad()
+
+        collector.update_policy_weights_() # perhaps not needed
 
         # Logging
         logs["train_reward"].append(train_reward)
         #print(f"\n Batch finished. Episode count is {episode_count}")
 
-        # Evaluate every hp.eval_frequency batches (skip first batch)
-        if batch_idx > 0 and batch_idx % hp.eval_frequency == 0:
+        # Evaluate every hp.eval_frequency batches
+        if batch_idx % hp.eval_frequency == 0:
             eval_reward = evaluate_policy(env, policy)
             logs["eval_reward"].append(eval_reward)
 
             writer.add_scalar("eval/mean_reward", eval_reward, batch_idx)
             # Possibly log LR
-            writer.add_scalar("train/learning_rate", hp.lr, batch_idx)
+            writer.add_scalar("train/learning_rate", optim.param_groups[0]['lr'], batch_idx)
 
             # Save best model if new best achieved
             if eval_reward > best_eval_reward:
@@ -365,8 +331,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 print(f"\nNew best eval reward: {best_eval_reward:.5f} at episode {episode_count}")
                 torch.save({
                     'policy_state_dict': policy.state_dict(),
-                    'qvalue_state_dict': qvalue_module.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
+                    'value_state_dict': value_module.state_dict(),
                     'current_reward': eval_reward,
                     'best_reward': best_eval_reward,
                     'episode': episode_count,
@@ -376,8 +341,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             # Save latest model
             torch.save({
                 'policy_state_dict': policy.state_dict(),
-                'qvalue_state_dict': qvalue_module.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
+                'value_state_dict': value_module.state_dict(),
                 'current_reward': eval_reward,
                 'best_reward': best_eval_reward,
                 'episode': episode_count,
@@ -390,7 +354,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         pbar.set_postfix({
             "train_reward": f"{train_reward:.5f}",
             "eval": eval_str,
-            "lr": f"{hp.lr:.2e}",
+            "lr": f"{optim.param_groups[0]['lr']:.2e}",
         })
         pbar.update(hp.episodes_per_batch)
 
@@ -450,22 +414,21 @@ class HyperParameters:
     num_cells_value: int = 512
     
     # Training schedule
-    episodes: int = 6000
-    episodes_per_batch: int = 4
+    episodes: int = 1200
+    episodes_per_batch: int = 20
+    desired_num_minibatches: int = 16
+    num_epochs: int = 10
     
-    # SAC parameters
+    # PPO parameters
+    clip_epsilon: float = 0.2
     gamma: float = 0.99
+    lmbda: float = 0.97
+    entropy_eps: float = 1e-3
     lr: float = 3e-4
-    alpha_init: float = 1.0
-    alpha_lr: float = 3e-4
-    target_update_polyak: float = 0.995
-    replay_buffer_size: int = 1000000
-    init_random_frames: int = 28800 # e.g. frames_per_batch * 24
-    batch_size: int = 300 #256
-    utd_ratio: float = 1.0  # Update-to-data ratio
+    max_grad_norm: float = 1.0
 
     # Evaluation settings
-    eval_frequency: int = 5  # Evaluate every N policy updates
+    eval_frequency: int = 1  # Evaluate every N policy updates
 
     def __post_init__(self):
         """Initialize parameter sources and calculate derived values"""
@@ -516,17 +479,16 @@ class HyperParameters:
             "Training Schedule": [
                 ("episodes", "Total training episodes"),
                 ("episodes_per_batch", "Episodes per update batch"),
+                ("desired_num_minibatches", "Target minibatches per update"),
+                ("num_epochs", "Training epochs per batch")
             ],
-            "SAC Parameters": [
+            "PPO Parameters": [
+                ("clip_epsilon", "PPO clipping parameter"),
                 ("gamma", "Discount factor"),
-                ("lr", "Learning rate for actor/critic"),
-                ("alpha_init", "Initial entropy regularization coefficient"),
-                ("alpha_lr", "Learning rate for alpha (entropy)"),
-                ("target_update_polyak", "Polyak averaging for target networks"),
-                ("replay_buffer_size", "Size of experience replay buffer"),
-                ("init_random_frames", "Random frames before training starts"),
-                ("batch_size", "Batch size for training"),
-                ("utd_ratio", "Update-to-data ratio"),
+                ("lmbda", "GAE lambda parameter"),
+                ("entropy_eps", "Entropy bonus coefficient"),
+                ("lr", "Learning rate"),
+                ("max_grad_norm", "Gradient clipping norm")
             ],
             "Derived Values": [
                 ("frames_per_batch", "Frames per batch"),
@@ -566,6 +528,50 @@ class HyperParameters:
 
         # Print legend
         print("\nSource: [C]=From .ini config file, [D]=Default, [-]=Derived")
+
+def print_tensordict_diagnostics(td, verbose=True):
+    """Enhanced diagnostics for debugging episode counting"""
+    print("\n=== TensorDict Diagnostics ===")
+    print("\nTensorDict Structure:")
+    print("-" * 80)
+    
+    # Print all top-level keys
+    print("Top-level keys:", td.keys())
+    
+    # Print nested keys
+    if "next" in td.keys():
+        print("\nNested 'next' keys:", td["next"].keys())
+    
+    print("\nBatch Information:")
+    print(f"Batch size: {td.batch_size}")
+    print(f"Device: {td.device}")
+    
+    print("\nDone Flags Status:")
+    print("-" * 80)
+    print(f"done shape: {td['done'].shape}")
+    print(f"done values: {td['done'].cpu().numpy()}")
+    print(f"terminated values: {td['terminated'].cpu().numpy()}")
+    print(f"truncated values: {td['truncated'].cpu().numpy()}")
+    
+    if "next" in td.keys():
+        print("\nNext State Done Flags:")
+        print(f"next done values: {td['next', 'done'].cpu().numpy()}")
+        print(f"next terminated values: {td['next', 'terminated'].cpu().numpy()}")
+        print(f"next truncated values: {td['next', 'truncated'].cpu().numpy()}")
+    
+    if verbose:
+        print("\nStep-by-Step Transition Details:")
+        print("-" * 80)
+        for i in range(td.batch_size[0]):
+            print(f"\nTransition {i}:")
+            print(f"Step count: {td['step_count'][i].cpu().item()}")
+            print(f"Action: {td['action'][i].cpu().numpy()}")
+            print(f"Reward: {td['next', 'reward'][i].cpu().item():.4f}")
+            print(f"Done flags: done={td['done'][i].cpu().item()}, "
+                  f"terminated={td['terminated'][i].cpu().item()}, "
+                  f"truncated={td['truncated'][i].cpu().item()}")
+    
+    print("\n" + "="*80)
 
 def get_device_count(backend_name):
     """Get number of available devices for given backend"""

@@ -1,11 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import os
-import time
-import functools
-import math
-from tensordict.nn import TensorDictModule, AddStateIndependentNormalScale
+from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.envs import (
@@ -43,12 +39,11 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     # Load policy
     checkpoint = torch.load(load_model, map_location=device, weights_only=True)
     
-    # Actor network with proper output handling - MUST match train.py exactly
     action_dim = env.action_spec_unbatched.shape[-1]
     input_shape = env.observation_spec["observation"].shape
     actor_mlp = nn.Sequential(
         nn.Linear(input_shape[-1], hp.num_cells_policy),
-        nn.Tanh(),
+        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
         nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
         nn.Tanh(),
         nn.Linear(hp.num_cells_policy, action_dim),  # only means are output
@@ -78,11 +73,11 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        return_log_prob=False,  # Match train.py setting
+        return_log_prob=True,
         distribution_kwargs={
-            "low": env.action_spec.space.low,
-            "high": env.action_spec.space.high,
-            "tanh_loc": False,
+        "low": env.action_spec.space.low,
+        "high": env.action_spec.space.high,
+        "tanh_loc": False,
         },
         #safe = True
     ).to(device)
