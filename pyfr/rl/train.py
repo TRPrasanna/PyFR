@@ -101,10 +101,10 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     # Value network (critic)
     qvalue_net = MLP(
-        depth=3,
+        depth=2,
         num_cells=hp.num_cells_value,
         out_features=1,
-        activation_class=nn.ReLU,
+        activation_class=nn.Tanh,
         device=device,
     )
 
