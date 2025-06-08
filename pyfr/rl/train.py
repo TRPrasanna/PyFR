@@ -23,8 +23,6 @@ from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
-from torchrl.modules import set_recurrent_mode
-
 from tqdm.auto import tqdm
 from pyfr.rl.env import PyFREnvironment
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
@@ -178,7 +176,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     value_module = ValueOperator(
         module=value_net,
-        in_keys=["observation", "critic_hidden_h", "critic_hidden_c"]  # Include LSTM hidden states
+        in_keys=["observation", "critic_hidden_h", "critic_hidden_c", "is_init"]  # Include LSTM hidden states and init tracker
     ).to(device)
 
     # Add LSTM primers to environment
@@ -339,7 +337,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         writer.add_scalar("batch/learning_rate", hp.lr, i)
 
         # Process data with GAE for advantage computation
-        with torch.no_grad(), set_recurrent_mode(True):
+        with torch.no_grad():
             advantage_module(tensordict)
 
         # Add to replay buffer
@@ -350,9 +348,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         for _ in range(hp.num_epochs):
             subdata = replay_buffer.sample(sub_batch_size)
             
-            # Set recurrent mode for training
-            with set_recurrent_mode(True):
-                loss_vals = loss_module(subdata)
+            # Train the model
+            loss_vals = loss_module(subdata)
             
             loss_value = (
                 loss_vals["loss_objective"]
@@ -371,7 +368,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
         # Periodic evaluation
         if i % hp.eval_iter == 0:
-            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad(), set_recurrent_mode(False):
+            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
                 eval_rollout = env.rollout(hp.eval_rollout_steps, policy)
                 eval_reward = eval_rollout["next", "reward"].mean().item()
                 logs["eval_reward"].append(eval_reward)

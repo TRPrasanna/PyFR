@@ -141,7 +141,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
 
     value_module = ValueOperator(
         module=value_net,
-        in_keys=["observation"]
+        in_keys=["observation", "critic_hidden_h", "critic_hidden_c", "is_init"]  # Include LSTM hidden states and init tracker
     ).to(device)
 
     # Add LSTM primers to environment
