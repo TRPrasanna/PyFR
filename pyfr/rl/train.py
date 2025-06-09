@@ -77,20 +77,34 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # LSTM hidden size
     lstm_hidden_size = hp.num_cells_policy
     
-    # Create actor network with LSTM
-    actor_lstm = LSTMModule(
-        input_size=input_shape[-1],
-        hidden_size=lstm_hidden_size,
-        in_keys=["observation", "actor_hidden_h", "actor_hidden_c"],
-        out_keys=["actor_features", ("next", "actor_hidden_h"), ("next", "actor_hidden_c")],
-        device=device,
-        default_recurrent_mode=True,
+    # Actor network with LSTM - using simpler pattern
+    # Step 1: Preprocessing MLP to transform observation for LSTM
+    actor_preprocessing = TensorDictModule(
+        MLP(
+            in_features=input_shape[-1],
+            out_features=lstm_hidden_size,
+            num_cells=[lstm_hidden_size],
+            activation_class=nn.Tanh,
+            device=device,
+        ),
+        in_keys=["observation"],
+        out_keys=["_actor_embed"]
     )
     
-    # MLP head for actor after LSTM - output both mean and scale parameters
+    # Step 2: LSTM with simple in/out keys
+    actor_lstm = LSTMModule(
+        input_size=lstm_hidden_size,
+        hidden_size=lstm_hidden_size,
+        device=device,
+        in_key="_actor_embed",
+        out_key="_actor_embed",
+        python_based=True,
+    )
+    
+    # Step 3: Final MLP that sees both LSTM output and original observation
     actor_head = MLP(
-        in_features=lstm_hidden_size,
-        out_features=2 * action_dim,  # Output both mean and scale parameters
+        in_features=lstm_hidden_size + input_shape[-1],  # LSTM output + observation
+        out_features=2 * action_dim,  # mean and scale parameters
         num_cells=[hp.num_cells_policy, hp.num_cells_policy],
         activation_class=nn.Tanh,
         device=device,
@@ -105,7 +119,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # Create actor head module that outputs raw parameters
     actor_head_module = TensorDictModule(
         actor_head,
-        in_keys=["actor_features"],
+        in_keys=["_actor_embed", "observation"],  # Both LSTM output and observation
         out_keys=["params"]  # Raw parameters before extraction
     )
     
@@ -119,16 +133,11 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         out_keys=["loc", "scale"]
     )
     
-    # Create the full actor network step by step
-    # Step 1: LSTM + MLP head that outputs raw parameters
-    actor_backbone = TensorDictSequential(
-        actor_lstm,
-        actor_head_module
-    ).to(device)
-    
-    # Step 2: Extract loc and scale from raw parameters
+    # Create the full actor network using the simpler pattern
     actor_net = TensorDictSequential(
-        actor_backbone,
+        actor_preprocessing,
+        actor_lstm,
+        actor_head_module,
         param_extractor
     ).to(device)
 
@@ -145,18 +154,32 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         },
     ).to(device)
 
-    # Value network (critic) with LSTM
-    critic_lstm = LSTMModule(
-        input_size=input_shape[-1],
-        hidden_size=hp.num_cells_value,
-        in_keys=["observation", "critic_hidden_h", "critic_hidden_c"],
-        out_keys=["critic_features", ("next", "critic_hidden_h"), ("next", "critic_hidden_c")],
-        device=device,
-        default_recurrent_mode=True,
+    # Value network (critic) with LSTM - using simpler pattern
+    # Step 1: Preprocessing MLP to transform observation for LSTM
+    critic_preprocessing = TensorDictModule(
+        MLP(
+            in_features=input_shape[-1],
+            out_features=hp.num_cells_value,
+            num_cells=[hp.num_cells_value],
+            activation_class=nn.Tanh,
+            device=device,
+        ),
+        in_keys=["observation"],
+        out_keys=["_critic_embed"]
     )
     
+    # Step 2: LSTM with simple in/out keys
+    critic_lstm = LSTMModule(
+        input_size=hp.num_cells_value,
+        hidden_size=hp.num_cells_value,
+        device=device,
+        in_key="_critic_embed",
+        out_key="_critic_embed",
+    )
+    
+    # Step 3: Final MLP that sees both LSTM output and original observation
     critic_head = MLP(
-        in_features=hp.num_cells_value,
+        in_features=hp.num_cells_value + input_shape[-1],  # LSTM output + observation
         out_features=1,
         num_cells=[hp.num_cells_value, hp.num_cells_value],
         activation_class=nn.Tanh,
@@ -165,19 +188,21 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     
     critic_head_module = TensorDictModule(
         critic_head,
-        in_keys=["critic_features"],
+        in_keys=["_critic_embed", "observation"],  # Both LSTM output and observation
         out_keys=["state_value"]
     )
     
     value_net = TensorDictSequential(
+        critic_preprocessing,
         critic_lstm,
         critic_head_module
     ).to(device)
 
-    value_module = ValueOperator(
-        module=value_net,
-        in_keys=["observation", "critic_hidden_h", "critic_hidden_c", "is_init"]  # Include LSTM hidden states and init tracker
-    ).to(device)
+    # value_module = ValueOperator(
+    #     module=value_net,
+    #     in_keys=["observation", "critic_hidden_h", "critic_hidden_c", "is_init"],  # Match what the value_net expects
+    #     out_keys=["state_value"]  # Explicitly specify output
+    # ).to(device)
 
     # Add LSTM primers to environment
     env.append_transform(actor_lstm.make_tensordict_primer())
@@ -187,13 +212,15 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     advantage_module = GAE(
         gamma=hp.gamma, 
         lmbda=hp.lmbda,
-        value_network=value_module,
-        average_gae=True
+        value_network=value_net,  # Use the raw TensorDictSequential
+        average_gae=True,
+        deactivate_vmap=True,
+        shifted=True,
     )
 
     loss_module = ClipPPOLoss(
         actor_network=policy,
-        critic_network=value_module,
+        critic_network=value_net,  # Use the same network
         clip_epsilon=hp.clip_epsilon,
         entropy_bonus=bool(hp.entropy_eps),
         entropy_coef=hp.entropy_eps,
@@ -219,9 +246,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             print_diagnostic=False
         )
         env = TransformedEnv(env, Compose(StepCounter(), InitTracker()))
-        # Add LSTM primers to each environment
-        env.append_transform(actor_lstm.make_tensordict_primer())
-        env.append_transform(critic_lstm.make_tensordict_primer())
+        # No LSTM primers needed with simplified approach
         return env
 
     # Create list of environment creators with device IDs
@@ -254,7 +279,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     if load_model and os.path.exists(load_model):
         checkpoint = torch.load(load_model, map_location=device, weights_only=True)
         policy.load_state_dict(checkpoint['policy_state_dict'])
-        value_module.load_state_dict(checkpoint['value_state_dict'])
+        value_net.load_state_dict(checkpoint['value_state_dict'])
         
         # Load optimizer states if available
         if 'optimizer_state_dict' in checkpoint:
@@ -321,104 +346,104 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     print(f"Writing hyperparameters to tensorboard: {run_name}")
     writer.add_hparams(hparam_dict, metric_dict, run_name=run_name)
 
-    # Training loop
-    for i, tensordict in enumerate(collector):
-        # Update policy weights
+    updates_per_batch = hp.num_epochs * (hp.frames_per_batch // sub_batch_size)
+
+    for batch_idx, tensordict_data in enumerate(collector):
+        episode_count += hp.episodes_per_batch
+        # Training performance metrics
+        train_reward = tensordict_data["next", "reward"].mean().item()
+        writer.add_scalar("batch/train_reward", train_reward, batch_idx)
+        writer.add_scalar("batch/episodes", episode_count, batch_idx)
+        writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
+
+
+        # Training updates
+        for epoch_idx in range(hp.num_epochs):
+            advantage_module(tensordict_data)
+            data_view = tensordict_data.reshape(-1)
+            replay_buffer.extend(data_view.cpu())
+            
+            for sub_update_idx in range(hp.frames_per_batch // sub_batch_size):
+                subdata = replay_buffer.sample(sub_batch_size)
+                loss_vals = loss_module(subdata.to(device))
+                loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
+                if hp.entropy_eps > 0:
+                    loss_value = loss_value + loss_vals["loss_entropy"]
+
+                policy_obj = loss_vals["loss_objective"].item()
+                val_loss = loss_vals["loss_critic"].item()
+                ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
+
+                loss_value.backward()
+                grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
+
+                global_update_idx = (batch_idx * updates_per_batch + 
+                                   epoch_idx * (hp.frames_per_batch // sub_batch_size) + 
+                                   sub_update_idx)
+                
+                # Log with global update index
+                writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
+                writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
+                writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
+                writer.add_scalar("grad/norm", grad_norm, global_update_idx)
+
+                optim.step()
+                optim.zero_grad()
+
         collector.update_policy_weights_() # perhaps not needed
 
-        current_frames = tensordict.numel()
-        episode_count += hp.episodes_per_batch
-        pbar.update(hp.episodes_per_batch)
-
-        # Training performance metrics
-        train_reward = tensordict["next", "reward"].mean().item()
-        writer.add_scalar("batch/train_reward", train_reward, i)
-        writer.add_scalar("batch/episodes", episode_count, i)
-        writer.add_scalar("batch/learning_rate", hp.lr, i)
-
-        # Process data with GAE for advantage computation
-        with torch.no_grad():
-            advantage_module(tensordict)
-
-        # Add to replay buffer
-        data_view = tensordict.reshape(-1)
-        replay_buffer.extend(data_view)
-
-        # PPO updates
-        for _ in range(hp.num_epochs):
-            subdata = replay_buffer.sample(sub_batch_size)
-            
-            # Train the model
-            loss_vals = loss_module(subdata)
-            
-            loss_value = (
-                loss_vals["loss_objective"]
-                + loss_vals["loss_critic"]
-                + loss_vals["loss_entropy"]
-            )
-
-            # Optimization step
-            loss_value.backward()
-            torch.nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
-            optim.step()
-            optim.zero_grad()
-
-        logs["reward"].append(train_reward)
+        # Logging
         logs["train_reward"].append(train_reward)
 
-        # Periodic evaluation
-        if i % hp.eval_iter == 0:
-            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                eval_rollout = env.rollout(hp.eval_rollout_steps, policy)
-                eval_reward = eval_rollout["next", "reward"].mean().item()
-                logs["eval_reward"].append(eval_reward)
-                writer.add_scalar("eval/reward", eval_reward, i)
-                eval_str = f"eval reward: {eval_reward:.4f}"
+        # Evaluate every hp.eval_frequency batches
+        if batch_idx % hp.eval_frequency == 0:
+            eval_reward = evaluate_policy(env, policy)
+            logs["eval_reward"].append(eval_reward)
 
-                # Save best model
-                if eval_reward > best_eval_reward:
-                    best_eval_reward = eval_reward
-                    best_eval_episode = episode_count
-                    torch.save({
-                        'policy_state_dict': policy.state_dict(),
-                        'value_state_dict': value_module.state_dict(),
-                        'optimizer_state_dict': optim.state_dict(),
-                        'best_reward': best_eval_reward,
-                        'current_reward': eval_reward,
-                        'episode': episode_count,
-                        'best_episode': best_eval_episode,
-                    }, best_model_path)
+            writer.add_scalar("eval/mean_reward", eval_reward, batch_idx)
+            writer.add_scalar("train/learning_rate", optim.param_groups[0]['lr'], batch_idx)
 
-                current_eval_reward = eval_reward
+            # Save best model if new best achieved
+            if eval_reward > best_eval_reward:
+                best_eval_reward = eval_reward
+                best_eval_episode = episode_count
+                print(f"\nNew best eval reward: {best_eval_reward:.5f} at episode {episode_count}")
+                torch.save({
+                    'policy_state_dict': policy.state_dict(),
+                    'value_state_dict': value_net.state_dict(),
+                    'current_reward': eval_reward,
+                    'best_reward': best_eval_reward,
+                    'episode': episode_count,
+                    'best_episode': best_eval_episode,
+                }, best_model_path)
 
-        # Save latest model
-        torch.save({
-            'policy_state_dict': policy.state_dict(),
-            'value_state_dict': value_module.state_dict(),
-            'optimizer_state_dict': optim.state_dict(),
-            'best_reward': best_eval_reward,
-            'current_reward': current_eval_reward,
-            'episode': episode_count,
-            'best_episode': best_eval_episode,
-        }, latest_model_path)
+            # Save latest model
+            torch.save({
+                'policy_state_dict': policy.state_dict(),
+                'value_state_dict': value_net.state_dict(),
+                'current_reward': eval_reward,
+                'best_reward': best_eval_reward,
+                'episode': episode_count,
+                'best_episode': best_eval_episode,
+            }, latest_model_path)
 
-        # Update progress bar
-        pbar.set_description(f"Training {eval_str}")
+            eval_str = f"eval reward: {eval_reward:.5f} (best: {best_eval_reward:.5f})"
 
-        # Stop condition
-        if episode_count >= hp.episodes:
-            break
+        # Progress bar update
+        pbar.set_postfix({
+            "train_reward": f"{train_reward:.5f}",
+            "eval": eval_str,
+            "lr": f"{optim.param_groups[0]['lr']:.2e}",
+        })
+        pbar.update(hp.episodes_per_batch)
 
-    # Close episode progress bar
+    pbar.close()
     if episode_pbar:
         episode_pbar.close()
 
-    pbar.close()
-    writer.close()
     collector.shutdown()
-
-    print(f"\nTraining completed! Best eval reward: {best_eval_reward:.4f} at episode {best_eval_episode}")
-    return logs
+    writer.close() # tensorboard writer
+    env.close()
 
 def evaluate_policy(env, policy, num_steps=1000000): 
     # _check_done will take care of num_steps, but done is not resetting env for some reason
