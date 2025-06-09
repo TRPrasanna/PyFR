@@ -51,20 +51,35 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     # LSTM hidden size
     lstm_hidden_size = hp.num_cells_policy
     
-    # Create actor network with LSTM
-    actor_lstm = LSTMModule(
-        input_size=input_shape[-1],
-        hidden_size=lstm_hidden_size,
-        in_keys=["observation", "actor_hidden_h", "actor_hidden_c"],
-        out_keys=["actor_features", ("next", "actor_hidden_h"), ("next", "actor_hidden_c")],
-        device=device,
+    # Actor network with LSTM - using simpler pattern (matching train.py)
+    # Step 1: Preprocessing MLP to transform observation for LSTM
+    actor_preprocessing = TensorDictModule(
+        MLP(
+            in_features=input_shape[-1],
+            out_features=lstm_hidden_size,
+            num_cells=[lstm_hidden_size],
+            activation_class=nn.Tanh,
+            device=device,
+        ),
+        in_keys=["observation"],
+        out_keys=["_actor_embed"]
     )
     
-    # MLP head for actor after LSTM
+    # Step 2: LSTM with simple in/out keys
+    actor_lstm = LSTMModule(
+        input_size=lstm_hidden_size,
+        hidden_size=lstm_hidden_size,
+        device=device,
+        in_key="_actor_embed",
+        out_key="_actor_embed",
+        python_based=True,
+    )
+    
+    # Step 3: Final MLP that sees both LSTM output and original observation
     actor_head = MLP(
-        in_features=lstm_hidden_size,
-        out_features=action_dim,
-        num_cells=[hp.num_cells_policy],
+        in_features=lstm_hidden_size + input_shape[-1],  # LSTM output + observation
+        out_features=2 * action_dim,  # mean and scale parameters
+        num_cells=[hp.num_cells_policy, hp.num_cells_policy],
         activation_class=nn.Tanh,
         device=device,
     )
@@ -75,27 +90,29 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
             torch.nn.init.orthogonal_(layer.weight, 1.0)
             layer.bias.data.zero_()
     
+    # Create actor head module that outputs raw parameters
     actor_head_module = TensorDictModule(
         actor_head,
-        in_keys=["actor_features"],
-        out_keys=["loc"]
+        in_keys=["_actor_embed", "observation"],  # Both LSTM output and observation
+        out_keys=["params"]  # Raw parameters before extraction
     )
     
-    # Add learnable scales (standard deviations)
-    scale_module = TensorDictModule(
-        AddStateIndependentNormalScale(
-            action_dim,
-            scale_lb=1e-8,
+    # NormalParamExtractor to split parameters into loc and scale
+    param_extractor = TensorDictModule(
+        NormalParamExtractor(
+            scale_mapping="biased_softplus_1.0",
+            scale_lb=0.1,   # lower bound for scale
         ),
-        in_keys=["loc"],
+        in_keys=["params"],
         out_keys=["loc", "scale"]
     )
     
-    # Create full actor network
+    # Create the full actor network using the simpler pattern
     actor_net = TensorDictSequential(
+        actor_preprocessing,
         actor_lstm,
         actor_head_module,
-        scale_module
+        param_extractor
     ).to(device)
 
     policy = ProbabilisticActor(
@@ -111,47 +128,56 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         },
     ).to(device)
 
-    # Value network (critic) with LSTM - needed for full model compatibility
-    critic_lstm = LSTMModule(
-        input_size=input_shape[-1],
-        hidden_size=hp.num_cells_value,
-        in_keys=["observation", "critic_hidden_h", "critic_hidden_c"],
-        out_keys=["critic_features", ("next", "critic_hidden_h"), ("next", "critic_hidden_c")],
-        device=device,
+    # Value network (critic) with LSTM - using simpler pattern (matching train.py)
+    # Step 1: Preprocessing MLP to transform observation for LSTM
+    critic_preprocessing = TensorDictModule(
+        MLP(
+            in_features=input_shape[-1],
+            out_features=hp.num_cells_value,
+            num_cells=[hp.num_cells_value],
+            activation_class=nn.Tanh,
+            device=device,
+        ),
+        in_keys=["observation"],
+        out_keys=["_critic_embed"]
     )
     
+    # Step 2: LSTM with simple in/out keys
+    critic_lstm = LSTMModule(
+        input_size=hp.num_cells_value,
+        hidden_size=hp.num_cells_value,
+        device=device,
+        in_key="_critic_embed",
+        out_key="_critic_embed",
+    )
+    
+    # Step 3: Final MLP that sees both LSTM output and original observation
     critic_head = MLP(
-        in_features=hp.num_cells_value,
+        in_features=hp.num_cells_value + input_shape[-1],  # LSTM output + observation
         out_features=1,
-        num_cells=[hp.num_cells_value],
+        num_cells=[hp.num_cells_value, hp.num_cells_value],
         activation_class=nn.Tanh,
         device=device,
     )
     
     critic_head_module = TensorDictModule(
         critic_head,
-        in_keys=["critic_features"],
+        in_keys=["_critic_embed", "observation"],  # Both LSTM output and observation
         out_keys=["state_value"]
     )
     
     value_net = TensorDictSequential(
+        critic_preprocessing,
         critic_lstm,
         critic_head_module
     ).to(device)
 
-    value_module = ValueOperator(
-        module=value_net,
-        in_keys=["observation", "critic_hidden_h", "critic_hidden_c", "is_init"]  # Include LSTM hidden states and init tracker
-    ).to(device)
-
-    # Add LSTM primers to environment
-    env.append_transform(actor_lstm.make_tensordict_primer())
-    env.append_transform(critic_lstm.make_tensordict_primer())
+    # Use value_net directly (no ValueOperator wrapper needed with simplified approach)
 
     # Load model weights
     policy.load_state_dict(checkpoint['policy_state_dict'])
     if 'value_state_dict' in checkpoint:
-        value_module.load_state_dict(checkpoint['value_state_dict'])
+        value_net.load_state_dict(checkpoint['value_state_dict'])
 
     print(f"Loaded model from: {load_model}")
     if 'best_reward' in checkpoint:
@@ -161,8 +187,8 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
 
     # Set environment step count to evaluation mode and policy to evaluation
     policy.eval()
-    if value_module is not None:
-        value_module.eval()
+    if value_net is not None:
+        value_net.eval()
 
     # Run evaluation episodes
     episode_rewards = []
