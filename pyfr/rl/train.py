@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from collections import defaultdict
 from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule, TensorDictSequential
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, LSTMModule, MLP
+from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, LSTMModule, MLP, set_recurrent_mode
 from torchrl.envs import (
     Compose,
     DoubleToFloat,
@@ -30,6 +30,7 @@ import os
 import math
 from torch.utils.tensorboard import SummaryWriter
 import time
+from torchrl.data import LazyMemmapStorage, TensorDictReplayBuffer
 
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
     # Device setup
@@ -75,51 +76,30 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     input_shape = env.observation_spec["observation"].shape
     
     # LSTM hidden size
-    lstm_hidden_size = hp.num_cells_policy
+    lstm_hidden_size = hp.num_cells_policy #for now
     
-    # Actor network with LSTM - using simpler pattern
-    # Step 1: Preprocessing MLP to transform observation for LSTM
-    actor_preprocessing = TensorDictModule(
-        MLP(
-            in_features=input_shape[-1],
-            out_features=lstm_hidden_size,
-            num_cells=[lstm_hidden_size],
-            activation_class=nn.Tanh,
-            device=device,
-        ),
-        in_keys=["observation"],
-        out_keys=["_actor_embed"]
-    )
-    
-    # Step 2: LSTM with simple in/out keys
     actor_lstm = LSTMModule(
-        input_size=lstm_hidden_size,
+        input_size=input_shape[-1],
         hidden_size=lstm_hidden_size,
         device=device,
-        in_key="_actor_embed",
-        out_key="_actor_embed",
+        in_key="observation",
+        out_key="intermediate",
         python_based=True,
     )
     
+    env.append_transform(actor_lstm.make_tensordict_primer()) 
     # Step 3: Final MLP that sees both LSTM output and original observation
     actor_head = MLP(
-        in_features=lstm_hidden_size + input_shape[-1],  # LSTM output + observation
         out_features=2 * action_dim,  # mean and scale parameters
         num_cells=[hp.num_cells_policy, hp.num_cells_policy],
         activation_class=nn.Tanh,
         device=device,
     )
     
-    # Initialize actor head weights
-    for layer in actor_head.modules():
-        if isinstance(layer, torch.nn.Linear):
-            torch.nn.init.orthogonal_(layer.weight, 1.0)
-            layer.bias.data.zero_()
-    
     # Create actor head module that outputs raw parameters
     actor_head_module = TensorDictModule(
         actor_head,
-        in_keys=["_actor_embed", "observation"],  # Both LSTM output and observation
+        in_keys=["intermediate"],
         out_keys=["params"]  # Raw parameters before extraction
     )
     
@@ -135,11 +115,17 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     
     # Create the full actor network using the simpler pattern
     actor_net = TensorDictSequential(
-        actor_preprocessing,
         actor_lstm,
         actor_head_module,
         param_extractor
     ).to(device)
+
+    actor_net(env.reset()) # helps with LazyLinear initialization? check
+    # Initialize actor head weights
+    for layer in actor_head.modules():
+        if isinstance(layer, torch.nn.Linear):
+            torch.nn.init.orthogonal_(layer.weight, 1.0)
+            layer.bias.data.zero_()
 
     policy = ProbabilisticActor(
         module=actor_net,
@@ -154,32 +140,21 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         },
     ).to(device)
 
-    # Value network (critic) with LSTM - using simpler pattern
-    # Step 1: Preprocessing MLP to transform observation for LSTM
-    critic_preprocessing = TensorDictModule(
-        MLP(
-            in_features=input_shape[-1],
-            out_features=hp.num_cells_value,
-            num_cells=[hp.num_cells_value],
-            activation_class=nn.Tanh,
-            device=device,
-        ),
-        in_keys=["observation"],
-        out_keys=["_critic_embed"]
-    )
+    # Value network (critic) with LSTM
     
-    # Step 2: LSTM with simple in/out keys
     critic_lstm = LSTMModule(
-        input_size=hp.num_cells_value,
-        hidden_size=hp.num_cells_value,
+        input_size=input_shape[-1],
+        hidden_size=hp.num_cells_value, # for now
         device=device,
-        in_key="_critic_embed",
-        out_key="_critic_embed",
+        in_key="observation",
+        out_key="intermediate",
+        python_based=True,
     )
     
+    # Add LSTM primers to environment
+    env.append_transform(critic_lstm.make_tensordict_primer())
     # Step 3: Final MLP that sees both LSTM output and original observation
     critic_head = MLP(
-        in_features=hp.num_cells_value + input_shape[-1],  # LSTM output + observation
         out_features=1,
         num_cells=[hp.num_cells_value, hp.num_cells_value],
         activation_class=nn.Tanh,
@@ -188,34 +163,29 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     
     critic_head_module = TensorDictModule(
         critic_head,
-        in_keys=["_critic_embed", "observation"],  # Both LSTM output and observation
+        in_keys=["intermediate"],
         out_keys=["state_value"]
     )
     
     value_net = TensorDictSequential(
-        critic_preprocessing,
         critic_lstm,
         critic_head_module
     ).to(device)
 
+    value_net(env.reset())  # helps initialize uninitialized parameters? check
     # value_module = ValueOperator(
     #     module=value_net,
-    #     in_keys=["observation", "critic_hidden_h", "critic_hidden_c", "is_init"],  # Match what the value_net expects
-    #     out_keys=["state_value"]  # Explicitly specify output
+    #     in_keys=["observation"],  # Match what the value_net expects
     # ).to(device)
-
-    # Add LSTM primers to environment
-    env.append_transform(actor_lstm.make_tensordict_primer())
-    env.append_transform(critic_lstm.make_tensordict_primer())
 
     # PPO components
     advantage_module = GAE(
         gamma=hp.gamma, 
         lmbda=hp.lmbda,
-        value_network=value_net,  # Use the raw TensorDictSequential
+        value_network=value_net,
         average_gae=True,
-        deactivate_vmap=True,
-        shifted=True,
+        deactivate_vmap=True, # as suggested in source code
+        #shifted=True,
     )
 
     loss_module = ClipPPOLoss(
@@ -246,7 +216,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             print_diagnostic=False
         )
         env = TransformedEnv(env, Compose(StepCounter(), InitTracker()))
-        # No LSTM primers needed with simplified approach
+        env.append_transform(actor_lstm.make_tensordict_primer())
+        env.append_transform(critic_lstm.make_tensordict_primer())
         return env
 
     # Create list of environment creators with device IDs
@@ -265,11 +236,16 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     )
 
     # Replay buffer
-    replay_buffer = ReplayBuffer(
-        storage=LazyTensorStorage(max_size=hp.frames_per_batch),
+    # replay_buffer = ReplayBuffer(
+    #     storage=LazyTensorStorage(max_size=hp.frames_per_batch),
+    #     sampler=SamplerWithoutReplacement(),
+    # )
+    replay_buffer = TensorDictReplayBuffer( # can store to disk in future
+        storage=LazyMemmapStorage(max_size=hp.frames_per_batch),
         sampler=SamplerWithoutReplacement(),
+        batch_size=sub_batch_size,
+        #prefetch=10,
     )
-
     best_eval_reward = float('-inf')
     best_eval_episode = 0
     start_episode = 0
@@ -359,13 +335,15 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
         # Training updates
         for epoch_idx in range(hp.num_epochs):
-            advantage_module(tensordict_data)
-            data_view = tensordict_data.reshape(-1)
-            replay_buffer.extend(data_view.cpu())
+            with set_recurrent_mode(True): #True or "recurrent"
+                advantage_module(tensordict_data)
+                print(tensordict_data.shape)
+            # pass non-flattened data unlike no-memory PPO
+            replay_buffer.extend(tensordict_data.unsqueeze(0).to_tensordict().cpu())
             
             for sub_update_idx in range(hp.frames_per_batch // sub_batch_size):
-                subdata = replay_buffer.sample(sub_batch_size)
-                loss_vals = loss_module(subdata.to(device))
+                subdata = replay_buffer.sample().to(device, non_blocking=True)
+                loss_vals = loss_module(subdata)
                 loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
                 if hp.entropy_eps > 0:
                     loss_value = loss_value + loss_vals["loss_entropy"]
