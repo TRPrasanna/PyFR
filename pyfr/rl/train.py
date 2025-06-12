@@ -242,7 +242,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     # )
     replay_buffer = TensorDictReplayBuffer( # can store to disk in future
         storage=LazyMemmapStorage(max_size=hp.frames_per_batch),
-        sampler=SamplerWithoutReplacement(),
+        sampler=SamplerWithoutReplacement(shuffle=False), #check
         batch_size=sub_batch_size,
         #prefetch=10,
     )
@@ -332,17 +332,21 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         writer.add_scalar("batch/episodes", episode_count, batch_idx)
         writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
 
+        # pass non-flattened data unlike no-memory PPO; unable to do it here though, check
+        #replay_buffer.extend(tensordict_data.unsqueeze(0).to_tensordict().cpu()) # do here or inside Adam loop? check
 
         # Training updates
         for epoch_idx in range(hp.num_epochs):
             with set_recurrent_mode(True): #True or "recurrent"
-                advantage_module(tensordict_data)
-                print(tensordict_data.shape)
+                advantage_module(tensordict_data) # classical PPO does this outside the loop?
+                #print(tensordict_data.shape)
             # pass non-flattened data unlike no-memory PPO
             replay_buffer.extend(tensordict_data.unsqueeze(0).to_tensordict().cpu())
             
             for sub_update_idx in range(hp.frames_per_batch // sub_batch_size):
                 subdata = replay_buffer.sample().to(device, non_blocking=True)
+                #print(subdata)
+                #print(subdata.keys)
                 loss_vals = loss_module(subdata)
                 loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
                 if hp.entropy_eps > 0:
