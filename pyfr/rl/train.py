@@ -19,7 +19,7 @@ from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
 from torchrl.collectors.distributed import DistributedDataCollector
 from torchrl.envs import EnvCreator
 from torchrl.data.replay_buffers import ReplayBuffer
-from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
+from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement, SliceSampler
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
@@ -55,20 +55,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     hp = HyperParameters.from_config(env.cfg)
     # Calculate derived parameters using environment info
     hp._calculate_derived(env)
-
-    # Adjust num_minibatches if it does not divide frames_per_batch evenly
-    sub_batch_size = hp.frames_per_batch // hp.desired_num_minibatches
-    remainder = hp.frames_per_batch % hp.desired_num_minibatches
-    if remainder != 0:
-        adjusted_num_minibatches = get_closest_divisor(hp.frames_per_batch, hp.desired_num_minibatches)
-        sub_batch_size = hp.frames_per_batch // adjusted_num_minibatches
-        print(
-            f"Warning: frames_per_batch ({hp.frames_per_batch}) is not perfectly divisible by "
-            f"num_minibatches ({hp.desired_num_minibatches}). "
-            f"Adjusted num_minibatches to {adjusted_num_minibatches} with sub_batch_size {sub_batch_size}."
-        )
-        hp.desired_num_minibatches = adjusted_num_minibatches
-
     hp.print_summary()
 
     # Actor network with LSTM
@@ -236,15 +222,11 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     )
 
     # Replay buffer
-    # replay_buffer = ReplayBuffer(
-    #     storage=LazyTensorStorage(max_size=hp.frames_per_batch),
-    #     sampler=SamplerWithoutReplacement(),
-    # )
     replay_buffer = TensorDictReplayBuffer( # can store to disk in future
-        storage=LazyMemmapStorage(max_size=hp.frames_per_batch),
-        sampler=SamplerWithoutReplacement(shuffle=False), #check
-        batch_size=sub_batch_size,
-        #prefetch=10,
+        #storage=LazyMemmapStorage(ndim=3,max_size=hp.frames_per_batch), # 3 because unflattened data is passed to buffer?
+        storage=LazyMemmapStorage(max_size=1), # for on-policy (as in PPO), store one batch at a time
+        #sampler=SamplerWithoutReplacement(shuffle=False),
+        batch_size= 1, # 1 unit of frames_per_batch?
     )
     best_eval_reward = float('-inf')
     best_eval_episode = 0
@@ -322,7 +304,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     print(f"Writing hyperparameters to tensorboard: {run_name}")
     writer.add_hparams(hparam_dict, metric_dict, run_name=run_name)
 
-    updates_per_batch = hp.num_epochs * (hp.frames_per_batch // sub_batch_size)
+    updates_per_batch = hp.num_epochs
 
     for batch_idx, tensordict_data in enumerate(collector):
         episode_count += hp.episodes_per_batch
@@ -332,45 +314,47 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         writer.add_scalar("batch/episodes", episode_count, batch_idx)
         writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
 
-        # pass non-flattened data unlike no-memory PPO; unable to do it here though, check
-        #replay_buffer.extend(tensordict_data.unsqueeze(0).to_tensordict().cpu()) # do here or inside Adam loop? check
-
         # Training updates
         for epoch_idx in range(hp.num_epochs):
             with set_recurrent_mode(True): #True or "recurrent"
+                #print("data before advantage module:", tensordict_data["is_init"])
                 advantage_module(tensordict_data) # classical PPO does this outside the loop?
+                # advantage and value_target are added to tensordict_data
                 #print(tensordict_data.shape)
             # pass non-flattened data unlike no-memory PPO
             replay_buffer.extend(tensordict_data.unsqueeze(0).to_tensordict().cpu())
+            #if batch_idx == 0 and epoch_idx == 0: print(replay_buffer)
+
+            subdata = replay_buffer.sample().to(device, non_blocking=True)
+            #print(subdata)
+            #print(subdata.keys)
+            #print("Subdata init keys:", subdata["is_init"])
+            #print("Subdata action:", subdata["action"])
+            loss_vals = loss_module(subdata)
+            loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
+            #if sub_update_idx == 0 and epoch_idx == 0:
+            #    print("Loss values:", loss_vals)
+            #    print("Loss value before entropy bonus:", loss_value)
+            if hp.entropy_eps > 0:
+                loss_value = loss_value + loss_vals["loss_entropy"]
+
+            policy_obj = loss_vals["loss_objective"].item()
+            val_loss = loss_vals["loss_critic"].item()
+            ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
+
+            loss_value.backward()
+            grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
+
+            global_update_idx = (batch_idx * updates_per_batch + epoch_idx)
             
-            for sub_update_idx in range(hp.frames_per_batch // sub_batch_size):
-                subdata = replay_buffer.sample().to(device, non_blocking=True)
-                #print(subdata)
-                #print(subdata.keys)
-                loss_vals = loss_module(subdata)
-                loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
-                if hp.entropy_eps > 0:
-                    loss_value = loss_value + loss_vals["loss_entropy"]
+            # Log with global update index
+            writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
+            writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
+            writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
+            writer.add_scalar("grad/norm", grad_norm, global_update_idx)
 
-                policy_obj = loss_vals["loss_objective"].item()
-                val_loss = loss_vals["loss_critic"].item()
-                ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
-
-                loss_value.backward()
-                grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
-
-                global_update_idx = (batch_idx * updates_per_batch + 
-                                   epoch_idx * (hp.frames_per_batch // sub_batch_size) + 
-                                   sub_update_idx)
-                
-                # Log with global update index
-                writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
-                writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
-                writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
-                writer.add_scalar("grad/norm", grad_norm, global_update_idx)
-
-                optim.step()
-                optim.zero_grad()
+            optim.step()
+            optim.zero_grad()
 
         collector.update_policy_weights_() # perhaps not needed
 
@@ -444,28 +428,6 @@ def evaluate_policy(env, policy, num_steps=1000000):
         env.set_evaluation_mode(False)  # Reset to training mode
         #print("Evaluation complete.Returning to training mode.")
 
-def get_closest_divisor(n, target):
-    """
-    Finds the closest divisor of n to the target value.
-    
-    Args:
-        n (int): The number to find divisors for.
-        target (int): The target divisor to approach.
-        
-    Returns:
-        int: The closest divisor to the target.
-    """
-    # Find all divisors of n
-    divisors = set()
-    for i in range(1, int(math.sqrt(n)) + 1):
-        if n % i == 0:
-            divisors.add(i)
-            divisors.add(n // i)
-    
-    # Find the divisor with the minimum absolute difference to the target
-    closest = min(divisors, key=lambda x: (abs(x - target), -x))  # Prefer larger divisor if tie
-    return closest
-
 @dataclass
 class HyperParameters:
     # Network architecture
@@ -475,7 +437,6 @@ class HyperParameters:
     # Training schedule
     episodes: int = 1200
     episodes_per_batch: int = 20
-    desired_num_minibatches: int = 16
     num_epochs: int = 10
     
     # PPO parameters
@@ -538,7 +499,6 @@ class HyperParameters:
             "Training Schedule": [
                 ("episodes", "Total training episodes"),
                 ("episodes_per_batch", "Episodes per update batch"),
-                ("desired_num_minibatches", "Target minibatches per update"),
                 ("num_epochs", "Training epochs per batch")
             ],
             "PPO Parameters": [
