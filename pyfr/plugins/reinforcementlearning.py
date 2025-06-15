@@ -30,7 +30,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         
         # Calculate observation size based on probe points and variables
         nvars = len(self.elementscls.privarmap[self.ndims]) if self.fmt == 'primitive' else len(self.elementscls.convarmap[self.ndims])
-        self.observation_size = len(self.pts) * 2 #* 3 # * nvars for all variables
+        self.observation_size = len(self.pts) #* 2 #* 3 # * nvars for all variables
         self.nvars = nvars
         
         # Rest of initialization
@@ -396,7 +396,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             samples = np.array(samples).T
 
             # Extract only u,v velocities, p (indices 1,2,3 in primitive variables)
-            var_indices = [1,2] #[1, 2, 3]  # u,v,p are at indices 1,2,3 (after density)
+            var_indices = [3] #[1, 2, 3]  # u,v,p are at indices 1,2,3 (after density)
             samples = samples[:, var_indices]
             
         # Convert to tensor of 32-bit floats, check
@@ -410,13 +410,13 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         # Time-averaged forces using trapezoid rule
         delta_t = self.force_times[-1] - self.force_times[0]
         #avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
-        avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
-        avg_sumabsact = trapezoid(y=self.action_history, x=self.force_times) / delta_t
+        #avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+        #avg_sumabsact = trapezoid(y=self.action_history, x=self.force_times) / delta_t
         avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
-        ms_moment = trapezoid(y=[m**2 for m in self.moment_history],
-                              x=self.force_times) / delta_t # mean-square moment
-        var_moment = ms_moment - avg_moment**2 #variance = E[Cm^2] - (E[Cm])^2
-        var_moment = max(0.0, var_moment) # avoid small negative value
+        #ms_moment = trapezoid(y=[m**2 for m in self.moment_history],
+        #                      x=self.force_times) / delta_t # mean-square moment
+        #var_moment = ms_moment - avg_moment**2 #variance = E[Cm^2] - (E[Cm])^2
+        #var_moment = max(0.0, var_moment) # avoid small negative value
 
         #print("averaging over time ", self.force_times[-1] - self.force_times[0])
 
