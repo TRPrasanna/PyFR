@@ -19,7 +19,7 @@ from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
 from torchrl.collectors.distributed import DistributedDataCollector
 from torchrl.envs import EnvCreator
 from torchrl.data.replay_buffers import ReplayBuffer
-from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement, SliceSampler
+from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
@@ -74,7 +74,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     )
     
     env.append_transform(actor_lstm.make_tensordict_primer()) 
-    # Step 3: Final MLP that sees both LSTM output and original observation
+    # Final MLP that sees LSTM output
     actor_head = MLP(
         out_features=2 * action_dim,  # mean and scale parameters
         num_cells=[hp.num_cells_policy, hp.num_cells_policy],
@@ -218,15 +218,17 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         total_frames=hp.total_frames,
         split_trajs=False,
         reset_at_each_iter=True,
-        device=device
+        device=device,
     )
 
     # Replay buffer
     replay_buffer = TensorDictReplayBuffer( # can store to disk in future
         #storage=LazyMemmapStorage(ndim=3,max_size=hp.frames_per_batch), # 3 because unflattened data is passed to buffer?
-        storage=LazyMemmapStorage(max_size=1), # for on-policy (as in PPO), store one batch at a time
-        #sampler=SamplerWithoutReplacement(shuffle=False),
-        batch_size= 1, # 1 unit of frames_per_batch?
+        #storage=LazyMemmapStorage(max_size=1), # for on-policy (as in PPO), store one batch at a time
+        storage=LazyMemmapStorage(max_size=hp.frames_per_batch), #permuted so first index now refers to frame
+        sampler=SamplerWithoutReplacement(shuffle=False),
+        #batch_size= 1, # 1 unit of frames_per_batch?
+        batch_size = hp.actions_per_episode,
     )
     best_eval_reward = float('-inf')
     best_eval_episode = 0
@@ -304,7 +306,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     print(f"Writing hyperparameters to tensorboard: {run_name}")
     writer.add_hparams(hparam_dict, metric_dict, run_name=run_name)
 
-    updates_per_batch = hp.num_epochs
+    updates_per_batch = hp.num_epochs * hp.episodes_per_batch
 
     for batch_idx, tensordict_data in enumerate(collector):
         episode_count += hp.episodes_per_batch
@@ -322,40 +324,45 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 # advantage and value_target are added to tensordict_data
                 #print(tensordict_data.shape)
             # pass non-flattened data unlike no-memory PPO
-            replay_buffer.extend(tensordict_data.unsqueeze(0).to_tensordict().cpu())
+            replay_buffer.extend(tensordict_data.unsqueeze(0).to_tensordict().permute(2,0,1).cpu())
             #if batch_idx == 0 and epoch_idx == 0: print(replay_buffer)
 
-            subdata = replay_buffer.sample().to(device, non_blocking=True)
-            #print(subdata)
-            #print(subdata.keys)
-            #print("Subdata init keys:", subdata["is_init"])
-            #print("Subdata action:", subdata["action"])
-            loss_vals = loss_module(subdata)
-            loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
-            #if sub_update_idx == 0 and epoch_idx == 0:
-            #    print("Loss values:", loss_vals)
-            #    print("Loss value before entropy bonus:", loss_value)
-            if hp.entropy_eps > 0:
-                loss_value = loss_value + loss_vals["loss_entropy"]
+            for sub_update_idx in range(hp.episodes_per_batch): #like a mini-batch
+                subdata = replay_buffer.sample().to(device, non_blocking=True)
+                subdata = subdata.permute(1, 2, 0)  # Move batch dimension to front
+                #print(subdata.shape)
+                #print(subdata["next", "reward"])
+                #print(subdata.keys)
+                print("Subdata init keys:", subdata["is_init"])
+                #print("Subdata action:", subdata["action"])
+                loss_vals = loss_module(subdata)
+                loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
+                #if sub_update_idx == 0 and epoch_idx == 0:
+                #    print("Loss values:", loss_vals)
+                #    print("Loss value before entropy bonus:", loss_value)
+                if hp.entropy_eps > 0:
+                    loss_value = loss_value + loss_vals["loss_entropy"]
 
-            policy_obj = loss_vals["loss_objective"].item()
-            val_loss = loss_vals["loss_critic"].item()
-            ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
+                policy_obj = loss_vals["loss_objective"].item()
+                val_loss = loss_vals["loss_critic"].item()
+                ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
 
-            loss_value.backward()
-            grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
+                loss_value.backward()
+                grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
 
-            global_update_idx = (batch_idx * updates_per_batch + epoch_idx)
-            
-            # Log with global update index
-            writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
-            writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
-            writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
-            writer.add_scalar("grad/norm", grad_norm, global_update_idx)
+                global_update_idx = (batch_idx * updates_per_batch + 
+                                   epoch_idx * hp.episodes_per_batch + 
+                                   sub_update_idx)
+                
+                # Log with global update index
+                writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
+                writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
+                writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
+                writer.add_scalar("grad/norm", grad_norm, global_update_idx)
 
-            optim.step()
-            optim.zero_grad()
-
+                optim.step()
+                optim.zero_grad()
+            check_sampler(replay_buffer) # sanity check if 100% sampled
         collector.update_policy_weights_() # perhaps not needed
 
         # Logging
@@ -427,6 +434,13 @@ def evaluate_policy(env, policy, num_steps=1000000):
     finally:
         env.set_evaluation_mode(False)  # Reset to training mode
         #print("Evaluation complete.Returning to training mode.")
+
+def check_sampler(replay_buffer):
+    sampler_str = str(replay_buffer.sampler)
+    if "100.0000% sampled" not in sampler_str:
+        print("Something went awry: Expected 100.0000% sampling but got", sampler_str)
+        return False
+    return True
 
 @dataclass
 class HyperParameters:
