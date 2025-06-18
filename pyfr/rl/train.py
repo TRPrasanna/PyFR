@@ -19,7 +19,7 @@ from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
 from torchrl.collectors.distributed import DistributedDataCollector
 from torchrl.envs import EnvCreator
 from torchrl.data.replay_buffers import ReplayBuffer
-from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
+from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement, SliceSamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
@@ -227,8 +227,10 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         #storage=LazyMemmapStorage(max_size=1), # for on-policy (as in PPO), store one batch at a time
         storage=LazyMemmapStorage(max_size=hp.frames_per_batch), #permuted so first index now refers to frame
         sampler=SamplerWithoutReplacement(shuffle=False),
-        #batch_size= 1, # 1 unit of frames_per_batch?
-        batch_size = hp.actions_per_episode,
+        #sampler=SliceSamplerWithoutReplacement(slice_len=hp.actions_per_episode), # for on-policy, slice length is frames_per_batch
+        #batch_size= 1, # 1 unit of frames_per_batch? use when not permuting tensordict data
+        batch_size = hp.actions_per_episode, #use with SamplerWithoutReplacement
+        #batch_size=hp.frames_per_batch,  # for SliceSamplerWithoutReplacement (not working yet)
     )
     best_eval_reward = float('-inf')
     best_eval_episode = 0
@@ -333,7 +335,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 #print(subdata.shape)
                 #print(subdata["next", "reward"])
                 #print(subdata.keys)
-                print("Subdata init keys:", subdata["is_init"])
+                #print("Subdata init keys:", subdata["is_init"])
                 #print("Subdata action:", subdata["action"])
                 loss_vals = loss_module(subdata)
                 loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
@@ -346,8 +348,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 policy_obj = loss_vals["loss_objective"].item()
                 val_loss = loss_vals["loss_critic"].item()
                 ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
-
-                loss_value.backward()
+                with set_recurrent_mode(True):
+                    loss_value.backward()
                 grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
 
                 global_update_idx = (batch_idx * updates_per_batch + 
