@@ -86,13 +86,15 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         device=device,
     )
 
+    # Initialize policy weights
+    activation_name = hp.activation_policy.lower()
+    gain = torch.nn.init.calculate_gain(activation_name)
+    for layer in actor_mlp.modules():
+        if isinstance(layer, torch.nn.Linear):
+            torch.nn.init.orthogonal_(layer.weight, gain=gain)
+            layer.bias.data.zero_()
     # Add learnable scales (standard deviations)
     if hp.state_ind_normal_scale:
-        # Initialize policy weights
-        for layer in actor_mlp.modules():
-            if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.orthogonal_(layer.weight, 1.0)
-                layer.bias.data.zero_()
         actor_net = nn.Sequential(
             actor_mlp,
             AddStateIndependentNormalScale(

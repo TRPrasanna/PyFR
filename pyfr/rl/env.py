@@ -103,7 +103,14 @@ class PyFREnvironment(EnvBase):
         # Get observation size from RL plugin
         obs_size = self.rl_plugin.observation_size
         if print_diagnostic:
+            try:
+                var_list = self.rl_plugin.obs_var_names
+                print(f"Observation variables: {', '.join(var_list)}")
+            except AttributeError:
+                print("Observation variables: <plugin does not expose obs_var_names>")
             print(f"Observation size: {obs_size}")
+            print(f"Reward function: {self.rl_plugin.reward_function}")
+            print(f"Variables used in reward function: {', '.join(sorted(self.rl_plugin.used_variables))}")
 
         # *_specs
         self.observation_spec = Composite(
@@ -212,6 +219,7 @@ class PyFREnvironment(EnvBase):
         #self.rl_plugin.reset()
         observation = self._get_observation()
         self.last_observation = observation  # Store first valid observation
+        #print(f"observation: {observation}")
         
         shape = torch.Size([])
         return TensorDict({
