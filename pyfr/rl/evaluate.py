@@ -2,339 +2,267 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
+import sys
 import time
-import functools
-import math
-from tensordict.nn import TensorDictModule, AddStateIndependentNormalScale, TensorDictSequential
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, LSTMModule, MLP, set_recurrent_mode
+from tensordict.nn import TensorDictModule, AddStateIndependentNormalScale
+from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, MLP
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.envs import (
     Compose,
     StepCounter,
     DoubleToFloat,
     TransformedEnv,
-    InitTracker,
 )
 import matplotlib.pyplot as plt
-from .train import HyperParameters
+from .train import HyperParameters, compare_configs
 from pyfr.inifile import Inifile
 from pyfr.readers.native import NativeReader
 from pyfr.rl.env import PyFREnvironment
 
-def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, episodes=1):
-    """Evaluate trained LSTM-enabled PPO policy"""
-    #device = torch.device('cuda')
-    device = torch.device('cpu')
 
+def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, episodes=1):
+    """Evaluate trained policy"""
     # Get config path at the start
     if hasattr(cfg_file, 'name'):
         cfg_path = cfg_file.name
     else:
         cfg_path = cfg_file
 
-    env = PyFREnvironment(mesh_file, cfg_path, backend_name, device_id=0, ic_dir=ic_dir, print_diagnostic=True)
-    # Add InitTracker for LSTM recurrent states
-    env = TransformedEnv(env, Compose(StepCounter(), InitTracker()))
+    # Read the config file content for comparison
+    try:
+        with open(cfg_path, 'r') as f:
+            config_content = f.read()
+    except Exception as e:
+        print(f"Warning: Could not read config file: {e}")
+        config_content = None
 
-    if 'neuralnetwork-hyperparameters' not in env.cfg.sections():
-        print("No neuralnetwork-hyperparameters section found in config file. Proceeding to use default hyperparameters.")
+    # Initialize environment
+    env = PyFREnvironment(mesh_file, cfg_path, backend_name, device_id=0, 
+                          ic_dir=ic_dir, print_diagnostic=True)
+    env = TransformedEnv(env, StepCounter())
 
-    hp = HyperParameters.from_config(env.cfg)
-
-    # Load policy
-    checkpoint = torch.load(load_model, map_location=device, weights_only=True)
+    # Load model checkpoint
+    if not os.path.exists(load_model):
+        print(f"Error: Model file not found: {load_model}")
+        sys.exit(1)
+        
+    device = torch.device('cpu')  # Use CPU for evaluation by default
+    checkpoint = torch.load(load_model, map_location=device)
     
-    # Actor network with LSTM - MUST match train.py exactly
+    # First try to use hyperparameters from checkpoint, fall back to config file
+    if 'hyperparameters' in checkpoint:
+        print("Using hyperparameters from checkpoint")
+        hp_dict = checkpoint['hyperparameters']
+        hp = HyperParameters()
+        for key, value in hp_dict.items():
+            if hasattr(hp, key):
+                setattr(hp, key, value)
+        # Still calculate derived parameters
+        hp._calculate_derived(env)
+    else:
+        print("No hyperparameters in checkpoint, using values from config file")
+        if 'neuralnetwork-hyperparameters' not in env.cfg.sections():
+            print("No neuralnetwork-hyperparameters section found in config file. Using default hyperparameters.")
+        hp = HyperParameters.from_config(env.cfg)
+        hp._calculate_derived(env)
+
+    # Compare config files if both are available
+    if 'config_content' in checkpoint and config_content:
+        print("\nVerifying config files...")
+        config_differences = compare_configs(checkpoint['config_content'], config_content)
+        
+        if config_differences:
+            print("\nWARNING: Config file differences detected between checkpoint and current:")
+            for line_num, ckpt_line, curr_line in config_differences:
+                print(f"Line {line_num}:")
+                print(f"  Checkpoint: {ckpt_line}")
+                print(f"  Current:    {curr_line}")
+                print()
+        else:
+            print("Config files match between checkpoint and current settings.")
+
+    # Print config if flag is set
+    if hasattr(hp, 'print_config_on_load') and hp.print_config_on_load and 'config_content' in checkpoint:
+        print("\n=== CHECKPOINT CONFIG FILE CONTENT ===\n")
+        print(checkpoint['config_content'])
+        print("\n=======================================\n")
+
+    # Actor network with proper output handling
     action_dim = env.action_spec_unbatched.shape[-1]
     input_shape = env.observation_spec["observation"].shape
     
-    # LSTM hidden size
-    lstm_hidden_size = hp.num_cells_policy
-    
-    # Actor network with LSTM - using simpler pattern (matching train.py)
-    # Step 1: Preprocessing MLP to transform observation for LSTM
-    actor_preprocessing = TensorDictModule(
-        MLP(
-            in_features=input_shape[-1],
-            out_features=lstm_hidden_size,
-            num_cells=[lstm_hidden_size],
-            activation_class=nn.Tanh,
-            device=device,
-        ),
-        in_keys=["observation"],
-        out_keys=["_actor_embed"]
-    )
-    
-    # Step 2: LSTM with simple in/out keys
-    actor_lstm = LSTMModule(
-        input_size=lstm_hidden_size,
-        hidden_size=lstm_hidden_size,
-        device=device,
-        in_key="_actor_embed",
-        out_key="_actor_embed",
-        python_based=True,
-    )
-    
-    # Step 3: Final MLP that sees both LSTM output and original observation
-    actor_head = MLP(
-        in_features=lstm_hidden_size + input_shape[-1],  # LSTM output + observation
-        out_features=2 * action_dim,  # mean and scale parameters
-        num_cells=[hp.num_cells_policy, hp.num_cells_policy],
-        activation_class=nn.Tanh,
+    # Create actor network with same architecture as train.py
+    actor_mlp = MLP(
+        in_features=input_shape[-1],
+        out_features=action_dim if hp.state_ind_normal_scale else 2*action_dim,
+        depth=hp.num_hidden_layers_policy,
+        num_cells=hp.num_cells_policy,
+        activation_class=getattr(nn, hp.activation_policy),
         device=device,
     )
-    
-    # Initialize actor head weights
-    for layer in actor_head.modules():
+
+    # Initialize weights for consistency with training
+    for layer in actor_mlp.modules():
         if isinstance(layer, torch.nn.Linear):
             torch.nn.init.orthogonal_(layer.weight, 1.0)
             layer.bias.data.zero_()
-    
-    # Create actor head module that outputs raw parameters
-    actor_head_module = TensorDictModule(
-        actor_head,
-        in_keys=["_actor_embed", "observation"],  # Both LSTM output and observation
-        out_keys=["params"]  # Raw parameters before extraction
-    )
-    
-    # NormalParamExtractor to split parameters into loc and scale
-    param_extractor = TensorDictModule(
-        NormalParamExtractor(
-            scale_mapping="biased_softplus_1.0",
-            scale_lb=0.1,   # lower bound for scale
-        ),
-        in_keys=["params"],
+            
+    # Add learnable scales (standard deviations) - matching train.py exactly
+    if hp.state_ind_normal_scale:
+        actor_net = nn.Sequential(
+            actor_mlp,
+            AddStateIndependentNormalScale(
+                action_dim,  # Number of actions
+                scale_lb=1e-8,
+            ).to(device)
+        )
+    else:
+        actor_net = nn.Sequential(
+            actor_mlp,
+            NormalParamExtractor(
+                scale_mapping="biased_softplus_1.0",
+                scale_lb=0.1,   # lower bound for scale
+            ).to(device)
+        )
+
+    actor_module = TensorDictModule(
+        actor_net,
+        in_keys=["observation"],
         out_keys=["loc", "scale"]
-    )
-    
-    # Create the full actor network using the simpler pattern
-    actor_net = TensorDictSequential(
-        actor_preprocessing,
-        actor_lstm,
-        actor_head_module,
-        param_extractor
     ).to(device)
 
     policy = ProbabilisticActor(
-        module=actor_net,
+        module=actor_module,
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        return_log_prob=True,
+        return_log_prob=False,  # Set to False for evaluation
         distribution_kwargs={
             "low": env.action_spec.space.low,
             "high": env.action_spec.space.high,
             "tanh_loc": False,
         },
     ).to(device)
-
-    # Value network (critic) with LSTM - using simpler pattern (matching train.py)
-    # Step 1: Preprocessing MLP to transform observation for LSTM
-    critic_preprocessing = TensorDictModule(
-        MLP(
-            in_features=input_shape[-1],
-            out_features=hp.num_cells_value,
-            num_cells=[hp.num_cells_value],
-            activation_class=nn.Tanh,
-            device=device,
-        ),
-        in_keys=["observation"],
-        out_keys=["_critic_embed"]
-    )
     
-    # Step 2: LSTM with simple in/out keys
-    critic_lstm = LSTMModule(
-        input_size=hp.num_cells_value,
-        hidden_size=hp.num_cells_value,
-        device=device,
-        in_key="_critic_embed",
-        out_key="_critic_embed",
-    )
-    
-    # Step 3: Final MLP that sees both LSTM output and original observation
-    critic_head = MLP(
-        in_features=hp.num_cells_value + input_shape[-1],  # LSTM output + observation
-        out_features=1,
-        num_cells=[hp.num_cells_value, hp.num_cells_value],
-        activation_class=nn.Tanh,
-        device=device,
-    )
-    
-    critic_head_module = TensorDictModule(
-        critic_head,
-        in_keys=["_critic_embed", "observation"],  # Both LSTM output and observation
-        out_keys=["state_value"]
-    )
-    
-    value_net = TensorDictSequential(
-        critic_preprocessing,
-        critic_lstm,
-        critic_head_module
-    ).to(device)
-
-    # Use value_net directly (no ValueOperator wrapper needed with simplified approach)
-
-    # Load model weights
     policy.load_state_dict(checkpoint['policy_state_dict'])
-    if 'value_state_dict' in checkpoint:
-        value_net.load_state_dict(checkpoint['value_state_dict'])
+    policy.eval()  # Set to evaluation mode
 
-    print(f"Loaded model from: {load_model}")
-    if 'best_reward' in checkpoint:
-        print(f"Model best reward: {checkpoint['best_reward']:.4f}")
-    if 'episode' in checkpoint:
-        print(f"Model episode: {checkpoint['episode']}")
+    # Get stored rewards and episodes
+    current_reward = checkpoint.get('current_reward', checkpoint.get('reward', None))
+    best_reward = checkpoint.get('best_reward', current_reward)
+    saved_episode = checkpoint.get('episode', 0)
+    best_episode = checkpoint.get('best_episode', saved_episode)
+    batch_idx = checkpoint.get('batch_idx', None)
 
-    # Set environment step count to evaluation mode and policy to evaluation
-    policy.eval()
-    if value_net is not None:
-        value_net.eval()
+    print("\nModel Information:")
+    print("-" * 40)
+    if current_reward is not None:
+        print(f"Current reward: {current_reward:.4f}")
+    if best_reward is not None:
+        print(f"Best reward: {best_reward:.4f}")
+        print(f"Best reward at episode: {best_episode}")
+    print(f"Model saved at episode: {saved_episode}")
+    if batch_idx is not None:
+        print(f"Model saved at batch: {batch_idx}")
+    print(f"Model path: {load_model}")
 
-    # Run evaluation episodes
-    episode_rewards = []
-    episode_lengths = []
-    all_actions = []
-    all_observations = []
-    
-    print(f"\nRunning {episodes} evaluation episodes...")
-    
-    for episode in range(episodes):
-        print(f"\nEpisode {episode + 1}/{episodes}")
-        
-        # Reset environment and ensure LSTM states are initialized
-        with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC), set_recurrent_mode(False):
-            td = env.reset()
-            episode_reward = 0
-            episode_length = 0
-            episode_actions = []
-            episode_observations = []
+    # Print network architecture summary
+    print("\nNetwork Architecture:")
+    print("-" * 40)
+    print(f"Input shape: {input_shape}")
+    print(f"Output shape: {action_dim}")
+    print(f"Hidden layers: {hp.num_hidden_layers_policy}")
+    print(f"Hidden units: {hp.num_cells_policy}")
+    print(f"Activation: {hp.activation_policy}")
+    print(f"State-independent normal scale: {hp.state_ind_normal_scale}")
+
+    # Set evaluation mode and run
+    env.set_evaluation_mode(True)
+    try:
+        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+            print("\nStarting evaluation...")
+            eval_rollout = env.rollout(100000, policy)
             
-            # Run episode
-            while not td["done"].any():
-                # Store observation
-                episode_observations.append(td["observation"].cpu().numpy())
-                
-                # Get action from policy
-                td = policy(td)
-                episode_actions.append(td["action"].cpu().numpy())
-                
-                # Take step
-                td = env.step(td)
-                
-                # Accumulate reward
-                reward = td["next", "reward"].item()
-                episode_reward += reward
-                episode_length += 1
-                
-                if episode_length >= 10000:  # Safety break
-                    print("Episode length exceeded 10000 steps, breaking...")
-                    break
-                
-                # Move to next state
-                td = env.step_mdp(td)
+            # Extract data and process for plotting
+            actions = eval_rollout["action"].cpu().numpy()
+            rewards = eval_rollout["next", "reward"].cpu().numpy().flatten()
             
-            # Store episode results
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(episode_length)
-            all_actions.append(np.array(episode_actions))
-            all_observations.append(np.array(episode_observations))
+            # Handle single vs multi-action case
+            if len(actions.shape) == 1:
+                actions = actions.reshape(-1, 1)
+            num_actions = actions.shape[1]
+            time_array = np.arange(len(actions)) * env.action_interval
             
-            print(f"Episode {episode + 1} - Reward: {episode_reward:.4f}, Length: {episode_length}")
+            # Print action history
+            print("\nAction history:")
+            column_width = 16
+            header = f"{'Time':>{column_width}}"
+            for i in range(num_actions):
+                header += f"{('Action_'+str(i)):>{column_width}}"
+            header += f"{'Reward':>{column_width}}"
+            print(header)
+            print("-" * (column_width * (num_actions + 2)))
+            
+            # Format and print data rows
+            for t in range(len(time_array)):
+                row = f"{time_array[t]:>{column_width}.7e}"
+                for i in range(num_actions):
+                    row += f"{actions[t,i]:>{column_width}.7e}"
+                row += f"{rewards[t]:>{column_width}.7e}"
+                print(row)
+            
+            # Calculate statistics for rewards
+            eval_reward = float(np.mean(rewards))
+            eval_std = float(np.std(rewards))
+            eval_min = float(np.min(rewards))
+            eval_max = float(np.max(rewards))
+            eval_total = float(np.sum(rewards))
+            
+            # Print evaluation results with more statistics
+            print("\nEvaluation Results:")
+            print("-" * 40)
+            print(f"Expected reward: {current_reward:.4f}")
+            print(f"Actual mean reward: {eval_reward:.4f}")
+            print(f"Reward std dev: {eval_std:.4f}")
+            print(f"Min/Max rewards: {eval_min:.4f} / {eval_max:.4f}")
+            print(f"Total reward: {eval_total:.4f}")
+            print(f"Number of steps: {len(rewards)}")
+            
+            if current_reward is not None:
+                print(f"Difference from expected: {((eval_reward - current_reward)/current_reward)*100:.2f}%")
+            
+            # Create evaluation plots
+            fig, axes = plt.subplots(num_actions + 1, 1, 
+                                   figsize=(12, 4*(num_actions + 1)),
+                                   sharex=True)
+            axes = np.atleast_1d(axes)
+            
+            for i in range(num_actions):
+                axes[i].plot(time_array, actions[:,i], '-', label=f'Action {i}')
+                axes[i].set_ylabel(f'Action {i}')
+                axes[i].grid(True)
+                axes[i].legend()
+            
+            axes[-1].plot(time_array, rewards, 'r-', label='Reward')
+            axes[-1].set_xlabel('Time')
+            axes[-1].set_ylabel('Reward')
+            axes[-1].grid(True)
+            axes[-1].legend()
 
-    # Calculate statistics
-    mean_reward = np.mean(episode_rewards)
-    std_reward = np.std(episode_rewards)
-    mean_length = np.mean(episode_lengths)
-    std_length = np.std(episode_lengths)
-
-    print(f"\n{'='*60}")
-    print("EVALUATION RESULTS (PPO-LSTM)")
-    print(f"{'='*60}")
-    print(f"Episodes: {episodes}")
-    print(f"Mean Reward: {mean_reward:.4f} ± {std_reward:.4f}")
-    print(f"Mean Episode Length: {mean_length:.2f} ± {std_length:.2f}")
-    print(f"Min Reward: {min(episode_rewards):.4f}")
-    print(f"Max Reward: {max(episode_rewards):.4f}")
-    print(f"{'='*60}")
-
-    # Return results
-    results = {
-        'episode_rewards': episode_rewards,
-        'episode_lengths': episode_lengths,
-        'all_actions': all_actions,
-        'all_observations': all_observations,
-        'mean_reward': mean_reward,
-        'std_reward': std_reward,
-        'mean_length': mean_length,
-        'std_length': std_length,
-    }
-
-    return results
-
-
-def plot_evaluation_results(results, save_path=None):
-    """Plot evaluation results"""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # Episode rewards
-    axes[0, 0].plot(results['episode_rewards'], 'b-', linewidth=2)
-    axes[0, 0].axhline(y=results['mean_reward'], color='r', linestyle='--', 
-                       label=f'Mean: {results["mean_reward"]:.2f}')
-    axes[0, 0].set_title('Episode Rewards')
-    axes[0, 0].set_xlabel('Episode')
-    axes[0, 0].set_ylabel('Reward')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
-    
-    # Episode lengths
-    axes[0, 1].plot(results['episode_lengths'], 'g-', linewidth=2)
-    axes[0, 1].axhline(y=results['mean_length'], color='r', linestyle='--',
-                       label=f'Mean: {results["mean_length"]:.2f}')
-    axes[0, 1].set_title('Episode Lengths')
-    axes[0, 1].set_xlabel('Episode')
-    axes[0, 1].set_ylabel('Length')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
-    
-    # Reward distribution
-    axes[1, 0].hist(results['episode_rewards'], bins=10, alpha=0.7, color='blue')
-    axes[1, 0].axvline(x=results['mean_reward'], color='r', linestyle='--',
-                       label=f'Mean: {results["mean_reward"]:.2f}')
-    axes[1, 0].set_title('Reward Distribution')
-    axes[1, 0].set_xlabel('Reward')
-    axes[1, 0].set_ylabel('Frequency')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True)
-    
-    # Action analysis (if multi-dimensional)
-    if len(results['all_actions']) > 0 and len(results['all_actions'][0]) > 0:
-        actions_concat = np.concatenate(results['all_actions'], axis=0)
-        if actions_concat.shape[1] > 1:
-            # Multi-dimensional actions
-            for i in range(min(3, actions_concat.shape[1])):  # Plot first 3 action dimensions
-                axes[1, 1].plot(actions_concat[:, i], label=f'Action {i+1}', alpha=0.7)
-            axes[1, 1].set_title('Action Trajectories')
-            axes[1, 1].set_xlabel('Step')
-            axes[1, 1].set_ylabel('Action Value')
-            axes[1, 1].legend()
-        else:
-            # Single action dimension
-            axes[1, 1].plot(actions_concat[:, 0], 'purple', alpha=0.7)
-            axes[1, 1].set_title('Action Trajectory')
-            axes[1, 1].set_xlabel('Step')
-            axes[1, 1].set_ylabel('Action Value')
-        axes[1, 1].grid(True)
-    else:
-        axes[1, 1].text(0.5, 0.5, 'No Action Data', ha='center', va='center',
-                        transform=axes[1, 1].transAxes)
-        axes[1, 1].set_title('Actions')
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Evaluation plots saved to: {save_path}")
-    
-    plt.show()
-    
-    return fig
+            plt.tight_layout()
+            
+            # Create output filename with timestamp
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            plot_filename = f'evaluation_results_{timestamp}.png'
+            plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            print(f"\nPlots saved as {plot_filename}")
+            del eval_rollout
+            return eval_reward
+            
+    except Exception as e:
+        print(f"Unexpected error in evaluation: {str(e)}")
+        raise
+    finally:
+        env.set_evaluation_mode(False)
