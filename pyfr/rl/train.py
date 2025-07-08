@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from collections import defaultdict
 from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
+from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, MLP
 from torchrl.envs import (
     Compose,
     DoubleToFloat,
@@ -14,8 +14,8 @@ from torchrl.envs import (
     StepCounter,
     TransformedEnv,
 )
-from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector, MultiaSyncDataCollector
-from torchrl.collectors.distributed import DistributedDataCollector, RPCDataCollector
+from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
+from torchrl.collectors.distributed import DistributedDataCollector
 from torchrl.envs import EnvCreator
 from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
@@ -31,16 +31,19 @@ from torch.utils.tensorboard import SummaryWriter
 import time
 
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
-    # Device setup
-    #device = torch.device('cuda' if backend_name in ['cuda', 'hip'] else 'cpu')
-    device = torch.device('cpu')
-    #device = torch.device('cuda')
-
     # Get config path at the start
     if hasattr(cfg_file, 'name'):
         cfg_path = cfg_file.name
     else:
         cfg_path = cfg_file
+
+    # Read the config file content, will be later stored in checkpoint
+    try:
+        with open(cfg_path, 'r') as f:
+            config_content = f.read()
+    except Exception as e:
+        print(f"Warning: Could not read config file: {e}")
+        config_content = None
 
     # Initialize environment
     env = PyFREnvironment(mesh_file, cfg_path, backend_name, ic_dir=ic_dir, print_diagnostic=True)
@@ -53,6 +56,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     hp = HyperParameters.from_config(env.cfg)
     # Calculate derived parameters using environment info
     hp._calculate_derived(env)
+
+    device = torch.device(hp.torch_device)
 
     # Adjust num_minibatches if it does not divide frames_per_batch evenly
     sub_batch_size = hp.frames_per_batch // hp.desired_num_minibatches
@@ -69,29 +74,42 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     hp.print_summary()
 
-     # Actor network with proper output handling
+    # Actor network with proper output handling
     action_dim = env.action_spec_unbatched.shape[-1]
     input_shape = env.observation_spec["observation"].shape
-    actor_mlp = nn.Sequential(
-        nn.Linear(input_shape[-1], hp.num_cells_policy),
-        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
-        nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        nn.Tanh(),
-        nn.Linear(hp.num_cells_policy, action_dim),  # only means are output
-    ).to(device)
+    actor_mlp = MLP(
+        in_features=input_shape[-1],
+        out_features=action_dim if hp.state_ind_normal_scale else 2*action_dim,
+        depth=hp.num_hidden_layers_policy,
+        num_cells=hp.num_cells_policy,
+        activation_class=getattr(nn, hp.activation_policy),
+        device=device,
+    )
+
     # Initialize policy weights
+    activation_name = hp.activation_policy.lower()
+    gain = torch.nn.init.calculate_gain(activation_name)
     for layer in actor_mlp.modules():
         if isinstance(layer, torch.nn.Linear):
-            torch.nn.init.orthogonal_(layer.weight, 1.0)
+            torch.nn.init.orthogonal_(layer.weight, gain=gain)
             layer.bias.data.zero_()
     # Add learnable scales (standard deviations)
-    actor_net = nn.Sequential(
-        actor_mlp,
-        AddStateIndependentNormalScale(
-            action_dim,  # Number of actions
-            scale_lb=1e-8,
-        ).to(device)
-    )
+    if hp.state_ind_normal_scale:
+        actor_net = nn.Sequential(
+            actor_mlp,
+            AddStateIndependentNormalScale(
+                action_dim,  # Number of actions
+                scale_lb=1e-8,
+            ).to(device)
+        )
+    else:
+        actor_net = nn.Sequential(
+            actor_mlp,
+            NormalParamExtractor(
+                scale_mapping="biased_softplus_1.0",
+                scale_lb=0.1,   # lower bound for scale
+            ).to(device)
+        )
 
     actor_module = TensorDictModule(
         actor_net,
@@ -114,13 +132,14 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     ).to(device)
 
     # Value network (critic)
-    value_net = nn.Sequential(
-        nn.Linear(input_shape[-1], hp.num_cells_value),
-        nn.Tanh(),
-        nn.Linear(hp.num_cells_value, hp.num_cells_value),
-        nn.Tanh(),
-        nn.Linear(hp.num_cells_value, 1)
-    ).to(device)
+    value_net = MLP(
+        in_features=input_shape[-1],
+        out_features=1,
+        depth=hp.num_hidden_layers_value,
+        num_cells=hp.num_cells_value,
+        activation_class=getattr(nn, hp.activation_value),
+        device=device,
+    )
 
     value_module = ValueOperator(
         module=value_net,
@@ -150,22 +169,10 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     #optim, hp.total_frames // hp.frames_per_batch, 0.0
     #)
-    
-    # Get SLURM configuration
-    ntasks = int(os.environ.get('SLURM_NTASKS', 1))
-    gpus_per_task = int(os.environ.get('SLURM_GPUS_PER_TASK', 0))
-    nnodes = int(os.environ.get('SLURM_NNODES', 1))
-    cpus_on_node = int(os.environ.get('SLURM_CPUS_ON_NODE', 1))
-    gpus_on_node = int(os.environ.get('SLURM_GPUS_ON_NODE', 1))
-    cpus_per_task = int(os.environ.get('SLURM_CPUS_PER_TASK',1))
-    
-    print(f"\nSLURM Configuration:")
-    print(f"Total tasks: {ntasks}")
-    print(f"GPUs per task: {gpus_per_task}")
-    print(f"Number of nodes: {nnodes}")
-    print(f"CPUs per node: {cpus_on_node}")
-    print(f"GPUs per node: {gpus_on_node}")
-    print(f"Calculated CPUs per task: {cpus_per_task}")
+
+    # Get number of available devices
+    num_devices = get_device_count(backend_name)
+    print(f"\nFound {num_devices} devices for backend '{backend_name}'")
 
     def make_env():
         """Create environment - SLURM handles GPU binding"""
@@ -181,7 +188,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     #kwargs = {"backend": "gloo"}
     collector = DistributedDataCollector(
-        create_env_fn=[make_env]*9, #5 jobs
+        create_env_fn=[make_env]*20, #N jobs
         policy=policy,
         num_workers_per_collector=1,
         frames_per_batch=hp.frames_per_batch,
@@ -192,7 +199,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         launcher="submitit",
         slurm_kwargs={
         "timeout_min": 14000, #4320,
-        "slurm_partition": "gpu_standard",
+        "slurm_partition": "gpu_windfall",
         "slurm_account": "mashayek",
         "slurm_nodes":1,
         "slurm_ntasks_per_node":1,
@@ -218,38 +225,90 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     start_episode = 0
     current_eval_reward = None
 
+    start_batch_idx = 0
     # Load existing model if specified
     if load_model and os.path.exists(load_model):
         checkpoint = torch.load(load_model, map_location=device, weights_only=True)
         policy.load_state_dict(checkpoint['policy_state_dict'])
         value_module.load_state_dict(checkpoint['value_state_dict'])
         
-        # Handle both old and new checkpoint formats
-        current_eval_reward = checkpoint.get('current_reward', checkpoint.get('reward', None))
-        loaded_best_reward = checkpoint.get('best_reward', current_eval_reward)
+        current_eval_reward = checkpoint.get('current_reward', float('-inf'))
+        loaded_best_reward = checkpoint.get('best_reward', float('-inf'))
         start_episode = checkpoint.get('episode', 0)
-        loaded_best_episode = checkpoint.get('best_episode', start_episode)
+        loaded_best_episode = checkpoint.get('best_episode', 0)
+        start_batch_idx = checkpoint.get('batch_idx', 0) + 1
+        
+        # Get saved hyperparameters and compare with current
+        saved_hp = checkpoint.get('hyperparameters', {})
+        differences = []
+        
+        if saved_hp:
+            print("\nVerifying hyperparameters...")
+            for key, saved_value in saved_hp.items():
+                if hasattr(hp, key):
+                    current_value = getattr(hp, key)
+                    if current_value != saved_value:
+                        differences.append((key, saved_value, current_value))
+        
+        # Print differences  in hyperparameters if any exist
+        if differences:
+            # Define consistent column widths
+            key_width = 22
+            val_width = 20
+            
+            # Create separator lines with exact matching widths
+            key_sep = '─' * (key_width + 2)  # +2 for padding spaces
+            val_sep = '─' * (val_width + 2)
+            
+            print("\nWARNING: Hyperparameter differences detected between checkpoint and current settings:")
+            # Add this line for the top border
+            print(f"┌{key_sep}┬{val_sep}┬{val_sep}┐")
+            print(f"│ {'Key':<{key_width}} │ {'Checkpoint Value':<{val_width}} │ {'Current Value':<{val_width}} │")
+            print(f"├{key_sep}┼{val_sep}┼{val_sep}┤")
+            for key, saved, current in differences:
+                # Ensure consistent formatting for each row
+                print(f"│ {key:<{key_width}} │ {str(saved):<{val_width}} │ {str(current):<{val_width}} │")
+            print(f"└{key_sep}┴{val_sep}┴{val_sep}┘")
+        else:
+            print("done.")
 
-        print("\nLoaded existing model:")
-        if current_eval_reward is not None:
-            print(f"Current eval reward: {current_eval_reward:.4f}")
-        if loaded_best_reward is not None:
-            print(f"Best eval reward: {loaded_best_reward:.4f}")
-            print(f"Best reward achieved at episode: {loaded_best_episode}")
-        print(f"Current episode count: {start_episode}")
-        print(f"Model path: {load_model}\n")
+        # Compare config files if available
+        if 'config_content' in checkpoint and config_content:
+            print("\nVerifying config files...")
+            config_differences = compare_configs(checkpoint['config_content'], config_content)
+            
+            if config_differences:
+                print("\nWARNING: Config file differences detected between checkpoint and current:")
+                for line_num, ckpt_line, curr_line in config_differences:
+                    print(f"Line {line_num}:")
+                    print(f"  Checkpoint: {ckpt_line}")
+                    print(f"  Current:    {curr_line}")
+                    print()
+            else:
+                print("Config files match between checkpoint and current settings.")
 
-        # Only update best reward if loading the best model
-        if "best_model" in load_model:
+        # Print config if flag is set
+        if hasattr(hp, 'print_config_on_load') and hp.print_config_on_load and 'config_content' in checkpoint:
+            print("\n=== CHECKPOINT CONFIG FILE CONTENT ===\n")
+            print(checkpoint['config_content'])
+            print("\n=======================================\n")
+
+        print(f"\nLoaded model from: {load_model}")
+        print(f"Current eval reward: {current_eval_reward:.4f}")
+        print(f"Best eval reward from checkpoint: {loaded_best_reward:.4f}")
+        print(f"Best reward achieved at episode: {loaded_best_episode}")
+        print(f"Continuing from episode: {start_episode}\n")
+        
+        # Always update best reward if better than current
+        if isinstance(loaded_best_reward, (int, float)) and loaded_best_reward > best_eval_reward:
             best_eval_reward = loaded_best_reward
             best_eval_episode = loaded_best_episode
-        else:
-            print("Note: Loading non-best model, will track new best reward from here\n")
+            print(f"Updated best reward tracking to: {best_eval_reward:.4f}\n")
 
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
-    best_model_path = os.path.join(checkpoint_dir, 'best_model.pt')
-    latest_model_path = os.path.join(checkpoint_dir, 'latest_model.pt')
+    best_model_path = os.path.join(checkpoint_dir, 'best-model.pt')
+    latest_model_path = os.path.join(checkpoint_dir, 'latest-model.pt')
     logs = defaultdict(list)
     remaining_episodes = hp.episodes - start_episode
     pbar = tqdm(total=remaining_episodes, desc="Training", initial=start_episode)
@@ -287,9 +346,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     #print(os.path.dirname(os.path.realpath(__file__)) + os.sep + log_path)
     updates_per_batch = hp.num_epochs * (hp.frames_per_batch // sub_batch_size)
 
-    for batch_idx, tensordict_data in enumerate(collector):
+    batch_idx = start_batch_idx
+    for _, tensordict_data in enumerate(collector):
         #print(f"\nBatch {i} starting...")
-        #print_tensordict_diagnostics(tensordict_data, verbose=True)
 
         episode_count += hp.episodes_per_batch
         # Training performance metrics
@@ -343,9 +402,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             eval_reward = evaluate_policy(env, policy)
             logs["eval_reward"].append(eval_reward)
 
-            writer.add_scalar("eval/mean_reward", eval_reward, batch_idx)
+            writer.add_scalar("eval/mean_reward", eval_reward, batch_idx+1)
             # Possibly log LR
-            writer.add_scalar("train/learning_rate", optim.param_groups[0]['lr'], batch_idx)
+            writer.add_scalar("train/learning_rate", optim.param_groups[0]['lr'], batch_idx+1)
 
             # Save best model if new best achieved
             if eval_reward > best_eval_reward:
@@ -359,6 +418,11 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                     'best_reward': best_eval_reward,
                     'episode': episode_count,
                     'best_episode': best_eval_episode,
+                    'batch_idx': batch_idx,
+                    'hyperparameters': {k: v for k, v in hp.__dict__.items() 
+                                    if not k.startswith('_') and not callable(v)},
+                    'config_content': config_content,
+                    'config_path': cfg_path,
                 }, best_model_path)
 
             # Save latest model
@@ -369,6 +433,25 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 'best_reward': best_eval_reward,
                 'episode': episode_count,
                 'best_episode': best_eval_episode,
+                'batch_idx': batch_idx,
+                'hyperparameters': {k: v for k, v in hp.__dict__.items() 
+                                if not k.startswith('_') and not callable(v)},
+                'config_content': config_content,
+                'config_path': cfg_path,
+            }, os.path.join(checkpoint_dir, f'model-{batch_idx+1}.pt'))
+            # for convenience also save as latest-model.pt
+            torch.save({
+                'policy_state_dict': policy.state_dict(),
+                'value_state_dict': value_module.state_dict(),
+                'current_reward': eval_reward,
+                'best_reward': best_eval_reward,
+                'episode': episode_count,
+                'best_episode': best_eval_episode,
+                'batch_idx': batch_idx,
+                'hyperparameters': {k: v for k, v in hp.__dict__.items() 
+                                if not k.startswith('_') and not callable(v)},
+                'config_content': config_content,
+                'config_path': cfg_path,
             }, latest_model_path)
 
             eval_str = f"eval reward: {eval_reward:.5f} (best: {best_eval_reward:.5f})"
@@ -382,6 +465,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         pbar.update(hp.episodes_per_batch)
 
         #scheduler.step()
+        batch_idx += 1
 
     pbar.close()
     if episode_pbar:
@@ -430,16 +514,66 @@ def get_closest_divisor(n, target):
     closest = min(divisors, key=lambda x: (abs(x - target), -x))  # Prefer larger divisor if tie
     return closest
 
+def compare_configs(checkpoint_config, current_config):
+    """
+    Compare two config files line by line and return differences.
+    
+    Args:
+        checkpoint_config: Config content from checkpoint as string
+        current_config: Current config content as string
+        
+    Returns:
+        List of tuples with (line_number, checkpoint_line, current_line) for different lines
+    """
+    if not checkpoint_config or not current_config:
+        return []
+        
+    # Split into lines and strip whitespace
+    checkpoint_lines = [line.strip() for line in checkpoint_config.splitlines()]
+    current_lines = [line.strip() for line in current_config.splitlines()]
+    
+    # Find differences
+    differences = []
+    
+    # First, check lines that exist in both files
+    for i, (ckpt_line, curr_line) in enumerate(zip(checkpoint_lines, current_lines)):
+        # Skip empty lines and comments
+        if not ckpt_line or ckpt_line.startswith(';') or not curr_line or curr_line.startswith(';'):
+            continue
+            
+        if ckpt_line != curr_line:
+            differences.append((i+1, ckpt_line, curr_line))
+    
+    # Check if one file has more lines than the other
+    if len(checkpoint_lines) > len(current_lines):
+        for i, line in enumerate(checkpoint_lines[len(current_lines):], start=len(current_lines)):
+            if line and not line.startswith(';'):  # Skip empty lines and comments
+                differences.append((i+1, line, "[MISSING]"))
+    
+    elif len(current_lines) > len(checkpoint_lines):
+        for i, line in enumerate(current_lines[len(checkpoint_lines):], start=len(checkpoint_lines)):
+            if line and not line.startswith(';'):  # Skip empty lines and comments
+                differences.append((i+1, "[MISSING]", line))
+    
+    return differences
 @dataclass
 class HyperParameters:
+    # General settings
+    torch_device: str = 'cpu'  # 'cuda', 'cpu'
+    print_config_on_load: bool = False # set to True to view config file content on model load
     # Network architecture
+    num_hidden_layers_policy: int = 2
+    num_hidden_layers_value: int = 2
     num_cells_policy: int = 512
     num_cells_value: int = 512
+    activation_policy: str = 'Tanh'
+    activation_value: str = 'Tanh'
+    state_ind_normal_scale: bool = False
     
     # Training schedule
     episodes: int = 1200
     episodes_per_batch: int = 20
-    desired_num_minibatches: int = 16
+    desired_num_minibatches: int = 20
     num_epochs: int = 10
     
     # PPO parameters
@@ -495,9 +629,18 @@ class HyperParameters:
     def print_summary(self) -> None:
         """Print hyperparameter summary with sections and sources"""
         sections = {
+            "General Settings": [
+                ("torch_device", "'cuda' or 'cpu'"),
+                ("print_config_on_load", "Print config file content on model load"),
+            ],
             "Network Architecture": [
+                ("num_hidden_layers_policy", "No. of hidden layers in policy network"),
+                ("num_hidden_layers_value", "No. of hidden layers in value network"),
                 ("num_cells_policy", "Size of policy network hidden layers"),
-                ("num_cells_value", "Size of value network hidden layers")
+                ("num_cells_value", "Size of value network hidden layers"),
+                ("activation_policy", "Activation function for policy network"),
+                ("activation_value", "Activation function for value network"),
+                ("state_ind_normal_scale", "state-independent normal scale for actions"),
             ],
             "Training Schedule": [
                 ("episodes", "Total training episodes"),
@@ -523,78 +666,99 @@ class HyperParameters:
             ]
         }
 
-        def format_line(param: str, value: Any, desc: str, source: str) -> str:
-            if param in self._derived_params:
-                src_mark = "[-]"
-            else:
-                src_mark = "[C]" if source == "config" else "[D]"
-            return f"| {param:<25} | {str(value):<15} | {src_mark:<5} | {desc:<40} |"
+        # Define consistent column widths
+        param_width = 25
+        value_width = 15
+        src_width = 5
+        desc_width = 40
+        
+        # Line breaking function for descriptions
+        def wrap_text(text, width):
+            """Wrap text to fit within width"""
+            if len(text) <= width:
+                return [text]
+            
+            words = text.split()
+            lines = []
+            current_line = []
+            current_length = 0
+            
+            for word in words:
+                if current_length + len(word) + len(current_line) <= width:
+                    current_line.append(word)
+                    current_length += len(word)
+                else:
+                    if current_line:
+                        lines.append(' '.join(current_line))
+                    current_line = [word]
+                    current_length = len(word)
+            
+            if current_line:
+                lines.append(' '.join(current_line))
+            return lines
+        
+        # Box drawing characters for continuous tables
+        h_line = "─"
+        v_line = "│"
+        tl_corner = "┌"
+        tr_corner = "┐"
+        bl_corner = "└"
+        br_corner = "┘"
+        t_down = "┬"
+        t_up = "┴"
+        t_right = "├"
+        t_left = "┤"
+        cross = "┼"
+        
+        # Create horizontal lines
+        top_line = f"{tl_corner}{h_line * (param_width + 2)}{t_down}{h_line * (value_width + 2)}{t_down}{h_line * (src_width + 2)}{t_down}{h_line * (desc_width + 2)}{tr_corner}"
+        mid_line = f"{t_right}{h_line * (param_width + 2)}{cross}{h_line * (value_width + 2)}{cross}{h_line * (src_width + 2)}{cross}{h_line * (desc_width + 2)}{t_left}"
+        bot_line = f"{bl_corner}{h_line * (param_width + 2)}{t_up}{h_line * (value_width + 2)}{t_up}{h_line * (src_width + 2)}{t_up}{h_line * (desc_width + 2)}{br_corner}"
+        
+        def format_row(param, value, source, desc_line, is_continuation=False):
+            """Format a single row of the table"""
+            # Leave source empty for continuation lines
+            src_display = "" if is_continuation else source
+            return f"{v_line} {param:<{param_width}} {v_line} {str(value):<{value_width}} {v_line} {src_display:<{src_width}} {v_line} {desc_line:<{desc_width}} {v_line}"
 
-        def print_header():
-            return (f"| {'Parameter':<25} | {'Value':<15} | {'Src':<5} | {'Description':<40} |\n" + 
-                   f"|{'-'*27}|{'-'*17}|{'-'*7}|{'-'*42}|")
+        def format_header():
+            """Format the table header with correct column names"""
+            return f"{v_line} {'Parameter':<{param_width}} {v_line} {'Value':<{value_width}} {v_line} {'Src':<{src_width}} {v_line} {'Description':<{desc_width}} {v_line}"
 
         print("\nHyperparameters Configuration")
-        print("=" * 98)
-
+        
         for section_name, params in sections.items():
             print(f"\n{section_name}:")
-            print("=" * 98)
-            print(print_header())
+            print(top_line)
+            print(format_header())
+            print(mid_line)
             
             for param_name, description in params:
                 value = getattr(self, param_name)
-                source = self._param_sources.get(param_name, 'derived')
-                print(format_line(param_name, value, description, source))
-            
-            print("-" * 98)
+                
+                # Determine source marker
+                if param_name in self._derived_params:
+                    source = "[-]"
+                elif param_name in self._param_sources and self._param_sources[param_name] == "config":
+                    source = "[C]"
+                else:
+                    source = "[D]"
+                
+                # Handle multi-line descriptions
+                desc_lines = wrap_text(description, desc_width)
+                
+                # Print first line with parameter info
+                print(format_row(param_name, value, source, desc_lines[0]))
+                
+                # Print continuation lines if any
+                for line in desc_lines[1:]:
+                    # Empty strings for param and value, and is_continuation=True to not show source
+                    print(format_row("", "", "", line, is_continuation=True))
+                
+            print(bot_line)
 
         # Print legend
         print("\nSource: [C]=From .ini config file, [D]=Default, [-]=Derived")
-
-def print_tensordict_diagnostics(td, verbose=True):
-    """Enhanced diagnostics for debugging episode counting"""
-    print("\n=== TensorDict Diagnostics ===")
-    print("\nTensorDict Structure:")
-    print("-" * 80)
-    
-    # Print all top-level keys
-    print("Top-level keys:", td.keys())
-    
-    # Print nested keys
-    if "next" in td.keys():
-        print("\nNested 'next' keys:", td["next"].keys())
-    
-    print("\nBatch Information:")
-    print(f"Batch size: {td.batch_size}")
-    print(f"Device: {td.device}")
-    
-    print("\nDone Flags Status:")
-    print("-" * 80)
-    print(f"done shape: {td['done'].shape}")
-    print(f"done values: {td['done'].cpu().numpy()}")
-    print(f"terminated values: {td['terminated'].cpu().numpy()}")
-    print(f"truncated values: {td['truncated'].cpu().numpy()}")
-    
-    if "next" in td.keys():
-        print("\nNext State Done Flags:")
-        print(f"next done values: {td['next', 'done'].cpu().numpy()}")
-        print(f"next terminated values: {td['next', 'terminated'].cpu().numpy()}")
-        print(f"next truncated values: {td['next', 'truncated'].cpu().numpy()}")
-    
-    if verbose:
-        print("\nStep-by-Step Transition Details:")
-        print("-" * 80)
-        for i in range(td.batch_size[0]):
-            print(f"\nTransition {i}:")
-            print(f"Step count: {td['step_count'][i].cpu().item()}")
-            print(f"Action: {td['action'][i].cpu().numpy()}")
-            print(f"Reward: {td['next', 'reward'][i].cpu().item():.4f}")
-            print(f"Done flags: done={td['done'][i].cpu().item()}, "
-                  f"terminated={td['terminated'][i].cpu().item()}, "
-                  f"truncated={td['truncated'][i].cpu().item()}")
-    
-    print("\n" + "="*80)
 
 def get_device_count(backend_name):
     """Get number of available devices for given backend"""
@@ -606,22 +770,3 @@ def get_device_count(backend_name):
         return CUDA().device_count()
     else:
         return 1  # For CPU backends like 'openmp'
-    
-def get_slurm_gpu_info():
-    """Get allocated GPU information from SLURM"""
-    total_gpus = int(os.environ.get('SLURM_GPUS', 0))
-    # Also check SLURM_GPUS_ON_NODE for total GPUs allocated to this node
-    gpus_on_node = int(os.environ.get('SLURM_GPUS_ON_NODE', 0))
-    node_id = int(os.environ.get('SLURM_NODEID', 0))
-    local_id = int(os.environ.get('SLURM_LOCALID', 0))
-    
-    # Get visible GPUs for this process
-    visible_gpus = os.environ.get('CUDA_VISIBLE_DEVICES', '')
-    local_gpus = [int(x) for x in visible_gpus.split(',')] if visible_gpus else []
-    
-    print(f"\nSLURM GPU allocation for node {node_id}:")
-    print(f"Total GPUs allocated across all nodes: {total_gpus}")
-    print(f"GPUs on this node: {gpus_on_node}")
-    print(f"Local process ID: {local_id}")
-    print(f"Visible GPUs: {local_gpus}")
-    return total_gpus, local_gpus, node_id, local_id

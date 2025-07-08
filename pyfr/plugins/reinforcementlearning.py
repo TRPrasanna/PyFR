@@ -4,6 +4,9 @@ from pyfr.plugins.sampler import _closest_pts, _plocs_to_tlocs
 from pyfr.mpiutil import get_comm_rank_root, mpi
 import numpy as np
 import torch
+import ast
+import operator
+import math
 from collections import defaultdict
 from pyfr.plugins.base import BaseSolnPlugin, SurfaceMixin
 from scipy.integrate import trapezoid
@@ -18,9 +21,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         super().__init__(intg, cfgsect, suffix)
 
         comm, rank, root = get_comm_rank_root()
-        #self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        #self.device = torch.device('cuda')
-        self.device = torch.device('cpu')
+        self.device = torch.device('cpu') # check: find a way to use value from config
         # Get sampling points configuration
         self.pts = self.cfg.getliteral(cfgsect, 'probe-pts')
         self.fmt = self.cfg.get(cfgsect, 'format', 'primitive')
@@ -29,11 +30,22 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         self._setup_sampling(intg)
         
         # Calculate observation size based on probe points and variables
-        nvars = len(self.elementscls.privarmap[self.ndims]) if self.fmt == 'primitive' else len(self.elementscls.convarmap[self.ndims])
-        # new: samples + mean Cm + var Cm
-        self.observation_size = len(self.pts) * 2 + 2
-
-        self.nvars = nvars
+        default_var_list = ['u', 'v', 'p']
+        var_string = self.cfg.get(cfgsect, 'observation-variables',
+                                  ','.join(default_var_list))
+        self.obs_var_names = [v.strip() for v in var_string.replace(',', ' ').split()]
+        primitive_names = list(self.elementscls.privarmap[self.ndims]) # e.g. 2-D: ['rho', 'u', 'v', 'p'] (compressible, check for inc.)
+        try:
+            self.var_indices = [primitive_names.index(v) for v in self.obs_var_names]
+        except ValueError as err:
+            raise ValueError(f"[reinforcementlearning] observation-variables: "
+                             f"unknown name in {self.obs_var_names}; "
+                             f"valid choices: {primitive_names}") from err
+        self.observation_size = len(self.pts) * len(self.var_indices)
+        self.obs_var_names = [v.strip() for v in var_string.replace(',', ' ').split()] # to print for diagnostics
+        #nvars = len(self.elementscls.privarmap[self.ndims]) if self.fmt == 'primitive' else len(self.elementscls.convarmap[self.ndims])
+        #self.observation_size = len(self.pts) #* 2 #* 3 # * nvars for all variables
+        #self.nvars = nvars
         
         # Rest of initialization
         self.action_interval = self.cfg.getfloat(cfgsect, 'action-interval', 0.1)
@@ -100,6 +112,33 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         self.moment_history = []
         self.action_history = []
         self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
+        
+        # Read reward function configuration
+        self.reward_function = self.cfg.get(cfgsect, 'reward-function', 
+                                           '-abs(avg_moment)')  # Default reward
+        
+        # Configure statistics options
+        self.normalize_reward = self.cfg.getbool(cfgsect, 'normalize-reward', False)
+        
+        # Reference values for normalization (optional) - now from main section
+        self.ref_values = {}
+        if self.normalize_reward:
+            # Look for reference values directly in the main section
+            for key in ['drag-ref', 'lift-ref', 'moment-ref', 'action-ref']:
+                if self.cfg.hasopt(cfgsect, key):
+                    # Store with simplified keys (without the -ref suffix)
+                    simple_key = key.replace('-ref', '')
+                    self.ref_values[simple_key] = self.cfg.getfloat(cfgsect, key)
+        
+        # Initialize expression evaluator
+        self.expr_evaluator = SafeExpressionEvaluator()
+        
+        # Determine which variables are used in the reward function
+        self.used_variables = self.expr_evaluator.find_used_variables(self.reward_function)
+        
+        # Print summary of which metrics will be calculated
+        #print(f"Reward function: {self.reward_function}")
+        #print(f"Variables used in reward function: {', '.join(sorted(self.used_variables))}")
 
     def _init_surface(self, intg, bc, surf):
         """Initialize matrices for a single surface"""
@@ -166,10 +205,9 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         current_control_value = (current_control_target-previous_control_target)/intg.system.env.action_interval*(intg.tcurr-intg.system.env.current_time) + previous_control_target
         lower_bound = np.minimum(previous_control_target,current_control_target)
         upper_bound = np.maximum(previous_control_target,current_control_target)
-        current_control_value = np.maximum(lower_bound, np.minimum(current_control_value, upper_bound));
+        current_control_value = np.maximum(lower_bound, np.minimum(current_control_value, upper_bound))
         #Q = (Q1-Q0)/Ta * (t-t0) + Q0; but this ramping behaviour may change in future; check
         #print(f"Current control value: {current_control_value}", previous_control_target, current_control_target)
-        # values will overshoot range [Q0,Q1] if dt is large; fix this before using
 
         # store sum of absolute values of actions
         #self.sumabsact = np.sum(np.abs(current_control_value))+abs(np.sum(current_control_value)) # DRL jets + opposing ZNMF jet
@@ -397,52 +435,110 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             samples = self.elementscls.con_to_pri(np.array(samples).T, self.cfg)
             samples = np.array(samples).T
 
-            # Extract only u,v velocities, p (indices 1,2,3 in primitive variables)
-            var_indices = [1,2] #[1, 2, 3]  # u,v,p are at indices 1,2,3 (after density)
-            samples = samples[:, var_indices]
-            
+            # Extract rho, u, v, p from samples depending on requested variables
+            samples = samples[:, self.var_indices]
+
         # Convert to tensor of 32-bit floats, check
         #print(f"Samples: {samples}")
         obs = torch.tensor(samples, device=self.device).flatten().float()
+        return obs
 
-        # --- extra MDP features: mean and variance of Cm ---
-        if self.force_times:
-            t0, t1 = self.force_times[0], self.force_times[-1]
-            dt = t1 - t0
-            avg_m = trapezoid(self.moment_history, self.force_times) / dt
-            ms_m  = trapezoid([m*m for m in self.moment_history], self.force_times) / dt
-            var_m = ms_m - avg_m*avg_m
-        else:
-            avg_m = var_m = 0.0
-
-        extra = torch.tensor([avg_m, var_m], device=self.device, dtype=torch.float32)
-        return torch.cat((obs, extra), dim=0)
-
+    def _compute_std(self, history, mean):
+        """Compute time-weighted standard deviation of a signal"""
+        if len(history) <= 1 or len(self.force_times) <= 1:
+            return 0.0
+            
+        # Calculate squared differences from mean
+        sq_diffs = [(x - mean)**2 for x in history]
+        
+        # Integrate squared differences over time
+        variance = trapezoid(y=sq_diffs, x=self.force_times) / (self.force_times[-1] - self.force_times[0])
+        
+        # Return standard deviation
+        return np.sqrt(variance)
 
     def _get_reward(self, solver):
-        """Compute reward using stored force history"""
-
-        # Time-averaged forces using trapezoid rule
-        delta_t = self.force_times[-1] - self.force_times[0]
-        #avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
-        avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
-        avg_sumabsact = trapezoid(y=self.action_history, x=self.force_times) / delta_t
-        avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
-        ms_moment = trapezoid(y=[m**2 for m in self.moment_history],
-                              x=self.force_times) / delta_t # mean-square moment
-        var_moment = ms_moment - avg_moment**2 #variance = E[Cm^2] - (E[Cm])^2
-
-        #print("averaging over time ", self.force_times[-1] - self.force_times[0])
-
-        # Combined reward: -0.8*<C_d> - 0.2*|<C_l>| : Cylinder
-        # -|<C_m>| : Airfoil
-        #reward = - abs(avg_moment+0.1625)
-        #reward = -(avg_drag-0.0284) - 0.2 * abs(avg_lift-0.1034) #- 0.05/3.0*(2.0*avg_sumabsact)
-        #reward = -(avg_drag-0.1608) - 0.2 * abs(avg_lift-0.5428) # free case
-        #reward = -avg_drag
-        reward = - 0.65*((avg_moment/5.883649e-02)**2) - 0.2* (((avg_lift-0.5428)/1.458435e-01)**2) - 0.1*var_moment/(5.883649e-02)**2 - 0.05 * avg_sumabsact/1.433533e+01 # 6.0*1.5457105**2
-        return float(reward)
+        """Compute reward using stored force history and configured reward function"""
+        if not self.force_times:
+            return 0.0  # No data yet
+            
+        variables = {}  # Dictionary to hold only needed variables
         
+        # Only calculate time-averaged values if needed
+        needs_avg_drag = 'avg_drag' in self.used_variables
+        needs_avg_lift = 'avg_lift' in self.used_variables
+        needs_avg_moment = 'avg_moment' in self.used_variables
+        needs_avg_sumabsact = 'avg_sumabsact' in self.used_variables
+        
+        # Standard deviations
+        needs_std_drag = 'std_drag' in self.used_variables
+        needs_std_lift = 'std_lift' in self.used_variables
+        needs_std_moment = 'std_moment' in self.used_variables
+        
+        # Get time window for integration
+        delta_t = self.force_times[-1] - self.force_times[0]
+        if delta_t <= 0:
+            return 0.0  # Avoid division by zero
+        
+        # Calculate only the requested averages
+        if needs_avg_drag:
+            variables['avg_drag'] = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
+            
+        if needs_avg_lift:
+            variables['avg_lift'] = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+            
+        if needs_avg_moment and self._mcomp and self.moment_history:
+            variables['avg_moment'] = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
+        elif needs_avg_moment:
+            variables['avg_moment'] = 0.0
+            
+        if needs_avg_sumabsact:
+            variables['avg_sumabsact'] = trapezoid(y=self.action_history, x=self.force_times) / delta_t
+        
+        # Calculate only the requested standard deviations
+        if needs_std_drag:
+            if not needs_avg_drag:  # Calculate avg_drag if not already done
+                avg_drag = trapezoid(y=self.drag_history, x=self.force_times) / delta_t
+            else:
+                avg_drag = variables['avg_drag']
+            variables['std_drag'] = self._compute_std(self.drag_history, avg_drag)
+            
+        if needs_std_lift:
+            if not needs_avg_lift:  # Calculate avg_lift if not already done
+                avg_lift = trapezoid(y=self.lift_history, x=self.force_times) / delta_t
+            else:
+                avg_lift = variables['avg_lift']
+            variables['std_lift'] = self._compute_std(self.lift_history, avg_lift)
+            
+        if needs_std_moment and self._mcomp and self.moment_history:
+            if not needs_avg_moment:  # Calculate avg_moment if not already done
+                avg_moment = trapezoid(y=self.moment_history, x=self.force_times) / delta_t
+            else:
+                avg_moment = variables['avg_moment']
+            variables['std_moment'] = self._compute_std(self.moment_history, avg_moment)
+        elif needs_std_moment:
+            variables['std_moment'] = 0.0
+        
+        # Normalize values if configured
+        if self.normalize_reward:
+            # Only normalize values that are used and have reference values
+            for var_name, value in list(variables.items()):
+                base_name = var_name.split('_')[1]  # Extract 'drag', 'lift', etc.
+                if base_name in self.ref_values and self.ref_values[base_name] != 0:
+                    variables[var_name] = value / self.ref_values[base_name]
+
+        #print(f"manual reward={-np.abs(variables.get('avg_moment'))-2.0*variables.get('std_moment')}")
+        #print(f"manual reward={-np.abs(variables.get('avg_moment')+0.01)-2.0*variables.get('std_moment')**2}")
+        try:
+            # Safely evaluate the reward function using AST
+            reward = float(self.expr_evaluator.evaluate(self.reward_function, variables))
+            #print(f"ast reward = {reward}")
+            return reward
+        except Exception as e:
+            print(f"Error evaluating reward function: {e}")
+            # Fall back to a simple default reward
+            default_reward = -1000.0
+            return default_reward
 
     def reset(self):
         #self.latest_observation.zero_()
@@ -483,3 +579,106 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         gradu, nu = du[:, 1:], self._constants['nu']
 
         return -nu*(gradu + gradu.swapaxes(0, 1))
+    
+class SafeExpressionEvaluator:
+    """
+    Evaluate a restricted mathematical expression safely.
+
+    Allowed:
+        • numeric literals
+        • variables passed in `variables`
+        • +  –  *  /  **  unary ±
+        • abs, sqrt, exp, log, log10, sin, cos, tan, min, max
+        • constants: pi, e
+    Anything else (attributes, subscripts, comparisons, etc.) raises ValueError.
+    """
+
+    _OPS = {
+        ast.Add:  operator.add,
+        ast.Sub:  operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div:  operator.truediv,
+        ast.Pow:  operator.pow,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+    }
+
+    _FUNCS = {
+        'abs':   abs,
+        'sqrt':  math.sqrt,
+        'exp':   math.exp,
+        'log':   math.log,      # natural
+        'log10': math.log10,
+        'sin':   math.sin,
+        'cos':   math.cos,
+        'tan':   math.tan,
+        'min':   min,
+        'max':   max,
+    }
+
+    _CONST = {'pi': math.pi, 'e': math.e}
+
+    # ------------------------------------------------------------------ public
+    def evaluate(self, expr: str, variables: dict | None = None) -> float:
+        """Return the numeric value of *expr* given *variables*."""
+        variables = variables or {}
+
+        try:
+            tree = ast.parse(expr, mode='eval')
+        except SyntaxError as err:
+            raise ValueError(f"Invalid expression: {err}") from None
+
+        return float(self._eval(tree.body, variables))
+
+    def find_used_variables(self, expr: str) -> set[str]:
+        """Return the set of variable names that the expression contains."""
+        try:
+            tree = ast.parse(expr, mode='eval')
+        except SyntaxError:
+            return set()
+
+        vars_: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                if node.id not in self._FUNCS and node.id not in self._CONST:
+                    vars_.add(node.id)
+        return vars_
+
+    # ----------------------------------------------------------------- private
+    def _eval(self, node: ast.AST, env: dict[str, float]) -> float:
+        """Recursive AST interpreter."""
+
+        # ----- literals -------------------------------------------------------
+        if isinstance(node, ast.Constant):        # Py ≥ 3.8
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("Only numeric literals are allowed")
+
+        # ----- identifiers ----------------------------------------------------
+        if isinstance(node, ast.Name):
+            if node.id in env:
+                return env[node.id]
+            if node.id in self._CONST:
+                return self._CONST[node.id]
+            raise ValueError(f"Unknown variable: {node.id}")
+
+        # ----- unary + / - ----------------------------------------------------
+        if isinstance(node, ast.UnaryOp) and type(node.op) in self._OPS:
+            return self._OPS[type(node.op)](self._eval(node.operand, env))
+
+        # ----- binary operators ----------------------------------------------
+        if isinstance(node, ast.BinOp) and type(node.op) in self._OPS:
+            left  = self._eval(node.left,  env)
+            right = self._eval(node.right, env)
+            return self._OPS[type(node.op)](left, right)
+
+        # ----- function calls -------------------------------------------------
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fname = node.func.id
+            if fname not in self._FUNCS:
+                raise ValueError(f"Function not allowed: {fname}")
+            args = [self._eval(arg, env) for arg in node.args]
+            return self._FUNCS[fname](*args)
+
+        # ----- anything else --------------------------------------------------
+        raise ValueError(f"Unsupported expression element: {ast.dump(node, annotate_fields=False)}")
