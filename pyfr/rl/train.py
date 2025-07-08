@@ -200,7 +200,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         slurm_kwargs={
         "timeout_min": 14000, #4320,
         "slurm_partition": "gpu_windfall",
-        "slurm_account": "mashayek",
+        #"slurm_account": "mashayek",
         "slurm_nodes":1,
         "slurm_ntasks_per_node":1,
         "slurm_cpus_per_task": 14,

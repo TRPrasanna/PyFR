@@ -1,8 +1,11 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor
+import os
+import sys
+import time
+from tensordict.nn import TensorDictModule, AddStateIndependentNormalScale
+from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, MLP
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.envs import (
     Compose,
@@ -11,56 +14,116 @@ from torchrl.envs import (
     TransformedEnv,
 )
 import matplotlib.pyplot as plt
-from .train import HyperParameters
+from .train import HyperParameters, compare_configs
 from pyfr.inifile import Inifile
 from pyfr.readers.native import NativeReader
 from pyfr.rl.env import PyFREnvironment
 
+
 def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, episodes=1):
     """Evaluate trained policy"""
-    #device = torch.device('cuda')
-    device = torch.device('cpu')
-
     # Get config path at the start
     if hasattr(cfg_file, 'name'):
         cfg_path = cfg_file.name
     else:
         cfg_path = cfg_file
 
-    env = PyFREnvironment(mesh_file, cfg_path, backend_name, ic_dir=ic_dir, print_diagnostic=True)
-    #env = TransformedEnv(env,Compose(StepCounter(), DoubleToFloat()))
-    env = TransformedEnv(env,StepCounter())
+    # Read the config file content for comparison
+    try:
+        with open(cfg_path, 'r') as f:
+            config_content = f.read()
+    except Exception as e:
+        print(f"Warning: Could not read config file: {e}")
+        config_content = None
 
-    if 'neuralnetwork-hyperparameters' not in env.cfg.sections():
-        print("No neuralnetwork-hyperparameters section found in config file. Proceeding to use default hyperparameters.")
+    # Initialize environment
+    env = PyFREnvironment(mesh_file, cfg_path, backend_name, 
+                          ic_dir=ic_dir, print_diagnostic=True)
+    env = TransformedEnv(env, StepCounter())
 
-    hp = HyperParameters.from_config(env.cfg)
-
-    # Load policy
-    checkpoint = torch.load(load_model, map_location=device, weights_only=True)
+    # Load model checkpoint
+    if not os.path.exists(load_model):
+        print(f"Error: Model file not found: {load_model}")
+        sys.exit(1)
+        
+    device = torch.device('cpu')  # Use CPU for evaluation by default
+    checkpoint = torch.load(load_model, map_location=device)
     
+    # First try to use hyperparameters from checkpoint, fall back to config file
+    if 'hyperparameters' in checkpoint:
+        print("Using hyperparameters from checkpoint")
+        hp_dict = checkpoint['hyperparameters']
+        hp = HyperParameters()
+        for key, value in hp_dict.items():
+            if hasattr(hp, key):
+                setattr(hp, key, value)
+        # Still calculate derived parameters
+        hp._calculate_derived(env)
+    else:
+        print("No hyperparameters in checkpoint, using values from config file")
+        if 'neuralnetwork-hyperparameters' not in env.cfg.sections():
+            print("No neuralnetwork-hyperparameters section found in config file. Using default hyperparameters.")
+        hp = HyperParameters.from_config(env.cfg)
+        hp._calculate_derived(env)
+
+    # Compare config files if both are available
+    if 'config_content' in checkpoint and config_content:
+        print("\nVerifying config files...")
+        config_differences = compare_configs(checkpoint['config_content'], config_content)
+        
+        if config_differences:
+            print("\nWARNING: Config file differences detected between checkpoint and current:")
+            for line_num, ckpt_line, curr_line in config_differences:
+                print(f"Line {line_num}:")
+                print(f"  Checkpoint: {ckpt_line}")
+                print(f"  Current:    {curr_line}")
+                print()
+        else:
+            print("Config files match between checkpoint and current settings.")
+
+    # Print config if flag is set
+    if hasattr(hp, 'print_config_on_load') and hp.print_config_on_load and 'config_content' in checkpoint:
+        print("\n=== CHECKPOINT CONFIG FILE CONTENT ===\n")
+        print(checkpoint['config_content'])
+        print("\n=======================================\n")
+
+    # Actor network with proper output handling
     action_dim = env.action_spec_unbatched.shape[-1]
     input_shape = env.observation_spec["observation"].shape
-    actor_mlp = nn.Sequential(
-        nn.Linear(input_shape[-1], hp.num_cells_policy),
-        nn.Tanh(), # tanh activation function is most commonly used for small networks for PPO
-        nn.Linear(hp.num_cells_policy, hp.num_cells_policy),
-        nn.Tanh(),
-        nn.Linear(hp.num_cells_policy, action_dim),  # only means are output
-    ).to(device)
-    # Initialize policy weights
+    
+    # Create actor network with same architecture as train.py
+    actor_mlp = MLP(
+        in_features=input_shape[-1],
+        out_features=action_dim if hp.state_ind_normal_scale else 2*action_dim,
+        depth=hp.num_hidden_layers_policy,
+        num_cells=hp.num_cells_policy,
+        activation_class=getattr(nn, hp.activation_policy),
+        device=device,
+    )
+
+    # Initialize weights for consistency with training
     for layer in actor_mlp.modules():
         if isinstance(layer, torch.nn.Linear):
             torch.nn.init.orthogonal_(layer.weight, 1.0)
             layer.bias.data.zero_()
-    # Add learnable scales (standard deviations)
-    actor_net = nn.Sequential(
-        actor_mlp,
-        AddStateIndependentNormalScale(
-            action_dim,  # Number of actions
-            scale_lb=1e-8,
-        ).to(device)
-    )
+            
+    # Add learnable scales (standard deviations) - matching train.py exactly
+    if hp.state_ind_normal_scale:
+        actor_net = nn.Sequential(
+            actor_mlp,
+            AddStateIndependentNormalScale(
+                action_dim,  # Number of actions
+                scale_lb=1e-8,
+            ).to(device)
+        )
+    else:
+        actor_net = nn.Sequential(
+            actor_mlp,
+            NormalParamExtractor(
+                scale_mapping="biased_softplus_1.0",
+                scale_lb=0.1,   # lower bound for scale
+            ).to(device)
+        )
 
     actor_module = TensorDictModule(
         actor_net,
@@ -73,23 +136,23 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        return_log_prob=True,
+        return_log_prob=False,  # Set to False for evaluation
         distribution_kwargs={
-        "low": env.action_spec.space.low,
-        "high": env.action_spec.space.high,
-        "tanh_loc": False,
+            "low": env.action_spec.space.low,
+            "high": env.action_spec.space.high,
+            "tanh_loc": False,
         },
-        #safe = True
     ).to(device)
     
     policy.load_state_dict(checkpoint['policy_state_dict'])
-    #policy.eval()
+    policy.eval()  # Set to evaluation mode
 
-    # Get stored rewards
+    # Get stored rewards and episodes
     current_reward = checkpoint.get('current_reward', checkpoint.get('reward', None))
     best_reward = checkpoint.get('best_reward', current_reward)
     saved_episode = checkpoint.get('episode', 0)
     best_episode = checkpoint.get('best_episode', saved_episode)
+    batch_idx = checkpoint.get('batch_idx', None)
 
     print("\nModel Information:")
     print("-" * 40)
@@ -99,16 +162,26 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         print(f"Best reward: {best_reward:.4f}")
         print(f"Best reward at episode: {best_episode}")
     print(f"Model saved at episode: {saved_episode}")
+    if batch_idx is not None:
+        print(f"Model saved at batch: {batch_idx}")
     print(f"Model path: {load_model}")
+
+    # Print network architecture summary
+    print("\nNetwork Architecture:")
+    print("-" * 40)
+    print(f"Input shape: {input_shape}")
+    print(f"Output shape: {action_dim}")
+    print(f"Hidden layers: {hp.num_hidden_layers_policy}")
+    print(f"Hidden units: {hp.num_cells_policy}")
+    print(f"Activation: {hp.activation_policy}")
+    print(f"State-independent normal scale: {hp.state_ind_normal_scale}")
 
     # Set evaluation mode and run
     env.set_evaluation_mode(True)
     try:
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-            print("Starting evaluation...")
+            print("\nStarting evaluation...")
             eval_rollout = env.rollout(100000, policy)
-            #print(eval_rollout)
-            #print("rewards",eval_rollout["reward"].item())
             
             # Extract data and process for plotting
             actions = eval_rollout["action"].cpu().numpy()
@@ -138,16 +211,26 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
                 row += f"{rewards[t]:>{column_width}.7e}"
                 print(row)
             
-             # Print evaluation results
+            # Calculate statistics for rewards
             eval_reward = float(np.mean(rewards))
+            eval_std = float(np.std(rewards))
+            eval_min = float(np.min(rewards))
+            eval_max = float(np.max(rewards))
+            eval_total = float(np.sum(rewards))
+            
+            # Print evaluation results with more statistics
             print("\nEvaluation Results:")
             print("-" * 40)
             print(f"Expected reward: {current_reward:.4f}")
-            print(f"Actual reward:   {eval_reward:.4f}")
-            if current_reward is not None:
-                print(f"Difference:      {((eval_reward - current_reward)/current_reward)*100:.2f}%")
+            print(f"Actual mean reward: {eval_reward:.4f}")
+            print(f"Reward std dev: {eval_std:.4f}")
+            print(f"Min/Max rewards: {eval_min:.4f} / {eval_max:.4f}")
+            print(f"Total reward: {eval_total:.4f}")
+            print(f"Number of steps: {len(rewards)}")
             
-            print("eval reward by torch mean",eval_rollout["next", "reward"].mean().item())
+            if current_reward is not None:
+                print(f"Difference from expected: {((eval_reward - current_reward)/current_reward)*100:.2f}%")
+            
             # Create evaluation plots
             fig, axes = plt.subplots(num_actions + 1, 1, 
                                    figsize=(12, 4*(num_actions + 1)),
@@ -167,10 +250,14 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
             axes[-1].legend()
 
             plt.tight_layout()
-            plt.savefig('evaluation_results.png', dpi=300, bbox_inches='tight')
+            
+            # Create output filename with timestamp
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            plot_filename = f'evaluation_results_{timestamp}.png'
+            plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
             plt.close()
             
-            print(f"\nPlots saved as evaluation_results.png")
+            print(f"\nPlots saved as {plot_filename}")
             del eval_rollout
             return eval_reward
             
