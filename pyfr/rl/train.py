@@ -397,6 +397,35 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         logs["train_reward"].append(train_reward)
         #print(f"\n Batch finished. Episode count is {episode_count}")
 
+        # Save latest model
+        torch.save({
+            'policy_state_dict': policy.state_dict(),
+            'value_state_dict': value_module.state_dict(),
+            'current_reward': eval_reward,
+            'best_reward': best_eval_reward,
+            'episode': episode_count,
+            'best_episode': best_eval_episode,
+            'batch_idx': batch_idx,
+            'hyperparameters': {k: v for k, v in hp.__dict__.items() 
+                            if not k.startswith('_') and not callable(v)},
+            'config_content': config_content,
+            'config_path': cfg_path,
+        }, os.path.join(checkpoint_dir, f'model-{batch_idx+1}.pt'))
+        # for convenience also save as latest-model.pt
+        torch.save({
+            'policy_state_dict': policy.state_dict(),
+            'value_state_dict': value_module.state_dict(),
+            'current_reward': eval_reward,
+            'best_reward': best_eval_reward,
+            'episode': episode_count,
+            'best_episode': best_eval_episode,
+            'batch_idx': batch_idx,
+            'hyperparameters': {k: v for k, v in hp.__dict__.items() 
+                            if not k.startswith('_') and not callable(v)},
+            'config_content': config_content,
+            'config_path': cfg_path,
+        }, latest_model_path)
+        
         # Evaluate every hp.eval_frequency batches
         if batch_idx % hp.eval_frequency == 0:
             eval_reward = evaluate_policy(env, policy)
@@ -424,36 +453,6 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                     'config_content': config_content,
                     'config_path': cfg_path,
                 }, best_model_path)
-
-            # Save latest model
-            torch.save({
-                'policy_state_dict': policy.state_dict(),
-                'value_state_dict': value_module.state_dict(),
-                'current_reward': eval_reward,
-                'best_reward': best_eval_reward,
-                'episode': episode_count,
-                'best_episode': best_eval_episode,
-                'batch_idx': batch_idx,
-                'hyperparameters': {k: v for k, v in hp.__dict__.items() 
-                                if not k.startswith('_') and not callable(v)},
-                'config_content': config_content,
-                'config_path': cfg_path,
-            }, os.path.join(checkpoint_dir, f'model-{batch_idx+1}.pt'))
-            # for convenience also save as latest-model.pt
-            torch.save({
-                'policy_state_dict': policy.state_dict(),
-                'value_state_dict': value_module.state_dict(),
-                'current_reward': eval_reward,
-                'best_reward': best_eval_reward,
-                'episode': episode_count,
-                'best_episode': best_eval_episode,
-                'batch_idx': batch_idx,
-                'hyperparameters': {k: v for k, v in hp.__dict__.items() 
-                                if not k.startswith('_') and not callable(v)},
-                'config_content': config_content,
-                'config_path': cfg_path,
-            }, latest_model_path)
-
             eval_str = f"eval reward: {eval_reward:.5f} (best: {best_eval_reward:.5f})"
 
         # Progress bar update
