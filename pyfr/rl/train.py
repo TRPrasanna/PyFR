@@ -209,7 +209,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         },
         reset_at_each_iter=True,
         backend = "gloo",
-        tcp_port = 60060, # I picked an available port
+        tcp_port = 60060, # I picked an available port,
+        update_after_each_batch=True, # update policy weights for each worker after each batch
         #**kwargs,
     )
 
@@ -391,7 +392,7 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
                 optim.step()
                 optim.zero_grad()
 
-        collector.update_policy_weights_() # perhaps not needed
+        #collector.update_policy_weights_() # perhaps not needed since update_after_each_batch=True
 
         # Logging
         logs["train_reward"].append(train_reward)
