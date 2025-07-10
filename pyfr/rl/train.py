@@ -222,6 +222,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     )
 
     best_eval_reward = float('-inf')
+    eval_reward = float('-inf')
+    best_eval_episode = 0
     best_eval_episode = 0
     start_episode = 0
     current_eval_reward = None
