@@ -133,6 +133,16 @@ class NavierStokesNoSlpAdiaWallBCInters(NavierStokesBaseBCInters):
     type = 'no-slp-adia-wall'
     cflux_state = 'ghost'
 
+class NavierStokesSubInOutAdiaBCInters(NavierStokesBaseBCInters):
+    type = 'sub-inout-adia'
+    cflux_state = 'ghost'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg):
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+
+        self.c['cpTw'], = self._eval_opts(['cpTw'])
+        self.c |= self._exp_opts('uvw'[:self.ndims], lhs,
+                                 default={'u': 0, 'v': 0, 'w': 0})
 
 class NavierStokesSlpAdiaWallBCInters(NavierStokesBaseBCInters):
     type = 'slp-adia-wall'
