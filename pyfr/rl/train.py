@@ -159,8 +159,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
         critic_network=value_module,
         clip_epsilon=hp.clip_epsilon,
         entropy_bonus=bool(hp.entropy_eps),
-        entropy_coef=hp.entropy_eps,
-        critic_coef=1.0,
+        entropy_coeff=hp.entropy_eps,
+        critic_coeff=1.0,
         loss_critic_type="smooth_l1",
     )
 
