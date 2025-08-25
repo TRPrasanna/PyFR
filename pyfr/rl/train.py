@@ -87,12 +87,39 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
     )
 
     # Initialize policy weights
-    activation_name = hp.activation_policy.lower()
-    gain = torch.nn.init.calculate_gain(activation_name)
-    for layer in actor_mlp.modules():
-        if isinstance(layer, torch.nn.Linear):
-            torch.nn.init.orthogonal_(layer.weight, gain=gain)
-            layer.bias.data.zero_()
+    def _safe_gain(act_name: str):
+        name = (act_name or "").lower()
+        # Map common aliases
+        if name in {"leakyrelu", "leaky_relu"}:
+            try:
+                return torch.nn.init.calculate_gain("leaky_relu", 0.01)
+            except Exception:
+                return None
+        # Valid set per PyTorch docs
+        valid = {
+            "linear","conv1d","conv2d","conv3d",
+            "conv_transpose1d","conv_transpose2d","conv_transpose3d",
+            "sigmoid","tanh","relu","leaky_relu","selu"
+        }
+        if name in valid:
+            try:
+                return torch.nn.init.calculate_gain(name)
+            except Exception:
+                return None
+        return None
+
+    activation_name = hp.activation_policy
+    gain = _safe_gain(activation_name)
+
+    if gain is None:
+        print(f"Info: Using PyTorch default initialization for actor MLP because activation '{activation_name}' has no supported gain.")
+    else:
+        for layer in actor_mlp.modules():
+            if isinstance(layer, torch.nn.Linear):
+                torch.nn.init.orthogonal_(layer.weight, gain=gain)
+                if layer.bias is not None:
+                    layer.bias.data.zero_()
+                    
     # Add learnable scales (standard deviations)
     if hp.state_ind_normal_scale:
         actor_net = nn.Sequential(
