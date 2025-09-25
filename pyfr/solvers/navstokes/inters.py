@@ -693,3 +693,146 @@ class NavierStokesSubInflowFrvNeuralType5ResidualBCInters(NavierStokesBaseBCInte
                 self.last_step_count = self.intg.system.env.step_count
             else:
                 self._init_complete = True
+
+class NavierStokesSubInflowFrvWsBCInters(NavierStokesBaseBCInters):
+    type = 'sub-in-frv-ws' # weak-specified
+    cflux_state = None
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg):
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+
+        self.c |= self._exp_opts(
+            ['rho', 'p', 'u', 'v', 'w'][:self.ndims + 2], lhs,
+            default={'u': 0, 'v': 0, 'w': 0, 'p': 0}
+        )
+
+class NavierStokesSubInflowFpvBCInters(NavierStokesBaseBCInters):
+    type = 'sub-in-fpv'
+    cflux_state = 'ghost'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg):
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+
+        self.c |= self._exp_opts(
+            ['p', 'u', 'v', 'w'][:self.ndims + 1], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+class NavierStokesAdiaJetBCInters(NavierStokesBaseBCInters):
+    type = 'adia-jet'
+    cflux_state = 'ghost'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg):
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+
+        self.c |= self._exp_opts(
+            ['u', 'v', 'w'][:self.ndims], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+            #['vn'][:1], lhs,
+            #default={'vn': 0}
+        )
+
+class NavierStokesAdiaJetNeuralType5BCInters(NavierStokesBaseBCInters):
+    type = 'adia-jet-neural-type5' # for changing velocity/mass flow rate for multiple actuators
+    cflux_state = 'ghost'
+
+    def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+        
+        # Basic initialization
+        self.c |= self._exp_opts(
+            ['u', 'v', 'w'][:self.ndims], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+        # some config parameters
+        self.t_act_interval = self.backend.matrix((1,1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
+                         value=self.t_act_interval)
+
+        # Neural network + control parameters
+        self.control_params = self.backend.matrix((1,3))
+        self._set_external('control_params', 'broadcast fpdtype_t[1][3]', 
+                         value=self.control_params)
+
+        # Initial value
+        self.control_params.set(np.array([[0.0, 0.0, 0.0]])) #(Q0,Q1,t0)
+
+        # Cache current parameter value 
+        self._current_target = 0.0
+
+        # Fixed values
+        self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
+        self.actuator_id = cfg.getint(cfgsect, 'actuator-number') # 0-indexed
+
+        # Helper to keep track of last step count
+        self.last_step_count = -1
+        self._init_complete = False
+
+    def prepare(self, t):
+        # Only update backend after environment has taken a step
+        if self.intg.system.env.step_count != self.last_step_count:
+            # Direct access to control signal from solver environment
+            required_target = self.intg.system.env.current_control[self.actuator_id]
+            
+            self.control_params.set(np.array([[self._current_target, required_target, t]]))
+            #print(f"Control signal: {required_target} at time t = {t}") #first setting will be overriden
+            self._current_target = required_target
+            #print(f"Control signal: {required_target} updated at time t = {t} and step count = {self.intg.system.env.step_count}, last step count = {self.last_step_count}")
+            if self._init_complete:
+                self.last_step_count = self.intg.system.env.step_count
+            else:
+                self._init_complete = True
+
+class NavierStokesAdiaJetNeuralType5ResidualBCInters(NavierStokesBaseBCInters):
+    type = 'adia-jet-neural-type5-residual' # same as type5 but this makes it zero-net-mass-flux
+    cflux_state = 'ghost'
+
+    def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+        
+        # Basic initialization
+        self.c |= self._exp_opts(
+            ['u', 'v', 'w'][:self.ndims], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+        # some config parameters
+        self.t_act_interval = self.backend.matrix((1,1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]', 
+                         value=self.t_act_interval)
+
+        # Neural network + control parameters
+        self.control_params = self.backend.matrix((1,3))
+        self._set_external('control_params', 'broadcast fpdtype_t[1][3]', 
+                         value=self.control_params)
+
+        # Initial value
+        self.control_params.set(np.array([[0.0, 0.0, 0.0]])) #(Q0,Q1,t0)
+
+        # Cache current parameter value 
+        self._current_target = 0.0
+
+        # Fixed values
+        self.t_act_interval.set(np.array([[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]))
+
+        # Helper to keep track of last step count
+        self.last_step_count = -1
+        self._init_complete = False
+
+    def prepare(self, t):
+        # Only update backend after environment has taken a step
+        if self.intg.system.env.step_count != self.last_step_count:
+            # Direct access to control signal from solver environment
+            required_target = -np.sum(self.intg.system.env.current_control)
+            
+            self.control_params.set(np.array([[self._current_target, required_target, t]]))
+            self._current_target = required_target
+            if self._init_complete:
+                self.last_step_count = self.intg.system.env.step_count
+            else:
+                self._init_complete = True
