@@ -498,7 +498,7 @@ def evaluate_policy(env, policy, num_steps=1000000):
     #print("Evaluating policy...")
     env.set_evaluation_mode(True)  # Use same IC
     try:
-        with set_exploration_type(ExplorationType.MODE), torch.no_grad():
+        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
             eval_rollout = env.rollout(num_steps, policy)
             eval_reward = eval_rollout["next", "reward"].mean().item()
             #print(f"Eval rewards var: {eval_rollout['next', 'reward']}")
