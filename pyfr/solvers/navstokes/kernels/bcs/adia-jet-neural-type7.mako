@@ -2,22 +2,20 @@
 <%include file='pyfr.solvers.navstokes.kernels.bcs.common'/>
 
 ## Externs:
-##   act_pack      : [A, D, F, t0]
+##   act_pack      : [D, F, t0]
 ##   t_act_interval: [Δt]
 ## Compile-time constants supplied from inters.py via self.c:
-##   Amin, Amax, Dmin, Dmax, Fmin, Fmax, Deps, and the jet direction fields c[u|v|w]
+##   Dmin, Dmax, Fmin, Fmax, Deps, and the slot profile fields c[u|v|w]
 
 <%pyfr:macro name='bc_rsolve_state' params='ul, nl, ur'
              externs='ploc, t, act_pack, t_act_interval'>
     // Unpack params and timing
-    fpdtype_t A  = act_pack[0][0];
-    fpdtype_t D  = act_pack[0][1];
-    fpdtype_t F  = act_pack[0][2];
-    fpdtype_t t0 = act_pack[0][3];
+    fpdtype_t D  = act_pack[0][0];
+    fpdtype_t F  = act_pack[0][1];
+    fpdtype_t t0 = act_pack[0][2];
     fpdtype_t T  = t_act_interval[0][0];
 
     // Clamp parameters against per-jet bounds
-    A = max(${c['Amin']}, min(${c['Amax']}, A));
     D = max(${c['Dmin']}, min(${c['Dmax']}, D));
     // Physical guard for duty
     D = max((fpdtype_t)0.0, min((fpdtype_t)1.0, D));
@@ -29,7 +27,7 @@
     // Adaptive-stepping guards
     fpdtype_t tau = t - t0;
     if (tau <= 0) tau = 0;           // handle early calls / FP jitter
-    if (tau >= T) {                   // past interval end: hard-zero control
+    if (tau >= T) {                  // past interval end: hard-zero control
         ur[0] = ul[0];
 % for i, v in enumerate('uvw'[:ndims]):
         ur[${i + 1}] = -ul[${i + 1}];
@@ -43,9 +41,10 @@
     fpdtype_t frac   = cycles - floor(cycles);
     fpdtype_t g = (frac < D) ? (fpdtype_t)1.0 : (fpdtype_t)0.0;
 
-    fpdtype_t control = A * g;
+    // Here amplitude is embedded in c[u|v|w] fields from cfg
+    fpdtype_t control = g;
 
-    // Apply like type5 adiabatic jet
+    // Apply like type5/6 adiabatic jet using slot profile fields
     ur[0] = ul[0];
 % for i, v in enumerate('uvw'[:ndims]):
     ur[${i + 1}] = -ul[${i + 1}] + 2.0*ul[0]*control*(${c[v]});
@@ -55,13 +54,11 @@
 
 <%pyfr:macro name='bc_ldg_state' params='ul, nl, ur'
              externs='ploc, t, act_pack, t_act_interval'>
-    fpdtype_t A  = act_pack[0][0];
-    fpdtype_t D  = act_pack[0][1];
-    fpdtype_t F  = act_pack[0][2];
-    fpdtype_t t0 = act_pack[0][3];
+    fpdtype_t D  = act_pack[0][0];
+    fpdtype_t F  = act_pack[0][1];
+    fpdtype_t t0 = act_pack[0][2];
     fpdtype_t T  = t_act_interval[0][0];
 
-    A = max(${c['Amin']}, min(${c['Amax']}, A));
     D = max(${c['Dmin']}, min(${c['Dmax']}, D));
     D = max((fpdtype_t)0.0, min((fpdtype_t)1.0, D));
     D = max(D, (fpdtype_t)${c['Deps']});
@@ -84,7 +81,9 @@
     fpdtype_t cycles = F * tau;
     fpdtype_t frac   = cycles - floor(cycles);
     fpdtype_t g = (frac < D) ? (fpdtype_t)1.0 : (fpdtype_t)0.0;
-    fpdtype_t control = A * g;
+
+    // Amplitude is embedded in c[u|v|w]
+    fpdtype_t control = g;
 
     ur[0] = ul[0];
 % for i, v in enumerate('uvw'[:ndims]):
@@ -150,4 +149,3 @@
     grad_ur[2][4] -= nl[2]*nl[0]*Tl_x + nl[2]*nl[1]*Tl_y + nl[2]*nl[2]*Tl_z;
 % endif
 </%pyfr:macro>
-

@@ -936,3 +936,108 @@ class NavierStokesAdiaJetNeuralType6BCInters(NavierStokesBaseBCInters):
             self.last_step_count = env.step_count
         else:
             self._init_complete = True
+
+# -*- coding: utf-8 -*-
+import numpy as np
+from pyfr.solvers.navstokes.inters import NavierStokesBaseBCInters
+
+class NavierStokesAdiaJetNeuralType7BCInters(NavierStokesBaseBCInters):
+    """
+    Pulsed blowing with 2 RL parameters per jet: duty D and frequency F.
+    Amplitude is fixed by the cfg 'u','v','w' expressions (slot profile),
+    and the kernel applies a square gate g(t) with duty/frequency.
+
+        control(t) = 0,                           if t - t0 >= Δt
+        control(t) = 1[ frac(F * (t - t0)) < D ], otherwise
+
+    Only one host->device set per action interval with [D, F, t0].
+    """
+    type = 'adia-jet-neural-type7'
+    cflux_state = 'ghost'
+
+    def __init__(self, intg, be, lhs, elemap, cfgsect, cfg):
+        self.backend = be
+        self.intg = intg
+        super().__init__(be, lhs, elemap, cfgsect, cfg)
+
+        # Fixed jet profile fields from cfg (same pattern as type 5/6)
+        # These can vary with x,y and already encode the amplitude and direction.
+        self.c |= self._exp_opts(
+            ['u', 'v', 'w'][:self.ndims], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+        # Action interval Δt: set once (shared for all actions)
+        self.t_act_interval = self.backend.matrix((1, 1))
+        self._set_external('t_act_interval',
+                           'broadcast fpdtype_t[1][1]',
+                           value=self.t_act_interval)
+        self.t_act_interval.set(np.array(
+            [[cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')]]
+        ))
+
+        # Single packed buffer: [D, F, t0]
+        self.act_pack = self.backend.matrix((1, 3))
+        self._set_external('act_pack',
+                           'broadcast fpdtype_t[1][3]',
+                           value=self.act_pack)
+
+        # Preallocate a small host buffer to avoid reallocations
+        self._pack_host = np.zeros((1, 3), dtype=float)
+        # Init defaults: D in (0,1), F >= 0
+        self._pack_host[0, :] = [0.10, 10.0, 0.0]
+        self.act_pack.set(self._pack_host)
+
+        # Per-jet index and precomputed base offset into the action vector
+        self.actuator_id = cfg.getint(cfgsect, 'actuator-number')  # 0-indexed
+        self._base = 2 * self.actuator_id  # 2 params per jet: D, F
+
+        # Infer bounds once from actions-low/high and store as device constants
+        lows = cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-low')
+        highs = cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-high')
+        try:
+            Dmin = float(lows[self._base + 0]); Fmin = float(lows[self._base + 1])
+            Dmax = float(highs[self._base + 0]); Fmax = float(highs[self._base + 1])
+        except Exception as e:
+            raise ValueError(f"type7 bounds: need 2 entries per jet in actions-low/high; error: {e}")
+
+        # Sanitize for safety; done once
+        Dmin = max(0.0, min(1.0, Dmin))
+        Dmax = max(0.0, min(1.0, Dmax))
+        Fmin = max(0.0, Fmin)
+
+        # Store as compile-time constants for the kernels
+        self.c['Dmin'], self.c['Dmax'] = Dmin, Dmax
+        self.c['Fmin'], self.c['Fmax'] = Fmin, Fmax
+        self.c['Deps'] = 1.0e-4  # avoid degenerate 0 or 1 duty
+
+        # Minimal Python bookkeeping
+        self.last_step_count = -1
+        self._init_complete = False
+
+    def prepare(self, t):
+        """
+        Called often. Only act when a new RL action arrives.
+        On a new action: copy [D, F, t] into the preallocated host buffer,
+        then one act_pack.set(...) to device. No clipping here; kernel clamps.
+        """
+        env = self.intg.system.env
+        if env.step_count == self.last_step_count:
+            return
+
+        # Read the pair for this jet
+        ctrl = env.current_control  # numpy array from your env
+        D = float(ctrl[self._base + 0])
+        F = float(ctrl[self._base + 1])
+
+        # Pack and push once
+        self._pack_host[0, 0] = D
+        self._pack_host[0, 1] = F
+        self._pack_host[0, 2] = float(t)
+        self.act_pack.set(self._pack_host)
+
+        # Bookkeeping
+        if self._init_complete:
+            self.last_step_count = env.step_count
+        else:
+            self._init_complete = True
