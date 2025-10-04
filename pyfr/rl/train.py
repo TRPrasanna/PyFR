@@ -1,356 +1,549 @@
-# train.py  (PPO-LSTM)
+from pyfr.inifile import Inifile
 from dataclasses import dataclass
-from typing import Any
-import os, time
-from collections import defaultdict
-
+from pyfr.readers.native import NativeReader
+from typing import Dict, Any
 import torch
 from torch import nn
-from torch.utils.tensorboard import SummaryWriter
-
-from tensordict.nn import TensorDictModule, TensorDictSequential
-from torchrl.modules import (
-    ProbabilisticActor,
-    TanhNormal,
-    NormalParamExtractor,
-    LSTMModule,
-    MLP,
-    set_recurrent_mode,  # correct import location
+from collections import defaultdict
+from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
+from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, MLP
+from torchrl.envs import (
+    Compose,
+    DoubleToFloat,
+    ObservationNorm,
+    StepCounter,
+    TransformedEnv,
 )
+from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
+from torchrl.collectors.distributed import DistributedDataCollector
+from torchrl.envs import EnvCreator
+from torchrl.data.replay_buffers import ReplayBuffer
+from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
+from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
-from torchrl.envs import TransformedEnv, Compose, StepCounter, InitTracker
-from torchrl.envs.utils import ExplorationType, set_exploration_type
-from torchrl.collectors import MultiSyncDataCollector
 from tqdm.auto import tqdm
-
-from pyfr.inifile import Inifile
 from pyfr.rl.env import PyFREnvironment
-
-# ---------------------------
-# Utilities and hyperparams
-# ---------------------------
-
-def get_device_count(backend_name):
-    if backend_name == 'hip':
-        from pyfr.backends.hip.driver import HIP
-        return HIP().device_count()
-    elif backend_name == 'cuda':
-        from pyfr.backends.cuda.driver import CUDA
-        return CUDA().device_count()
-    else:
-        return 1
-
-@dataclass
-class HyperParameters:
-    # General
-    torch_device: str = "cpu"
-    print_config_on_load: bool = False
-
-    # Architecture
-    num_cells_policy: int = 512   # LSTM hidden size (actor)
-    num_cells_value: int  = 512   # LSTM hidden size (critic)
-    activation_policy: str = "Tanh"
-    activation_value: str  = "Tanh"
-
-    # Schedule
-    episodes: int = 5000
-    episodes_per_batch: int = 20
-    num_epochs: int = 10
-
-    # PPO
-    clip_epsilon: float = 0.2
-    gamma: float = 0.99
-    lmbda: float = 0.97
-    entropy_eps: float = 1e-3
-    lr: float = 1e-4
-    max_grad_norm: float = 10.0
-
-    # Eval
-    eval_frequency: int = 1
-
-    # Derived
-    actions_per_episode: int = None
-    frames_per_batch: int = None
-    total_frames: int = None
-
-    # Optional config loader hook (retain if you have one)
-    @classmethod
-    def from_config(cls, cfg: Inifile) -> "HyperParameters":
-        params = cls()
-        if 'neuralnetwork-hyperparameters' in cfg.sections():
-            section = 'neuralnetwork-hyperparameters'
-            for field_name, field in params.__dataclass_fields__.items():
-                cfg_key = field_name.replace('_', '-')
-                if cfg.hasopt(section, cfg_key):
-                    if field.type == int:
-                        val = cfg.getint(section, cfg_key)
-                    elif field.type == float:
-                        val = cfg.getfloat(section, cfg_key)
-                    elif field.type == bool:
-                        val = cfg.getbool(section, cfg_key)
-                    else:
-                        val = cfg.get(section, cfg_key)
-                    setattr(params, field_name, val)
-        return params
-
-    def _calculate_derived(self, env):
-        self.actions_per_episode = int(env.dtend / env.action_interval)
-        self.frames_per_batch = self.episodes_per_batch * self.actions_per_episode
-        self.total_frames = self.episodes * self.actions_per_episode
-
-# ---------------------------
-# Evaluation
-# ---------------------------
-
-def evaluate_policy(env, policy, num_steps=1_000_000):
-    env.set_evaluation_mode(True)
-    try:
-        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-            rollout = env.rollout(num_steps, policy)
-            return rollout["next", "reward"].mean().item()
-    finally:
-        env.set_evaluation_mode(False)
-
-# ---------------------------
-# Main training
-# ---------------------------
+from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
+import os
+import math
+from torch.utils.tensorboard import SummaryWriter
+import time
 
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
-    # Resolve config path and cache text for checkpoint diff
-    cfg_path = cfg_file.name if hasattr(cfg_file, 'name') else cfg_file
+    # Get config path at the start
+    if hasattr(cfg_file, 'name'):
+        cfg_path = cfg_file.name
+    else:
+        cfg_path = cfg_file
+
+    # Read the config file content, will be later stored in checkpoint
     try:
         with open(cfg_path, 'r') as f:
             config_content = f.read()
-    except Exception:
+    except Exception as e:
+        print(f"Warning: Could not read config file: {e}")
         config_content = None
 
-    # Base env with StepCounter + InitTracker
-    base_env = PyFREnvironment(mesh_file, cfg_path, backend_name, 0, ic_dir=ic_dir, print_diagnostic=True)
-    env = TransformedEnv(base_env, Compose(StepCounter(), InitTracker()))
+    # Initialize environment
+    env = PyFREnvironment(mesh_file, cfg_path, backend_name, 0, ic_dir=ic_dir, print_diagnostic=True)
+    env = TransformedEnv(env,StepCounter())
+    # todo, check: fix PyFR single precision and Pytorch double precision mismatch
 
-    # Hyperparameters
     if 'neuralnetwork-hyperparameters' not in env.cfg.sections():
-        print("No [neuralnetwork-hyperparameters] in cfg. Using defaults.")
+        print("No neuralnetwork-hyperparameters section found in config file. Proceeding to use default hyperparameters.")
+
     hp = HyperParameters.from_config(env.cfg)
+    # Calculate derived parameters using environment info
     hp._calculate_derived(env)
+
     device = torch.device(hp.torch_device)
 
-    # Shapes
-    action_dim = env.action_spec_unbatched.shape[-1]
-    obs_dim    = env.observation_spec["observation"].shape[-1]
+    # Adjust num_minibatches if it does not divide frames_per_batch evenly
+    sub_batch_size = hp.frames_per_batch // hp.desired_num_minibatches
+    remainder = hp.frames_per_batch % hp.desired_num_minibatches
+    if remainder != 0:
+        adjusted_num_minibatches = get_closest_divisor(hp.frames_per_batch, hp.desired_num_minibatches)
+        sub_batch_size = hp.frames_per_batch // adjusted_num_minibatches
+        print(
+            f"Warning: frames_per_batch ({hp.frames_per_batch}) is not perfectly divisible by "
+            f"num_minibatches ({hp.desired_num_minibatches}). "
+            f"Adjusted num_minibatches to {adjusted_num_minibatches} with sub_batch_size {sub_batch_size}."
+        )
+        hp.desired_num_minibatches = adjusted_num_minibatches
 
-    # ---------------------------
-    # Actor: LSTM + head -> loc, scale
-    # ---------------------------
-    actor_lstm = LSTMModule(
-        input_size=obs_dim,
-        hidden_size=hp.num_cells_policy,
-        device=device,
-        in_keys=["observation", "actor_h", "actor_c"],
-        out_keys=["actor_feat", ("next", "actor_h"), ("next", "actor_c")],
-        python_based=True,
-    )
-    actor_head = MLP(
-        in_features=hp.num_cells_policy,
-        out_features=2 * action_dim,
-        num_cells=[hp.num_cells_policy],
+    hp.print_summary()
+
+    # Actor network with proper output handling
+    action_dim = env.action_spec_unbatched.shape[-1]
+    input_shape = env.observation_spec["observation"].shape
+    actor_mlp = MLP(
+        in_features=input_shape[-1],
+        out_features=action_dim if hp.state_ind_normal_scale else 2*action_dim,
+        depth=hp.num_hidden_layers_policy,
+        num_cells=hp.num_cells_policy,
         activation_class=getattr(nn, hp.activation_policy),
         device=device,
     )
-    actor_head_mod = TensorDictModule(actor_head, in_keys=["actor_feat"], out_keys=["actor_params"])
-    param_extract  = TensorDictModule(
-        NormalParamExtractor(scale_mapping="biased_softplus_1.0", scale_lb=0.1),
-        in_keys=["actor_params"], out_keys=["loc", "scale"]
-    )
-    actor_net = TensorDictSequential(actor_lstm, actor_head_mod, param_extract).to(device)
+
+    # Initialize policy weights
+    def _safe_gain(act_name: str):
+        name = (act_name or "").lower()
+        # Map common aliases
+        if name in {"leakyrelu", "leaky_relu"}:
+            try:
+                return torch.nn.init.calculate_gain("leaky_relu", 0.01)
+            except Exception:
+                return None
+        # Valid set per PyTorch docs
+        valid = {
+            "linear","conv1d","conv2d","conv3d",
+            "conv_transpose1d","conv_transpose2d","conv_transpose3d",
+            "sigmoid","tanh","relu","leaky_relu","selu"
+        }
+        if name in valid:
+            try:
+                return torch.nn.init.calculate_gain(name)
+            except Exception:
+                return None
+        return None
+
+    activation_name = hp.activation_policy
+    gain = _safe_gain(activation_name)
+
+    if gain is None:
+        print(f"Info: Using PyTorch default initialization for actor MLP because activation '{activation_name}' has no supported gain.")
+    else:
+        for layer in actor_mlp.modules():
+            if isinstance(layer, torch.nn.Linear):
+                torch.nn.init.orthogonal_(layer.weight, gain=gain)
+                if layer.bias is not None:
+                    layer.bias.data.zero_()
+
+    # Add learnable scales (standard deviations)
+    if hp.state_ind_normal_scale:
+        actor_net = nn.Sequential(
+            actor_mlp,
+            AddStateIndependentNormalScale(
+                action_dim,  # Number of actions
+                scale_lb=1e-8,
+            ).to(device)
+        )
+    else:
+        actor_net = nn.Sequential(
+            actor_mlp,
+            NormalParamExtractor(
+                scale_mapping="biased_softplus_1.0",
+                scale_lb=0.1,   # lower bound for scale
+            ).to(device)
+        )
+
+    actor_module = TensorDictModule(
+        actor_net,
+        in_keys=["observation"],
+        out_keys=["loc", "scale"]
+    ).to(device)
+
     policy = ProbabilisticActor(
-        module=actor_net,
+        module=actor_module,
         spec=env.action_spec,
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
         return_log_prob=True,
         distribution_kwargs={
-            "low":  env.action_spec.space.low,
-            "high": env.action_spec.space.high,
-            "tanh_loc": False,
+        "low": env.action_spec.space.low,
+        "high": env.action_spec.space.high,
+        "tanh_loc": False,
         },
+        #safe = True
     ).to(device)
 
-    # ---------------------------
-    # Critic: LSTM + head -> state_value
-    # ---------------------------
-    critic_lstm = LSTMModule(
-        input_size=obs_dim,
-        hidden_size=hp.num_cells_value,
-        device=device,
-        in_keys=["observation", "critic_h", "critic_c"],
-        out_keys=["critic_feat", ("next", "critic_h"), ("next", "critic_c")],
-        python_based=True,
-    )
-    critic_head = MLP(
-        in_features=hp.num_cells_value,
+    # Value network (critic)
+    value_net = MLP(
+        in_features=input_shape[-1],
         out_features=1,
-        num_cells=[hp.num_cells_value],
+        depth=hp.num_hidden_layers_value,
+        num_cells=hp.num_cells_value,
         activation_class=getattr(nn, hp.activation_value),
         device=device,
     )
-    critic_head_mod = TensorDictModule(critic_head, in_keys=["critic_feat"], out_keys=["state_value"])
-    value_net = TensorDictSequential(critic_lstm, critic_head_mod).to(device)
 
-    # Register both primers
-    env.append_transform(actor_lstm.make_tensordict_primer())
-    env.append_transform(critic_lstm.make_tensordict_primer())
+    # Initialize value weights
+    activation_name = hp.activation_value
+    gain = _safe_gain(activation_name)
 
-    # ---------------------------
-    # Advantage + PPO loss
-    # ---------------------------
+    if gain is None:
+        print(f"Info: Using PyTorch default initialization for actor MLP because activation '{activation_name}' has no supported gain.")
+    else:
+        for layer in value_net.modules():
+            if isinstance(layer, torch.nn.Linear):
+                torch.nn.init.orthogonal_(layer.weight, gain=gain)
+                if layer.bias is not None:
+                    layer.bias.data.zero_()
+
+    value_module = ValueOperator(
+        module=value_net,
+        in_keys=["observation"]
+    ).to(device)
+
+    # PPO components
     advantage_module = GAE(
-        gamma=hp.gamma,
+        gamma=hp.gamma, 
         lmbda=hp.lmbda,
-        value_network=value_net,
-        average_gae=True,
-        deactivate_vmap=True,
+        value_network=value_module,
+        average_gae=True
     )
+
     loss_module = ClipPPOLoss(
         actor_network=policy,
-        critic_network=value_net,
+        critic_network=value_module,
         clip_epsilon=hp.clip_epsilon,
         entropy_bonus=bool(hp.entropy_eps),
-        entropy_coeff=hp.entropy_eps,   # updated name
-        critic_coeff=1.0,               # updated name
+        entropy_coeff=hp.entropy_eps,
+        critic_coeff=1.0,
         loss_critic_type="smooth_l1",
     )
-    optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
 
-    # ---------------------------
-    # Collector
-    # ---------------------------
+    # Optimizer
+    optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
+    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #optim, hp.total_frames // hp.frames_per_batch, 0.0
+    #)
+
+    # Get number of available devices
     num_devices = get_device_count(backend_name)
-    print(f"Found {num_devices} devices for backend '{backend_name}'")
+    print(f"\nFound {num_devices} devices for backend '{backend_name}'")
 
     def make_env(backend, device_id):
-        e = PyFREnvironment(mesh_file, cfg_file, backend, device_id, ic_dir=ic_dir, print_diagnostic=False)
-        e = TransformedEnv(e, Compose(StepCounter(), InitTracker()))
-        e.append_transform(actor_lstm.make_tensordict_primer())
-        e.append_transform(critic_lstm.make_tensordict_primer())
-        return e
+        """Create environment with specified backend and device ID"""
+        env = PyFREnvironment(
+            mesh_file=mesh_file,
+            cfg_file=cfg_file,
+            backend_name=backend,
+            device_id=device_id,
+            ic_dir=ic_dir,
+            print_diagnostic=False
+        )
+        env = TransformedEnv(env, StepCounter())
+        return env
 
-    env_makers = [(lambda j=i: make_env(backend_name, j)) for i in range(num_devices)]
-
+    # Create list of environment creators with device IDs
+    env_makers = [
+        (lambda id=i: make_env(backend_name, id))
+        for i in range(num_devices)
+    ]
     collector = MultiSyncDataCollector(
         create_env_fn=env_makers,
         policy=policy,
         frames_per_batch=hp.frames_per_batch,
         total_frames=hp.total_frames,
-        reset_at_each_iter=True,
-        device=device,
+        split_trajs=False,
+        reset_at_each_iter=True, # without this the collector seems to continue collecting in evaluation mode
+        device=device
     )
 
-    # ---------------------------
-    # Checkpointing and logging
-    # ---------------------------
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    best_model_path   = os.path.join(checkpoint_dir, "best_model.pt")
-    latest_model_path = os.path.join(checkpoint_dir, "latest_model.pt")
+    # Replay buffer here is not actually used for experience replay
+    # It is rather used for convenience to sample mini-batches from the collected data
+    replay_buffer = ReplayBuffer(
+        storage=LazyTensorStorage(max_size=hp.frames_per_batch),
+        sampler=SamplerWithoutReplacement(),
+    )
 
-    best_eval_reward = float("-inf")
+    best_eval_reward = float('-inf')
     best_eval_episode = 0
-    episode_count = 0
+    start_episode = 0
+    current_eval_reward = None
 
+    start_batch_idx = 0
+    # Load existing model if specified
     if load_model and os.path.exists(load_model):
-        ckpt = torch.load(load_model, map_location=device, weights_only=True)
-        policy.load_state_dict(ckpt["policy_state_dict"])
-        value_net.load_state_dict(ckpt["value_state_dict"])
-        print(f"Loaded model: {load_model}")
-        if "best_reward" in ckpt:
-            best_eval_reward = ckpt["best_reward"]
-            best_eval_episode = ckpt.get("best_episode", 0)
+        checkpoint = torch.load(load_model, map_location=device, weights_only=True)
+        policy.load_state_dict(checkpoint['policy_state_dict'])
+        value_module.load_state_dict(checkpoint['value_state_dict'])
+        
+        current_eval_reward = checkpoint.get('current_reward', float('-inf'))
+        loaded_best_reward = checkpoint.get('best_reward', float('-inf'))
+        start_episode = checkpoint.get('episode', 0)
+        loaded_best_episode = checkpoint.get('best_episode', 0)
+        start_batch_idx = checkpoint.get('batch_idx', 0) + 1
+        
+        # Get saved hyperparameters and compare with current
+        saved_hp = checkpoint.get('hyperparameters', {})
+        differences = []
+        
+        if saved_hp:
+            print("\nVerifying hyperparameters...")
+            for key, saved_value in saved_hp.items():
+                if hasattr(hp, key):
+                    current_value = getattr(hp, key)
+                    if current_value != saved_value:
+                        differences.append((key, saved_value, current_value))
+        
+        # Print differences  in hyperparameters if any exist
+        if differences:
+            # Define consistent column widths
+            key_width = 22
+            val_width = 20
+            
+            # Create separator lines with exact matching widths
+            key_sep = '─' * (key_width + 2)  # +2 for padding spaces
+            val_sep = '─' * (val_width + 2)
+            
+            print("\nWARNING: Hyperparameter differences detected between checkpoint and current settings:")
+            # Add this line for the top border
+            print(f"┌{key_sep}┬{val_sep}┬{val_sep}┐")
+            print(f"│ {'Key':<{key_width}} │ {'Checkpoint Value':<{val_width}} │ {'Current Value':<{val_width}} │")
+            print(f"├{key_sep}┼{val_sep}┼{val_sep}┤")
+            for key, saved, current in differences:
+                # Ensure consistent formatting for each row
+                print(f"│ {key:<{key_width}} │ {str(saved):<{val_width}} │ {str(current):<{val_width}} │")
+            print(f"└{key_sep}┴{val_sep}┴{val_sep}┘")
+        else:
+            print("done.")
 
-    wallclock = time.strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = os.path.join(checkpoint_dir, f"tensorboard_logs/{wallclock}")
-    writer = SummaryWriter(log_dir=log_dir)
-    print(f"Writing hyperparameters to tensorboard: {log_dir}")
-    hparam_dict = {k: v for k, v in hp.__dict__.items() if isinstance(v, (int, float, str, bool))}
-    writer.add_hparams(hparam_dict, {}, run_name=log_dir)
+        # Compare config files if available
+        if 'config_content' in checkpoint and config_content:
+            print("\nVerifying config files...")
+            config_differences = compare_configs(checkpoint['config_content'], config_content)
+            
+            if config_differences:
+                print("\nWARNING: Config file differences detected between checkpoint and current:")
+                for line_num, ckpt_line, curr_line in config_differences:
+                    print(f"Line {line_num}:")
+                    print(f"  Checkpoint: {ckpt_line}")
+                    print(f"  Current:    {curr_line}")
+                    print()
+            else:
+                print("Config files match between checkpoint and current settings.")
 
-    # ---------------------------
-    # Train loop
-    # ---------------------------
-    pbar = tqdm(total=hp.episodes, desc="Training")
-    updates_per_batch = hp.num_epochs
+        # Print config if flag is set
+        if hasattr(hp, 'print_config_on_load') and hp.print_config_on_load and 'config_content' in checkpoint:
+            print("\n=== CHECKPOINT CONFIG FILE CONTENT ===\n")
+            print(checkpoint['config_content'])
+            print("\n=======================================\n")
 
-    for batch_idx, td in enumerate(collector):
+        print(f"\nLoaded model from: {load_model}")
+        print(f"Current eval reward: {current_eval_reward:.4f}")
+        print(f"Best eval reward from checkpoint: {loaded_best_reward:.4f}")
+        print(f"Best reward achieved at episode: {loaded_best_episode}")
+        print(f"Continuing from episode: {start_episode}\n")
+        
+        # Always update best reward if better than current
+        if isinstance(loaded_best_reward, (int, float)) and loaded_best_reward > best_eval_reward:
+            best_eval_reward = loaded_best_reward
+            best_eval_episode = loaded_best_episode
+            print(f"Updated best reward tracking to: {best_eval_reward:.4f}\n")
+
+    # Create checkpoint directory
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    best_model_path = os.path.join(checkpoint_dir, 'best-model.pt')
+    latest_model_path = os.path.join(checkpoint_dir, 'latest-model.pt')
+    logs = defaultdict(list)
+    remaining_episodes = hp.episodes - start_episode
+    pbar = tqdm(total=remaining_episodes, desc="Training", initial=start_episode)
+    episode_count = start_episode
+
+    eval_str = ""
+
+    # Optional episode progress bar (new)
+    try:
+        episode_pbar = tqdm(total=hp.episodes, desc="Episodes", leave=False)
+        env.set_progress_bar(episode_pbar)
+    except:
+        print("Warning: Could not create episode progress bar")
+        episode_pbar = None
+        env.set_progress_bar(None)
+
+    # Tensorboard writer: write different runs based on humean-readable time
+    wallclock_datetime = time.strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = os.path.join(checkpoint_dir, f"tensorboard_logs/{wallclock_datetime}")
+    writer = SummaryWriter(log_dir=log_path)
+    # loop through hyperparameters and write them to tensorboard in one go (except _param_sources_ and _derived_params)
+    # Collect all hyperparameters first
+    hparam_dict = {}
+    metric_dict = {}  # Required but empty for hparams logging
+    
+    for key, value in hp.__dict__.items():
+        if key not in ['_param_sources', '_derived_params']:
+            if isinstance(value, (int, float, str, bool)):
+                hparam_dict[key] = value
+    
+    # Write all hyperparameters at once
+    run_name = os.path.join(os.path.dirname(os.path.realpath(log_path)),f"{wallclock_datetime}")
+    print(f"Writing hyperparameters to tensorboard: {run_name}")
+    writer.add_hparams(hparam_dict, metric_dict, run_name=run_name)
+    #print(os.path.dirname(os.path.realpath(__file__)) + os.sep + log_path)
+    updates_per_batch = hp.num_epochs * (hp.frames_per_batch // sub_batch_size)
+
+    batch_idx = start_batch_idx
+    for _, tensordict_data in enumerate(collector):
+        #print(f"\nBatch {i} starting...")
+
         episode_count += hp.episodes_per_batch
-
-        train_reward = td["next", "reward"].mean().item()
+        # Training performance metrics
+        train_reward = tensordict_data["next", "reward"].mean().item()
         writer.add_scalar("batch/train_reward", train_reward, batch_idx)
         writer.add_scalar("batch/episodes", episode_count, batch_idx)
-        writer.add_scalar("batch/learning_rate", optim.param_groups[0]["lr"], batch_idx)
+        writer.add_scalar("batch/learning_rate", optim.param_groups[0]['lr'], batch_idx)
+        #advantage_module(tensordict_data) # classical approach?
+        #data_view = tensordict_data.reshape(-1)
+        #replay_buffer.extend(data_view.cpu())
 
-        for ep in range(hp.num_epochs):
-            with set_recurrent_mode(True):
-                advantage_module(td)
-            with set_recurrent_mode(True):
-                loss_vals = loss_module(td.to(device))
+        # Training updates
+        for epoch_idx in range(hp.num_epochs):
+            advantage_module(tensordict_data) # https://arxiv.org/pdf/2006.05990 # recompute advantage each epoch
+            data_view = tensordict_data.reshape(-1)
+            replay_buffer.extend(data_view.cpu())
+            
+            for sub_update_idx in range(hp.frames_per_batch // sub_batch_size):
+                subdata = replay_buffer.sample(sub_batch_size)
+                loss_vals = loss_module(subdata.to(device))
                 loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
                 if hp.entropy_eps > 0:
                     loss_value = loss_value + loss_vals["loss_entropy"]
 
-            loss_value.backward()
-            grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
-            optim.step()
-            optim.zero_grad()
+                policy_obj = loss_vals["loss_objective"].item()
+                val_loss = loss_vals["loss_critic"].item()
+                ent_loss = loss_vals.get("loss_entropy", 0.0).item() if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor) else 0.0
 
-            global_update = batch_idx * updates_per_batch + ep
-            writer.add_scalar("loss/policy_objective", loss_vals["loss_objective"].item(), global_update)
-            writer.add_scalar("loss/value_loss",      loss_vals["loss_critic"].item(),    global_update)
-            writer.add_scalar(
-                "loss/entropy_bonus",
-                loss_vals.get("loss_entropy", torch.tensor(0.0)).detach().item(),
-                global_update,
-            )
-            writer.add_scalar("grad/norm", float(grad_norm if not isinstance(grad_norm, torch.Tensor) else grad_norm.detach().item()), global_update)
+                loss_value.backward()
+                grad_norm = nn.utils.clip_grad_norm_(loss_module.parameters(), hp.max_grad_norm)
 
+                global_update_idx = (batch_idx * updates_per_batch + 
+                                   epoch_idx * (hp.frames_per_batch // sub_batch_size) + 
+                                   sub_update_idx)
+                
+                # Log with global update index
+                writer.add_scalar("loss/policy_objective", policy_obj, global_update_idx)
+                writer.add_scalar("loss/value_loss", val_loss, global_update_idx)
+                writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
+                writer.add_scalar("grad/norm", grad_norm, global_update_idx)
 
-        collector.update_policy_weights_()
+                optim.step()
+                optim.zero_grad()
 
+        collector.update_policy_weights_() # perhaps not needed
+
+        # Logging
+        logs["train_reward"].append(train_reward)
+        #print(f"\n Batch finished. Episode count is {episode_count}")
+
+        # Evaluate every hp.eval_frequency batches
         if batch_idx % hp.eval_frequency == 0:
             eval_reward = evaluate_policy(env, policy)
-            writer.add_scalar("eval/mean_reward", eval_reward, batch_idx)
+            logs["eval_reward"].append(eval_reward)
+
+            writer.add_scalar("eval/mean_reward", eval_reward, batch_idx+1)
+            # Possibly log LR
+            writer.add_scalar("train/learning_rate", optim.param_groups[0]['lr'], batch_idx+1)
+
+            # Save best model if new best achieved
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
                 best_eval_episode = episode_count
-                print(f"New best eval reward: {best_eval_reward:.5f} at episode {episode_count}")
+                print(f"\nNew best eval reward: {best_eval_reward:.5f} at episode {episode_count}")
                 torch.save({
-                    "policy_state_dict": policy.state_dict(),
-                    "value_state_dict": value_net.state_dict(),
-                    "current_reward": eval_reward,
-                    "best_reward": best_eval_reward,
-                    "best_episode": best_eval_episode,
-                    "config_content": config_content,
-                    "config_path": cfg_path,
+                    'policy_state_dict': policy.state_dict(),
+                    'value_state_dict': value_module.state_dict(),
+                    'current_reward': eval_reward,
+                    'best_reward': best_eval_reward,
+                    'episode': episode_count,
+                    'best_episode': best_eval_episode,
+                    'batch_idx': batch_idx,
+                    'hyperparameters': {k: v for k, v in hp.__dict__.items() 
+                                    if not k.startswith('_') and not callable(v)},
+                    'config_content': config_content,
+                    'config_path': cfg_path,
                 }, best_model_path)
+
+            # Save latest model
             torch.save({
-                "policy_state_dict": policy.state_dict(),
-                "value_state_dict": value_net.state_dict(),
-                "current_reward": eval_reward,
-                "best_reward": best_eval_reward,
-                "best_episode": best_eval_episode,
-                "config_content": config_content,
-                "config_path": cfg_path,
+                'policy_state_dict': policy.state_dict(),
+                'value_state_dict': value_module.state_dict(),
+                'current_reward': eval_reward,
+                'best_reward': best_eval_reward,
+                'episode': episode_count,
+                'best_episode': best_eval_episode,
+                'batch_idx': batch_idx,
+                'hyperparameters': {k: v for k, v in hp.__dict__.items() 
+                                if not k.startswith('_') and not callable(v)},
+                'config_content': config_content,
+                'config_path': cfg_path,
+            }, os.path.join(checkpoint_dir, f'model-{batch_idx+1}.pt'))
+            # for convenience also save as latest-model.pt
+            torch.save({
+                'policy_state_dict': policy.state_dict(),
+                'value_state_dict': value_module.state_dict(),
+                'current_reward': eval_reward,
+                'best_reward': best_eval_reward,
+                'episode': episode_count,
+                'best_episode': best_eval_episode,
+                'batch_idx': batch_idx,
+                'hyperparameters': {k: v for k, v in hp.__dict__.items() 
+                                if not k.startswith('_') and not callable(v)},
+                'config_content': config_content,
+                'config_path': cfg_path,
             }, latest_model_path)
 
+            eval_str = f"eval reward: {eval_reward:.5f} (best: {best_eval_reward:.5f})"
+
+        # Progress bar update
         pbar.set_postfix({
             "train_reward": f"{train_reward:.5f}",
+            "eval": eval_str,
             "lr": f"{optim.param_groups[0]['lr']:.2e}",
         })
         pbar.update(hp.episodes_per_batch)
 
+        #scheduler.step()
+        batch_idx += 1
+
     pbar.close()
+    if episode_pbar:
+        episode_pbar.close()
+
     collector.shutdown()
-    writer.close()
+    writer.close() # tensorboard writer
     env.close()
+
+def evaluate_policy(env, policy, num_steps=1000000): 
+    # _check_done will take care of num_steps, but done is not resetting env for some reason
+    """Evaluate policy without exploration using consistent IC"""
+    #print("Evaluating policy...")
+    env.set_evaluation_mode(True)  # Use same IC
+    try:
+        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+            eval_rollout = env.rollout(num_steps, policy)
+            eval_reward = eval_rollout["next", "reward"].mean().item()
+            #print(f"Eval rewards var: {eval_rollout['next', 'reward']}")
+            #print(f"Eval rewards: {eval_reward}")
+            del eval_rollout
+            return eval_reward
+    finally:
+        env.set_evaluation_mode(False)  # Reset to training mode
+        #print("Evaluation complete.Returning to training mode.")
+
+def get_closest_divisor(n, target):
+    """
+    Finds the closest divisor of n to the target value.
+    
+    Args:
+        n (int): The number to find divisors for.
+        target (int): The target divisor to approach.
+        
+    Returns:
+        int: The closest divisor to the target.
+    """
+    # Find all divisors of n
+    divisors = set()
+    for i in range(1, int(math.sqrt(n)) + 1):
+        if n % i == 0:
+            divisors.add(i)
+            divisors.add(n // i)
+    
+    # Find the divisor with the minimum absolute difference to the target
+    closest = min(divisors, key=lambda x: (abs(x - target), -x))  # Prefer larger divisor if tie
+    return closest
 
 def compare_configs(checkpoint_config, current_config):
     """
@@ -597,3 +790,14 @@ class HyperParameters:
 
         # Print legend
         print("\nSource: [C]=From .ini config file, [D]=Default, [-]=Derived")
+
+def get_device_count(backend_name):
+    """Get number of available devices for given backend"""
+    if backend_name == 'hip':
+        from pyfr.backends.hip.driver import HIP
+        return HIP().device_count()
+    elif backend_name == 'cuda':
+        from pyfr.backends.cuda.driver import CUDA
+        return CUDA().device_count()
+    else:
+        return 1  # For CPU backends like 'openmp'
