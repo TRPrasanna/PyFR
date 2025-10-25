@@ -134,7 +134,8 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
             actor_mlp,
             NormalParamExtractor(
                 scale_mapping="biased_softplus_1.0",
-                scale_lb=0.1,   # lower bound for scale
+                scale_lb=0.1,   # lower bound for scale, this over-rides min_val in 
+                                # tensordict/nn/distributions/continuous.py class biased_softplus() if scale_lb > 0.01
             ).to(device)
         )
 
