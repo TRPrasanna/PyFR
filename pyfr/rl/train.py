@@ -16,7 +16,7 @@ from tensordict.nn import (
 )
 from torchrl.collectors import MultiSyncDataCollector
 from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
-from torchrl.data.replay_buffers.samplers import SliceSampler
+from torchrl.data.replay_buffers.samplers import SliceSamplerWithoutReplacement
 from torchrl.envs import Compose, InitTracker, StepCounter, TransformedEnv
 from torchrl.envs.transforms import TensorDictPrimer
 from torchrl.envs.utils import ExplorationType, set_exploration_type
@@ -45,13 +45,13 @@ def train_agent(
     ic_dir=None,
     load_model=None,
 ):
-    # Get config path at the start
+    # Resolve config path (string) for reproducibility in checkpoints
     if hasattr(cfg_file, "name"):
         cfg_path = cfg_file.name
     else:
         cfg_path = cfg_file
 
-    # Read config file content now (for checkpoint reproducibility)
+    # Read config file content now so we can store it in checkpoints
     try:
         with open(cfg_path, "r") as f:
             config_content = f.read()
@@ -60,14 +60,13 @@ def train_agent(
         config_content = None
 
     # =========================
-    # Env init (root env first)
+    # Environment initialization
     # =========================
+    # StepCounter(): gives per-episode step index
+    # InitTracker(): marks reset boundaries ("is_init"), which TorchRL uses to reset recurrent state
     env = PyFREnvironment(
         mesh_file, cfg_path, backend_name, 0, ic_dir=ic_dir, print_diagnostic=True
     )
-    # Wrap with:
-    # - StepCounter() gives per-episode step idx
-    # - InitTracker() marks reset boundaries ("is_init"), needed for recurrent state resets
     env = TransformedEnv(env, Compose(StepCounter(), InitTracker()))
 
     if "neuralnetwork-hyperparameters" not in env.cfg.sections():
@@ -77,9 +76,124 @@ def train_agent(
         )
 
     hp = HyperParameters.from_config(env.cfg)
-    hp._calculate_derived(env)
-
+    hp._calculate_derived(env)  # fills in actions_per_episode, train_batch_size, total_frames
     device = torch.device(hp.torch_device)
+
+    # =======================================================
+    # RLlib-style minibatch / TBPTT schedule resolution
+    # =======================================================
+    #
+    # RLlib knobs we mirror:
+    #   - train_batch_size         (derived): total timesteps per update batch
+    #   - recurrent_seq_len        (hp.recurrent_seq_len): TBPTT window
+    #   - sgd_minibatch_size       (hp.sgd_minibatch_size): timesteps per SGD minibatch
+    #   - num_sgd_iter             (hp.num_sgd_iter): epochs over that batch
+    #
+    # Constraints we enforce:
+    #   1. recurrent_seq_len <= episode_length
+    #      (otherwise we'd have to slice in the middle and stitch hidden state;
+    #       we can add that later, but for now we clamp and warn)
+    #
+    #   2. sgd_minibatch_size must:
+    #        - be >0
+    #        - be a multiple of recurrent_seq_len
+    #        - divide train_batch_size with no remainder
+    #
+    #      If user gives 0 or something invalid, we AUTO-PICK a safe value
+    #      and warn. The auto-pick tries to use full episodes as minibatches
+    #      (so each minibatch is contiguous and we don't split episodes).
+    #
+    # After this resolution, EVERY timestep in the batch is used exactly once
+    # per epoch. No leftovers are dropped.
+
+    episode_len = hp.actions_per_episode  # length of a single rollout episode in env steps
+    requested_seq_len = hp.recurrent_seq_len
+
+    if requested_seq_len > episode_len:
+        print(
+            f"WARNING: requested recurrent_seq_len ({requested_seq_len}) "
+            f"is longer than a single episode length ({episode_len}). "
+            "This would force mid-episode truncation and hidden-state stitching, "
+            "and would normally waste data. "
+            f"Clamping recurrent_seq_len down to {episode_len} so that each sequence "
+            "is exactly one full episode and we can consume the entire batch."
+        )
+        effective_seq_len = episode_len
+    else:
+        effective_seq_len = requested_seq_len
+
+    # train_batch_size is total frames per update, like RLlib train_batch_size
+    train_batch_size = hp.train_batch_size
+
+    # Now pick/adjust sgd_minibatch_size
+    requested_minibatch = hp.sgd_minibatch_size
+
+    def _valid_minibatch_sizes(train_bs, seq_len):
+        # return all divisors of train_bs that are also multiples of seq_len
+        vals = []
+        for m in range(seq_len, train_bs + 1, seq_len):
+            if train_bs % m == 0:
+                vals.append(m)
+        return vals
+
+    valid_sizes = _valid_minibatch_sizes(train_batch_size, effective_seq_len)
+
+    if not valid_sizes:
+        # This should basically never happen for sane integers,
+        # but just in case, fallback to using the whole batch.
+        valid_sizes = [train_batch_size]
+
+    def _pick_closest_size(target, candidates):
+        # choose candidate closest to target; if tie, choose smaller
+        return min(candidates, key=lambda x: (abs(x - target), x))
+
+    schedule_notes = []
+
+    if requested_minibatch <= 0:
+        # auto mode: prefer "one full episode per minibatch" if that tiles perfectly.
+        # one episode per minibatch = episode_len.
+        if (episode_len in valid_sizes) and (train_batch_size % episode_len == 0):
+            chosen_minibatch = episode_len
+        else:
+            # fallback: choose the smallest valid size to get more SGD steps
+            chosen_minibatch = min(valid_sizes)
+
+        schedule_notes.append(
+            "[schedule notice] sgd_minibatch_size was 0 or invalid; "
+            f"auto-selected {chosen_minibatch} so that we cover all {train_batch_size} steps with no leftovers."
+        )
+    else:
+        # user-specified minibatch size: snap it to something valid
+        chosen_minibatch = _pick_closest_size(requested_minibatch, valid_sizes)
+        if chosen_minibatch != requested_minibatch:
+            schedule_notes.append(
+                "[schedule notice] requested sgd_minibatch_size "
+                f"{requested_minibatch} cannot tile train_batch_size={train_batch_size} "
+                f"with recurrent_seq_len={effective_seq_len}. "
+                f"Using {chosen_minibatch} instead so every sample is used."
+            )
+
+    # how many minibatches per epoch
+    actual_num_minibatches = train_batch_size // chosen_minibatch
+
+    # sanity: coverage
+    used_steps = actual_num_minibatches * chosen_minibatch
+    assert used_steps == train_batch_size, (
+        "internal bug: minibatch tiling did not cover full batch"
+    )
+
+    # summary print
+    print("\nRecurrent PPO minibatch schedule (RLlib-style naming):")
+    print(f"  train_batch_size           = {train_batch_size}  # total timesteps per update")
+    print(f"  requested recurrent_seq_len= {requested_seq_len}")
+    print(f"  effective_seq_len          = {effective_seq_len}")
+    print(f"  requested sgd_minibatch    = {requested_minibatch}")
+    print(f"  chosen sgd_minibatch_size  = {chosen_minibatch}")
+    print(f"  num_sgd_iter (epochs)      = {hp.num_sgd_iter}")
+    print(f"  minibatches per epoch      = {actual_num_minibatches}")
+    print(f"  coverage check: {actual_num_minibatches} * {chosen_minibatch} = {used_steps} (should equal {train_batch_size})")
+    for note in schedule_notes:
+        print(note)
 
     hp.print_summary()
 
@@ -117,7 +231,7 @@ def train_agent(
                 return None
         return None
 
-    # ---- Policy recurrent backbone (LSTM over observations) ----
+    # Policy recurrent backbone
     actor_lstm = LSTMModule(
         input_size=input_shape[-1],
         hidden_size=hp.lstm_hidden_size_policy,
@@ -191,7 +305,7 @@ def train_agent(
         },
     ).to(device)
 
-    # ---- Value recurrent backbone ----
+    # Value recurrent backbone
     value_lstm = LSTMModule(
         input_size=input_shape[-1],
         hidden_size=hp.lstm_hidden_size_value,
@@ -237,8 +351,8 @@ def train_agent(
     # ================================
     # Register primers for recurrence
     # ================================
-    # The primers inject recurrent state keys ("hidden", "cell", "is_init", etc.)
-    # into the env rollout TensorDict so SliceSampler can later recover them.
+    # Primers inject recurrent state keys ("recurrent_state_h", "recurrent_state_c", "is_init", etc.)
+    # into the rollout tensordict so SliceSamplerWithoutReplacement can grab contiguous sequences.
     def _append_primers_for_module(env_obj, module):
         primers = get_primers_from_module(module)
         if primers is None:
@@ -306,35 +420,33 @@ def train_agent(
     collector = MultiSyncDataCollector(
         create_env_fn=env_makers,
         policy=policy,
-        frames_per_batch=hp.frames_per_batch,
+        frames_per_batch=hp.train_batch_size,  # RLlib: train_batch_size
         total_frames=hp.total_frames,
-        split_trajs=False,          # keep trajectories as contiguous streams
-        reset_at_each_iter=True,    # reset each worker every collector iteration
+        split_trajs=False,          # keep trajectories contiguous
+        reset_at_each_iter=True,    # reset each worker between collector iterations
         device=device,
     )
 
     # ====================================
-    # Replay buffer for recurrent PPO
+    # Replay buffer for recurrent PPO minibatch slicing
     # ====================================
-    # We are doing on-policy PPO. We still use a replay buffer here as a
-    # convenient "minibatch slicer": SliceSampler draws short contiguous
-    # sequence windows (length seq_len) from the most recent rollout.
-    #
-    # batch_size = seqs_per_minibatch  (number of sequences per optimizer step)
-    # slice_len  = seq_len             (truncated BPTT length)
+    # SliceSamplerWithoutReplacement will:
+    #   - draw contiguous sequences of length slice_len (= effective_seq_len),
+    #   - pack several of those sequences together into a batch whose total length
+    #     equals chosen_minibatch.
+    # We set batch_size=minibatch_size_steps (chosen_minibatch).
     replay_buffer = TensorDictReplayBuffer(
-        storage=LazyTensorStorage(hp.frames_per_batch, device=device),
-        sampler=SliceSampler(
-            slice_len=hp.seq_len,
+        storage=LazyTensorStorage(hp.train_batch_size, device=device),
+        sampler=SliceSamplerWithoutReplacement(
+            slice_len=effective_seq_len,
             end_key=("next", "done"),
-            cache_values=True,
             strict_length=False,
         ),
-        batch_size=hp.seqs_per_minibatch,
+        batch_size=chosen_minibatch,
     )
 
     # ====================================
-    # Bookkeeping / checkpoint management
+    # Checkpoint bookkeeping
     # ====================================
     best_eval_reward = float("-inf")
     best_eval_episode = 0
@@ -365,7 +477,7 @@ def train_agent(
                         differences.append((key, saved_value, current_value))
 
         if differences:
-            key_width = 22
+            key_width = 28
             val_width = 20
             key_sep = "─" * (key_width + 2)
             val_sep = "─" * (val_width + 2)
@@ -432,16 +544,16 @@ def train_agent(
     latest_model_path = os.path.join(checkpoint_dir, "latest-model.pt")
     logs = defaultdict(list)
 
-    remaining_episodes = hp.episodes - start_episode
+    remaining_episodes = hp.episodes_total - start_episode
     pbar = tqdm(total=remaining_episodes, desc="Training", initial=start_episode)
     episode_count = start_episode
 
     eval_str = ""
 
     try:
-        episode_pbar = tqdm(total=hp.episodes, desc="Episodes", leave=False)
+        episode_pbar = tqdm(total=hp.episodes_total, desc="Episodes", leave=False)
         env.set_progress_bar(episode_pbar)
-    except Exception:  # noqa: BLE001
+    except Exception:
         print("Warning: Could not create episode progress bar")
         episode_pbar = None
         env.set_progress_bar(None)
@@ -450,13 +562,18 @@ def train_agent(
     log_path = os.path.join(checkpoint_dir, f"tensorboard_logs/{wallclock_datetime}")
     writer = SummaryWriter(log_dir=log_path)
 
-    # Store hyperparameters to tensorboard
+    # Store hyperparameters & resolved schedule to tensorboard
     hparam_dict = {}
     metric_dict = {}
     for key, value in hp.__dict__.items():
         if key not in ["_param_sources", "_derived_params"]:
             if isinstance(value, (int, float, str, bool)) or value is None:
                 hparam_dict[key] = value
+    # log derived schedule values that matter for debugging
+    hparam_dict["effective_seq_len"] = effective_seq_len
+    hparam_dict["chosen_sgd_minibatch_size"] = chosen_minibatch
+    hparam_dict["actual_num_minibatches"] = actual_num_minibatches
+    hparam_dict["train_batch_size"] = train_batch_size
 
     run_name = os.path.join(
         os.path.dirname(os.path.realpath(log_path)), f"{wallclock_datetime}"
@@ -464,81 +581,59 @@ def train_agent(
     print(f"Writing hyperparameters to tensorboard: {run_name}")
     writer.add_hparams(hparam_dict, metric_dict, run_name=run_name)
 
+    updates_per_batch = hp.num_sgd_iter * actual_num_minibatches
+
     # =========================
     # Main training loop
     # =========================
     batch_idx = start_batch_idx
-    for _, tensordict_data_cpu in enumerate(collector):
-        # on-policy batch collected from all envs
-        episode_count += hp.episodes_per_batch
-
-        tensordict_data = tensordict_data_cpu.to(device)
+    for _, tensordict_data in enumerate(collector):
+        # tensordict_data_cpu: rollout from all env workers,
+        # length should be train_batch_size steps total
+        episode_count += hp.rollout_fragment_episodes
 
         # quick scalar reward logging from rollout
         train_reward = tensordict_data["next", "reward"].mean().item()
         writer.add_scalar("batch/train_reward", train_reward, batch_idx)
-        writer.add_scalar("batch/episodes", episode_count, batch_idx)
+        writer.add_scalar("batch/episodes_so_far", episode_count, batch_idx)
         writer.add_scalar(
             "batch/learning_rate", optim.param_groups[0]["lr"], batch_idx
         )
-
-        # For recurrent PPO:
-        # We will run hp.num_epochs epochs.
-        # In each epoch we:
-        #   1. recompute GAE (advantages and value targets) with current critic
-        #   2. dump the (updated) rollout into the replay buffer
-        #   3. sample hp.updates_per_epoch minibatches, each minibatch is
-        #      seqs_per_minibatch sequences of length seq_len, and do an optimizer step
-        for epoch_idx in range(hp.num_epochs):
-            advantage_module(tensordict_data) # could recompute advantages per innermost loop, like in non-recurrent PPO?
-
+        
+        for epoch_idx in range(hp.num_sgd_iter):
+            advantage_module(tensordict_data)
             data_view = tensordict_data.reshape(-1)
-
-            # load rollout into buffer for this epoch
+            # refill replay buffer for this epoch (ring buffer semantics)
             replay_buffer.extend(data_view)
 
-            for update_idx in range(hp.updates_per_epoch):
-                # sample one recurrent minibatch
+            for sub_update_idx in range(actual_num_minibatches):
                 subdata = replay_buffer.sample()
 
-                # forward PPO loss dict
+                # PPO loss dict
                 loss_vals = loss_module(subdata)
-
                 loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
                 if hp.entropy_eps > 0:
-                    entropy_term = loss_vals.get("loss_entropy", 0.0)
-                    if isinstance(entropy_term, torch.Tensor):
-                        loss_value = loss_value + entropy_term
-                    else:
-                        loss_value = loss_value + torch.tensor(
-                            entropy_term, device=device
-                        )
+                    loss_value = loss_value + loss_vals["loss_entropy"]
 
                 # scalars for logging
                 policy_obj = loss_vals["loss_objective"].item()
                 val_loss = loss_vals["loss_critic"].item()
                 ent_loss = (
-                    loss_vals.get(
-                        "loss_entropy", torch.tensor(0.0, device=device)
-                    )
-                    .detach()
-                    .item()
+                    loss_vals.get("loss_entropy", 0.0).item()
+                    if isinstance(loss_vals.get("loss_entropy", 0.0), torch.Tensor)
+                    else 0.0
                 )
 
-                # truncated BPTT backward through seq_len
+                # truncated BPTT backward through effective_seq_len
                 loss_value.backward()
-
                 grad_norm = nn.utils.clip_grad_norm_(
                     loss_module.parameters(), hp.max_grad_norm
                 )
 
-                optim.step()
-                optim.zero_grad()
-
                 global_update_idx = (
-                    batch_idx * (hp.num_epochs * hp.updates_per_epoch)
-                    + epoch_idx * hp.updates_per_epoch
-                    + update_idx
+                    batch_idx * updates_per_batch
+                    + epoch_idx * actual_num_minibatches
+                    + sub_update_idx
                 )
 
                 writer.add_scalar(
@@ -548,7 +643,10 @@ def train_agent(
                 writer.add_scalar("loss/entropy_bonus", ent_loss, global_update_idx)
                 writer.add_scalar("grad/norm", grad_norm, global_update_idx)
 
-        # After PPO updates on this batch, sync new weights to collectors
+                optim.step()
+                optim.zero_grad()
+
+        # push the new weights to collectors
         collector.update_policy_weights_()
 
         logs["train_reward"].append(train_reward)
@@ -611,7 +709,11 @@ def train_agent(
             )
             torch.save(checkpoint_payload, latest_model_path)
 
-            eval_str = f"eval reward: {eval_reward:.5f} (best: {best_eval_reward:.5f})"
+            eval_str = (
+                f"eval reward: {eval_reward:.5f} (best: {best_eval_reward:.5f})"
+            )
+        else:
+            eval_str = eval_str
 
         pbar.set_postfix(
             {
@@ -620,7 +722,7 @@ def train_agent(
                 "lr": f"{optim.param_groups[0]['lr']:.2e}",
             }
         )
-        pbar.update(hp.episodes_per_batch)
+        pbar.update(hp.rollout_fragment_episodes)
 
         batch_idx += 1
 
@@ -634,7 +736,7 @@ def train_agent(
 
 
 def evaluate_policy(env, policy, num_steps=1_000_000):
-    """Evaluate policy without exploration using consistent IC"""
+    """Evaluate policy without exploration"""
     env.set_evaluation_mode(True)
     try:
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
@@ -644,23 +746,6 @@ def evaluate_policy(env, policy, num_steps=1_000_000):
             return eval_reward
     finally:
         env.set_evaluation_mode(False)
-
-
-def get_closest_divisor(n, target):
-    """
-    Finds the closest divisor of n to the target value.
-    """
-    divisors = set()
-    for i in range(1, int(math.sqrt(n)) + 1):
-        if n % i == 0:
-            divisors.add(i)
-            divisors.add(n // i)
-
-    closest = min(
-        divisors,
-        key=lambda x: (abs(x - target), -x),
-    )
-    return closest
 
 
 def compare_configs(checkpoint_config, current_config):
@@ -719,58 +804,59 @@ class HyperParameters:
     activation_value: str = "Tanh"
     state_ind_normal_scale: bool = False
 
-    # Recurrent settings
+    # Recurrent net sizes
     lstm_hidden_size_policy: int = 256
     lstm_hidden_size_value: int = 256
     lstm_num_layers_policy: int = 1
     lstm_num_layers_value: int = 1
     lstm_dropout: float = 0.0
 
-    # PPO / rollout scheduling
-    episodes: int = 1200                # total episodes to train
-    episodes_per_batch: int = 20        # how many episodes (across envs) collected before one PPO update phase
-    num_epochs: int = 4                 # PPO epochs per on-policy batch
+    # === RLlib-style PPO / rollout scheduling ===
+    episodes_total: int = 2000            # total number of episodes we plan to run
+    rollout_fragment_episodes: int = 20    # how many full episodes we gather per update iteration
+    recurrent_seq_len: int = 100          # requested TBPTT window (RLlib: recurrent_seq_len)
+    sgd_minibatch_size: int = 0          # requested timesteps per SGD minibatch (RLlib: sgd_minibatch_size). 0=auto
+    num_sgd_iter: int = 10                # PPO epochs per batch (RLlib: num_sgd_iter)
 
-    # Recurrent minibatch (truncated BPTT) schedule
-    seq_len: int = 64                   # unroll length for LSTM per sampled sequence (TBPTT horizon)
-    seqs_per_minibatch: int = 32        # number of sequences per optimizer step
-    updates_per_epoch: int = 8          # how many optimizer steps per epoch
-
-    # PPO parameters
+    # PPO loss parameters
     clip_epsilon: float = 0.2
-    gamma: float = 0.99
+    gamma: float = 0.97
     lmbda: float = 0.97
     entropy_eps: float = 1e-3
-    lr: float = 3e-4
-    max_grad_norm: float = 1.0
+    lr: float = 1e-4
+    max_grad_norm: float = 10.0
 
-    # Evaluation
+    # Eval
     eval_frequency: int = 1
 
+    # ---------- Derived values (filled after env is known) ----------
+    # actions_per_episode: timesteps per episode (env.dtend / env.action_interval)
+    # train_batch_size:    total timesteps per PPO update iteration
+    # total_frames:        total timesteps across entire training horizon
     def __post_init__(self):
         self._param_sources = {
             field_name: "default" for field_name in self.__dataclass_fields__.keys()
         }
-        # Derived values are computed after env is known
         self._derived_params = {
-            "frames_per_batch",
-            "total_frames",
             "actions_per_episode",
+            "train_batch_size",
+            "total_frames",
         }
         self.actions_per_episode = None
-        self.frames_per_batch = None
+        self.train_batch_size = None
         self.total_frames = None
 
     def _calculate_derived(self, env):
-        # env.dtend / env.action_interval is how many actions per episode
+        # one episode length in env steps
         self.actions_per_episode = int(env.dtend / env.action_interval)
 
-        # frames collected from all envs before PPO update
-        # episodes_per_batch episodes * actions_per_episode timesteps each
-        self.frames_per_batch = self.episodes_per_batch * self.actions_per_episode
+        # RLlib-style train_batch_size = rollout_fragment_episodes * episode_len
+        self.train_batch_size = (
+            self.rollout_fragment_episodes * self.actions_per_episode
+        )
 
-        # total frames seen over entire training horizon
-        self.total_frames = self.episodes * self.actions_per_episode
+        # total frames for bookkeeping / collector
+        self.total_frames = self.episodes_total * self.actions_per_episode
 
     @classmethod
     def from_config(cls, cfg: Inifile) -> "HyperParameters":
@@ -787,7 +873,6 @@ class HyperParameters:
                     field_name not in params._derived_params
                     and cfg.hasopt(section, config_name)
                 ):
-                    # type dispatch
                     if field.type == int:
                         value = cfg.getint(section, config_name)
                     elif field.type == float:
@@ -801,57 +886,57 @@ class HyperParameters:
         return params
 
     def print_summary(self) -> None:
+        # nice console dump, updated to RLlib-y naming where relevant
         sections = {
             "General Settings": [
                 ("torch_device", "'cuda' or 'cpu'"),
                 ("print_config_on_load", "Print config file content on model load"),
             ],
             "Network Architecture": [
-                ("num_hidden_layers_policy", "No. of hidden layers in policy network"),
-                ("num_hidden_layers_value", "No. of hidden layers in value network"),
-                ("num_cells_policy", "Size of policy network hidden layers"),
-                ("num_cells_value", "Size of value network hidden layers"),
-                ("activation_policy", "Activation function for policy network"),
-                ("activation_value", "Activation function for value network"),
-                ("state_ind_normal_scale", "state-independent normal scale for actions"),
+                ("num_hidden_layers_policy", "Hidden layers in policy MLP"),
+                ("num_hidden_layers_value", "Hidden layers in value MLP"),
+                ("num_cells_policy", "Hidden units per layer (policy)"),
+                ("num_cells_value", "Hidden units per layer (value)"),
+                ("activation_policy", "Activation function for policy MLP"),
+                ("activation_value", "Activation function for value MLP"),
+                ("state_ind_normal_scale", "Use state-independent action std"),
             ],
             "Recurrent Architecture": [
-                ("lstm_hidden_size_policy", "Hidden size of policy LSTM"),
-                ("lstm_hidden_size_value", "Hidden size of value LSTM"),
-                ("lstm_num_layers_policy", "Number of LSTM layers in policy"),
-                ("lstm_num_layers_value", "Number of LSTM layers in value"),
-                ("lstm_dropout", "Dropout prob between stacked LSTM layers"),
+                ("lstm_hidden_size_policy", "Policy LSTM hidden size"),
+                ("lstm_hidden_size_value", "Value LSTM hidden size"),
+                ("lstm_num_layers_policy", "Policy LSTM layers"),
+                ("lstm_num_layers_value", "Value LSTM layers"),
+                ("lstm_dropout", "LSTM dropout between stacked layers"),
             ],
-            "Rollout / PPO Schedule": [
-                ("episodes", "Total training episodes"),
-                ("episodes_per_batch", "Episodes collected per PPO batch"),
-                ("num_epochs", "PPO epochs per on-policy batch"),
-                ("seq_len", "Truncated BPTT length (timesteps per sequence)"),
-                ("seqs_per_minibatch", "Sequences per optimizer step"),
-                ("updates_per_epoch", "Optimizer steps per epoch"),
+            "Rollout / PPO Schedule (RLlib-ish)": [
+                ("episodes_total", "Total env episodes to train"),
+                ("rollout_fragment_episodes", "Episodes gathered per update"),
+                ("recurrent_seq_len", "Requested recurrent_seq_len (TBPTT window)"),
+                ("sgd_minibatch_size", "Requested sgd_minibatch_size (timesteps per SGD minibatch, 0=auto)"),
+                ("num_sgd_iter", "num_sgd_iter (epochs per batch)"),
             ],
             "PPO Parameters": [
-                ("clip_epsilon", "PPO clipping parameter"),
+                ("clip_epsilon", "PPO clipping epsilon"),
                 ("gamma", "Discount factor"),
-                ("lmbda", "GAE lambda parameter"),
-                ("entropy_eps", "Entropy bonus coefficient"),
+                ("lmbda", "GAE lambda"),
+                ("entropy_eps", "Entropy bonus coeff"),
                 ("lr", "Learning rate"),
                 ("max_grad_norm", "Gradient clipping norm"),
             ],
             "Derived Values": [
-                ("frames_per_batch", "Frames per PPO batch"),
-                ("total_frames", "Total frames overall"),
-                ("actions_per_episode", "Actions per episode"),
+                ("actions_per_episode", "Episode length in env steps"),
+                ("train_batch_size", "train_batch_size (timesteps per update)"),
+                ("total_frames", "Total timesteps over full training run"),
             ],
             "Evaluation Settings": [
-                ("eval_frequency", "Evaluate policy every N PPO batches"),
+                ("eval_frequency", "Evaluate policy every N updates"),
             ],
         }
 
-        param_width = 25
+        param_width = 30
         value_width = 15
         src_width = 5
-        desc_width = 40
+        desc_width = 50
 
         def wrap_text(text, width):
             if len(text) <= width:
@@ -943,9 +1028,7 @@ class HyperParameters:
                     source = "[D]"
 
                 desc_lines = wrap_text(description, desc_width)
-
                 print(format_row(param_name, value, source, desc_lines[0]))
-
                 for line in desc_lines[1:]:
                     print(format_row("", "", "", line, is_continuation=True))
 
