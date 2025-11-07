@@ -36,16 +36,59 @@ class PyFREnvironment(EnvBase):
         self.backend = get_backend(backend_name, self.cfg)
         self.rallocs = get_rank_allocation(self.mesh, self.cfg)
 
+        rl_section = 'solver-plugin-reinforcementlearning'
+
         self.tend = self.cfg.getfloat('solver-time-integrator', 'tend')
-        self.num_control_actions = self.cfg.getint('solver-plugin-reinforcementlearning', 'num-control-actions')
-        self.actions_low = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-low')
-        self.actions_high = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-high')
-        self.actions_init = self.cfg.getliteral('solver-plugin-reinforcementlearning', 'actions-init')
+        self.num_control_actions = self.cfg.getint(rl_section, 'num-control-actions')
+        self.actions_low = self.cfg.getliteral(rl_section, 'actions-low')
+        self.actions_high = self.cfg.getliteral(rl_section, 'actions-high')
+        self.actions_init = self.cfg.getliteral(rl_section, 'actions-init')
         # check if there are num_control_actions action_lows and action_highs
         assert len(self.actions_low) == self.num_control_actions
         assert len(self.actions_high) == self.num_control_actions
         assert len(self.actions_init) == self.num_control_actions
 
+        # Goal-conditioned targets configuration
+        self.num_reward_targets = self.cfg.getint(rl_section, 'num-reward-targets', 0)
+        self.targets_low = None
+        self.targets_high = None
+        self.eval_target = None
+        self.current_targets = None
+        self._target_tensor = None
+        self._target_rng = np.random.default_rng()
+
+        if self.num_reward_targets:
+            low_cfg = self.cfg.getliteral(rl_section, 'targets-low', None)
+            high_cfg = self.cfg.getliteral(rl_section, 'targets-high', None)
+            if low_cfg is None or high_cfg is None:
+                raise ValueError("targets-low and targets-high must be specified when num-reward-targets > 0")
+
+            self.targets_low = np.array(low_cfg, dtype=np.float64)
+            self.targets_high = np.array(high_cfg, dtype=np.float64)
+
+            if len(self.targets_low) != self.num_reward_targets or len(self.targets_high) != self.num_reward_targets:
+                raise ValueError("targets-low and targets-high must each contain num-reward-targets values")
+
+            if np.any(self.targets_high < self.targets_low):
+                raise ValueError("targets-high must be greater than or equal to targets-low for every reward target")
+
+            eval_cfg = self.cfg.getliteral(rl_section, 'eval-target', None)
+            if eval_cfg is not None:
+                self.eval_target = np.array(eval_cfg, dtype=np.float64)
+                if len(self.eval_target) != self.num_reward_targets:
+                    raise ValueError("eval-target must contain num-reward-targets values")
+                if np.any(self.eval_target < self.targets_low) or np.any(self.eval_target > self.targets_high):
+                    raise ValueError("eval-target entries must lie within [targets-low, targets-high]")
+
+            if print_diagnostic:
+                print("Goal-conditioned targets enabled:")
+                print(f"  targets-low : {self.targets_low}")
+                print(f"  targets-high: {self.targets_high}")
+                if self.eval_target is not None:
+                    print(f"  eval-target : {self.eval_target}")
+
+        # Select an initial target before the solver is constructed
+        self._select_target_vector(force_eval=False)
 
         if print_diagnostic:
             print(f"Number of control actions: {self.num_control_actions}")
@@ -64,7 +107,7 @@ class PyFREnvironment(EnvBase):
         # Track current episode time limit
         self._current_time_limit = self.dtend
 
-        self.action_interval = self.cfg.getfloat('solver-plugin-reinforcementlearning', 'action-interval')
+        self.action_interval = self.cfg.getfloat(rl_section, 'action-interval')
         # Calculate max steps from time limits
         self.max_training_steps = int(self.dtend / self.action_interval)
         self.max_eval_steps = int(self.eval_time / self.action_interval)
@@ -201,6 +244,7 @@ class PyFREnvironment(EnvBase):
         self.step_count = 0
         self.current_control = np.array(self.actions_init)
         self.previous_control = np.array(self.actions_init)
+        self._select_target_vector()
 
         restart_soln = None
         # Handle evaluation mode differently
@@ -310,12 +354,45 @@ class PyFREnvironment(EnvBase):
         self._current_time_limit = self.eval_time if is_evaluating else self.dtend
         self._current_max_steps = self.max_eval_steps if is_evaluating else self.max_training_steps
         self.count_episodes = not is_evaluating  # Don't count during evaluation
+        # Ensure the next reset uses the correct target distribution
+        self._select_target_vector(force_eval=is_evaluating)
 
     def close(self):
         """Clean up resources"""
         # Don't finalize MPI here since other parts might still need it
         #self.solver = None
         #self.rl_plugin = None
+
+    def _select_target_vector(self, force_eval=None):
+        """Sample a new goal target vector depending on the current phase."""
+        if not self.num_reward_targets:
+            self.current_targets = None
+            return
+
+        use_eval = self.is_evaluating if force_eval is None else force_eval
+
+        if use_eval and self.eval_target is not None:
+            target = self.eval_target
+        elif use_eval:
+            target = 0.5 * (self.targets_low + self.targets_high)
+        else:
+            target = self._target_rng.uniform(self.targets_low, self.targets_high)
+
+        self.current_targets = np.array(target, dtype=np.float64)
+        # Invalidate cached tensor so the plugin appends the updated goal
+        self._target_tensor = None
+        #print(f"[GoalRL] Current targets: {self.current_targets}")
+
+    def get_current_targets_tensor(self):
+        """Return the current goal vector as a torch tensor for observations."""
+        if not self.num_reward_targets or self.current_targets is None:
+            return None
+
+        if self._target_tensor is None or self._target_tensor.numel() != self.num_reward_targets:
+            self._target_tensor = torch.zeros(self.num_reward_targets, device=self.device, dtype=torch.float32)
+
+        self._target_tensor.copy_(torch.as_tensor(self.current_targets, device=self.device, dtype=torch.float32))
+        return self._target_tensor
 
 class InitialConditionManager:
     def __init__(self, ic_dir: str, mesh_uuid: str, print_diagnostic=False):

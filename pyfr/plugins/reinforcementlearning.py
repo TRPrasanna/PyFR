@@ -41,7 +41,12 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
             raise ValueError(f"[reinforcementlearning] observation-variables: "
                              f"unknown name in {self.obs_var_names}; "
                              f"valid choices: {primitive_names}") from err
-        self.observation_size = len(self.pts) * len(self.var_indices)
+        base_obs = len(self.pts) * len(self.var_indices)
+
+        # Environment reference for goal-conditioned RL (if available)
+        self.env = getattr(intg.system, 'env', None)
+        self.goal_dim = getattr(self.env, 'num_reward_targets', 0) if self.env else 0
+        self.observation_size = base_obs + (self.goal_dim or 0)
         self.obs_var_names = [v.strip() for v in var_string.replace(',', ' ').split()] # to print for diagnostics
         #nvars = len(self.elementscls.privarmap[self.ndims]) if self.fmt == 'primitive' else len(self.elementscls.convarmap[self.ndims])
         #self.observation_size = len(self.pts) #* 2 #* 3 # * nvars for all variables
@@ -441,6 +446,13 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
         # Convert to tensor of 32-bit floats, check
         #print(f"Samples: {samples}")
         obs = torch.tensor(samples, device=self.device).flatten().float()
+
+        # Append goal targets if enabled
+        if self.goal_dim and self.env is not None:
+            tgt_tensor = self.env.get_current_targets_tensor()
+            if tgt_tensor is not None:
+                obs = torch.cat((obs, tgt_tensor.to(self.device)))
+
         return obs
 
     def _compute_std(self, history, mean):
@@ -529,16 +541,19 @@ class ReinforcementLearningPlugin(BaseSolverPlugin, SurfaceMixin, BaseSolnPlugin
 
         #print(f"manual reward={-np.abs(variables.get('avg_moment'))-2.0*variables.get('std_moment')}")
         #print(f"manual reward={-np.abs(variables.get('avg_moment')+0.01)-2.0*variables.get('std_moment')**2}")
+        env = self.env
+        if env and env.current_targets is not None:
+            variables['tgt'] = list(env.current_targets)
+
         try:
             # Safely evaluate the reward function using AST
             reward = float(self.expr_evaluator.evaluate(self.reward_function, variables))
             #print(f"ast reward = {reward}")
             return reward
         except Exception as e:
-            print(f"Error evaluating reward function: {e}")
-            # Fall back to a simple default reward
-            default_reward = -1000.0
-            return default_reward
+            raise RuntimeError(
+                f"Failed to evaluate reward function '{self.reward_function}': {e}"
+            ) from e
 
     def reset(self):
         #self.latest_observation.zero_()
@@ -661,6 +676,32 @@ class SafeExpressionEvaluator:
             if node.id in self._CONST:
                 return self._CONST[node.id]
             raise ValueError(f"Unknown variable: {node.id}")
+
+        # ----- subscriptions like tgt[0] -------------------------------------
+        if isinstance(node, ast.Subscript):
+            base = self._eval(node.value, env)
+
+            # Only allow constant integer indices
+            idx_node = node.slice
+            if isinstance(idx_node, ast.Constant):
+                idx_value = idx_node.value
+            elif hasattr(ast, 'Index') and isinstance(idx_node, ast.Index):
+                # ast.Index exists on Python <3.9; keep for completeness
+                inner = idx_node.value
+                if isinstance(inner, ast.Constant):
+                    idx_value = inner.value
+                else:
+                    raise ValueError("Only constant indices are supported in subscriptions")
+            else:
+                raise ValueError("Only constant indices are supported in subscriptions")
+
+            if not isinstance(idx_value, int):
+                raise ValueError("Subscript indices must be integers")
+
+            try:
+                return base[idx_value]
+            except Exception as exc:
+                raise ValueError(f"Invalid subscript access: {exc}") from None
 
         # ----- unary + / - ----------------------------------------------------
         if isinstance(node, ast.UnaryOp) and type(node.op) in self._OPS:
