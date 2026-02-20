@@ -71,15 +71,13 @@ class ReinforcementLearningPlugin(BaseSolverPlugin):
         self._ac = intg.system.name.startswith('ac')
         self._viscorr = self.cfg.get('solver', 'viscosity-correction', 'none')
         self._constants = self.cfg.items_as('constants', float)
-        self._visc_grad_source = self.cfg.get(cfgsect, 'viscous-grad-source',
-                                              'corrected')
-        if self._visc_grad_source not in {'local', 'corrected'}:
-            raise ValueError("viscous-grad-source must be 'local' or "
-                             "'corrected'")
-        if self._viscous and self._visc_grad_source == 'local' and rank == root:
-            print('[reinforcementlearning] viscous-grad-source=local '
-                  '(legacy fast mode): viscous gradients are not the '
-                  'corrected interface-consistent gradients.')
+        if self.cfg.hasopt(cfgsect, 'viscous-grad-source'):
+            vsrc = self.cfg.get(cfgsect, 'viscous-grad-source')
+            if vsrc != 'corrected':
+                raise ValueError(
+                    "viscous-grad-source='local' is no longer supported; "
+                    "use corrected gradients"
+                )
 
         mcomp = 3 if self.ndims == 3 else 1
         self._mcomp = mcomp if self.cfg.hasopt(cfgsect, 'morigin') else 0
@@ -105,33 +103,6 @@ class ReinforcementLearningPlugin(BaseSolverPlugin):
             self.ff_int[surf] = FluidForceIntegrator(
                 self.cfg, cfgsect, intg.system, surf, morigin
             )
-
-        # Fast path (v2-style): compute viscous gradients locally only for
-        # boundary elements touched by RL force integration.
-        if self._viscous and self._visc_grad_source == 'local':
-            self._m4 = {}
-            self._rcpjact = {}
-
-            for surf in self.surf_bnames:
-                ff_int = self.ff_int[surf]
-                etype_rcpjact = {}
-                self._m4[surf] = {}
-                self._rcpjact[surf] = {}
-
-                for (etype, fidx), eidx in ff_int.eidxs.items():
-                    eles = intg.system.ele_map[etype]
-
-                    if etype not in self._m4[surf]:
-                        self._m4[surf][etype] = eles.basis.m4
-
-                    if etype not in etype_rcpjact:
-                        smat = eles.smat_at_np('upts').transpose(2, 0, 1, 3)
-                        djac = eles.rcpdjac_at_np('upts')
-                        etype_rcpjact[etype] = smat * djac
-
-                    self._rcpjact[surf][etype, fidx] = (
-                        etype_rcpjact[etype][..., eidx]
-                    )
 
         self.nsteps = self.cfg.getint(cfgsect, 'nsteps', 10)
 
@@ -232,10 +203,7 @@ class ReinforcementLearningPlugin(BaseSolverPlugin):
         if self._viscous:
             pidx, vidx, midx = 0, 1, 2
             fm = np.zeros((3, ndims + mcomp))
-            if self._visc_grad_source == 'corrected':
-                grads = dict(zip(intg.system.ele_types, intg.grad_soln))
-            else:
-                grads = None
+            grads = dict(zip(intg.system.ele_types, intg.grad_soln))
         else:
             pidx, vidx, midx = 0, None, 1
             fm = np.zeros((2, ndims + mcomp))
@@ -269,18 +237,8 @@ class ReinforcementLearningPlugin(BaseSolverPlugin):
                                               qwts, rhovs, norms, vs)
 
                 if self._viscous:
-                    if self._visc_grad_source == 'corrected':
-                        duupts = grads[etype][..., ff_int.eidxs[etype, fidx]]
-                        duupts = duupts.reshape(ndims, nupts, -1)
-                    else:
-                        m4 = self._m4[surf][etype]
-                        rcpjact = self._rcpjact[surf][etype, fidx]
-
-                        # Compute physical gradients only for boundary elements.
-                        tduupts = m4 @ uupts.reshape(nupts, -1)
-                        tduupts = tduupts.reshape(ndims, nupts, self.nvars, -1)
-                        duupts = np.einsum('ijkl,jkml->ikml', rcpjact, tduupts)
-                        duupts = duupts.reshape(ndims, nupts, -1)
+                    duupts = grads[etype][..., ff_int.eidxs[etype, fidx]]
+                    duupts = duupts.reshape(ndims, nupts, -1)
 
                     dufpts = np.array([m0 @ du for du in duupts])
                     dufpts = dufpts.reshape(ndims, nfpts, self.nvars, -1)
