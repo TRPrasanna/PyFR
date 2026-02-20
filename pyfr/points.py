@@ -4,13 +4,18 @@ import numpy as np
 from rtree.index import Index, Property
 
 from pyfr.cache import memoize
-from pyfr.mpiutil import autofree, get_comm_rank_root, get_start_end_csize, mpi
+from pyfr.mpiutil import get_comm_rank_root, get_start_end_csize, mpi
 from pyfr.polys import get_polybasis
 from pyfr.shapes import BaseShape
 from pyfr.util import subclass_where
 
 
 class PointLocator:
+    # Cache MPI reduction operations keyed by (dtype descriptor, ndim).
+    # Creating an MPI user-op for every point-location call can exhaust
+    # the MPI implementation limit in long RL runs with frequent resets.
+    _minloc_ops = {}
+
     def __init__(self, mesh, fine_order=6):
         self.mesh = mesh
         self.fine_order = fine_order
@@ -83,25 +88,34 @@ class PointLocator:
 
     def _minloc(self, coll, x, y, ndim=None):
         dtype = y.dtype
-        fields = list(dtype.fields)[:ndim]
+        key = (repr(dtype.descr), ndim)
 
-        def op(pmem, qmem, dt):
-            p = np.frombuffer(pmem, dtype=dtype)
-            q = np.frombuffer(qmem, dtype=dtype)
+        if key in self._minloc_ops:
+            op = self._minloc_ops[key]
+        else:
+            fields = tuple(list(dtype.fields)[:ndim])
 
-            lmask = p[fields[0]] < q[fields[0]]
-            emask = p[fields[0]] == q[fields[0]]
+            def opfn(pmem, qmem, dt):
+                p = np.frombuffer(pmem, dtype=dtype)
+                q = np.frombuffer(qmem, dtype=dtype)
 
-            for f in fields[1:]:
-                lmask |= emask & (p[f] < q[f])
-                emask &= p[f] == q[f]
+                lmask = p[fields[0]] < q[fields[0]]
+                emask = p[fields[0]] == q[fields[0]]
 
-            q[lmask] = p[lmask]
+                for f in fields[1:]:
+                    lmask |= emask & (p[f] < q[f])
+                    emask &= p[f] == q[f]
+
+                q[lmask] = p[lmask]
+
+            # Keep a process-local cache of ops and reuse them.
+            op = mpi.Op.Create(opfn, commute=False)
+            self._minloc_ops[key] = op
 
         sbuf = (x, mpi.BYTE) if x is not mpi.IN_PLACE else x
         rbuf = (y, mpi.BYTE)
 
-        coll(sbuf, rbuf, op=autofree(mpi.Op.Create(op, commute=False)))
+        coll(sbuf, rbuf, op=op)
 
     @memoize
     def _get_nodes_off_tree(self):
