@@ -1,15 +1,12 @@
+import gc
 import os
 import random
 from datetime import datetime
-import gc
 from typing import List
 
+import gymnasium as gym
 import h5py
 import numpy as np
-import torch
-from tensordict import TensorDict
-from torchrl.data import Bounded, Categorical, Composite, Unbounded
-from torchrl.envs.common import EnvBase
 
 from pyfr.backends import get_backend
 from pyfr.inifile import Inifile
@@ -18,15 +15,14 @@ from pyfr.readers.native import NativeReader
 from pyfr.solvers import get_solver
 
 
-class PyFREnvironment(EnvBase):
-    """PyFR environment compatible with TorchRL."""
+class PyFREnvironment(gym.Env):
+    """PyFR environment compatible with Gymnasium/SB3."""
+
+    metadata = {}
 
     def __init__(self, mesh_file, cfg_file, backend_name, device_id,
                  ic_dir=None, print_diagnostic=False):
         init_mpi()
-
-        device = torch.device('cpu')
-        super().__init__(device=device)
 
         # Keep one mesh reader open and reuse it for loading restart solutions
         self.mesh_reader = NativeReader(mesh_file)
@@ -56,9 +52,13 @@ class PyFREnvironment(EnvBase):
             'solver-plugin-reinforcementlearning', 'actions-init'
         )
 
-        assert len(self.actions_low) == self.num_control_actions
-        assert len(self.actions_high) == self.num_control_actions
-        assert len(self.actions_init) == self.num_control_actions
+        if not (
+            len(self.actions_low)
+            == len(self.actions_high)
+            == len(self.actions_init)
+            == self.num_control_actions
+        ):
+            raise ValueError('Action bounds/init sizes do not match num-control-actions')
 
         if print_diagnostic:
             print(f'Number of control actions: {self.num_control_actions}')
@@ -67,6 +67,9 @@ class PyFREnvironment(EnvBase):
                     f'Control action {i + 1} range: '
                     f'{self.actions_low[i]} to {self.actions_high[i]}'
                 )
+
+        self._action_low_arr = np.asarray(self.actions_low, dtype=np.float32)
+        self._action_high_arr = np.asarray(self.actions_high, dtype=np.float32)
 
         self.current_control = np.array(self.actions_init, dtype=np.float64)
         self.previous_control = np.array(self.actions_init, dtype=np.float64)
@@ -109,6 +112,8 @@ class PyFREnvironment(EnvBase):
         self._init_solver(initsoln=restart_soln)
 
         obs_size = self.rl_plugin.observation_size
+        self.observation_size = obs_size
+
         if print_diagnostic:
             try:
                 var_list = self.rl_plugin.obs_var_names
@@ -123,56 +128,17 @@ class PyFREnvironment(EnvBase):
                 f"{', '.join(sorted(self.rl_plugin.used_variables))}"
             )
 
-        self.observation_spec = Composite(
-            {
-                'observation': Unbounded(shape=(obs_size,), device=self.device)
-            },
-            shape=torch.Size([])
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(obs_size,),
+            dtype=np.float32,
         )
-
-        self.state_spec = self.observation_spec.clone()
-
-        self.action_spec = Composite(
-            {
-                'action': Bounded(
-                    low=torch.tensor(self.actions_low, device=self.device),
-                    high=torch.tensor(self.actions_high, device=self.device),
-                    shape=(self.num_control_actions,),
-                    device=self.device
-                )
-            },
-            batch_size=torch.Size([])
-        )
-
-        self.reward_spec = Composite(
-            {
-                'reward': Unbounded(shape=(1,), device=self.device)
-            },
-            shape=torch.Size([])
-        )
-
-        self.full_done_spec = Composite(
-            {
-                'done': Categorical(
-                    n=2,
-                    shape=(1,),
-                    dtype=torch.bool,
-                    device=self.device
-                ),
-                'terminated': Categorical(
-                    n=2,
-                    shape=(1,),
-                    dtype=torch.bool,
-                    device=self.device
-                ),
-                'truncated': Categorical(
-                    n=2,
-                    shape=(1,),
-                    dtype=torch.bool,
-                    device=self.device
-                ),
-            },
-            shape=torch.Size([])
+        self.action_space = gym.spaces.Box(
+            low=self._action_low_arr,
+            high=self._action_high_arr,
+            shape=(self.num_control_actions,),
+            dtype=np.float32,
         )
 
         if print_diagnostic:
@@ -183,6 +149,7 @@ class PyFREnvironment(EnvBase):
         self.count_episodes = True
 
     def set_progress_bar(self, pbar):
+        # Kept for compatibility with older code paths.
         self.pbar = pbar
 
     def _load_restart_soln(self):
@@ -212,7 +179,7 @@ class PyFREnvironment(EnvBase):
             self.backend, self.mesh, self.restart_soln, self.cfg
         )
 
-        # The RL BC hooks and plugin read controls from env.
+        # RL BC hooks and plugin read controls from env.
         self.solver.env = self
         self.solver.system.env = self
 
@@ -224,7 +191,6 @@ class PyFREnvironment(EnvBase):
         self.max_time = self.current_time + self._current_time_limit
 
     def _release_solver(self):
-        # Ensure we do not hold two full solver instances at once during reset.
         if not hasattr(self, 'solver') or self.solver is None:
             return
 
@@ -239,10 +205,24 @@ class PyFREnvironment(EnvBase):
         del old_solver
         gc.collect()
 
-    def _get_observation_size(self):
-        return self.rl_plugin.observation_size
+    def _get_observation(self):
+        obs = self.rl_plugin._get_observation(self.solver)
 
-    def _reset(self, tensordict=None, **kwargs):
+        # Robust conversion: plugin may return numpy or torch tensor.
+        if hasattr(obs, 'detach'):
+            obs = obs.detach().cpu().numpy()
+
+        return np.asarray(obs, dtype=np.float32)
+
+    def _compute_reward(self):
+        return float(self.rl_plugin._get_reward(self.solver))
+
+    def _check_done(self) -> bool:
+        return self.step_count >= self._current_max_steps
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+
         self.step_count = 0
         self.current_control = np.array(self.actions_init, dtype=np.float64)
         self.previous_control = np.array(self.actions_init, dtype=np.float64)
@@ -253,36 +233,29 @@ class PyFREnvironment(EnvBase):
         self.rl_plugin.reset()
         observation = self._get_observation()
 
-        return TensorDict(
-            {
-                'observation': observation,
-                'done': torch.tensor(False, device=self.device,
-                                     dtype=torch.bool),
-                'terminated': torch.tensor(False, device=self.device,
-                                           dtype=torch.bool),
-                'truncated': torch.tensor(False, device=self.device,
-                                          dtype=torch.bool),
-            },
-            batch_size=torch.Size([])
-        )
+        info = {
+            'step_count': self.step_count,
+            'time': float(self.solver.tcurr),
+        }
 
-    def _step(self, tensordict):
+        return observation, info
+
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float64).reshape(self.num_control_actions)
+        action = np.clip(action, self._action_low_arr, self._action_high_arr)
+
         self.previous_control = self.current_control
-        self.current_control = tensordict['action'].detach().cpu().numpy()
-
-        if 'step_count' in tensordict.keys(True):
-            self.step_count = int(tensordict['step_count'].item())
-        else:
-            self.step_count += 1
+        self.current_control = action
+        self.step_count += 1
 
         if np.isnan(self.current_control).any():
             raise RuntimeError('Control signal is NaN. Aborting.')
 
         self.current_time = self.solver.tcurr
-        self.next_action_time = self.current_time + self.action_interval
+        next_action_time = self.current_time + self.action_interval
 
         try:
-            self.solver.advance_to(self.next_action_time)
+            self.solver.advance_to(next_action_time)
 
             reward = self._compute_reward()
             observation = self._get_observation()
@@ -292,10 +265,15 @@ class PyFREnvironment(EnvBase):
             if truncated and self.count_episodes:
                 self.episode_count += 1
 
+            info = {
+                'step_count': self.step_count,
+                'time': float(self.solver.tcurr),
+            }
+
         except RuntimeError as e:
             print(f'Solver crashed: {e}. Last actions were: {self.current_control}')
 
-            observation = self.observation_spec.zero(torch.Size([]))['observation']
+            observation = np.zeros(self.observation_space.shape, dtype=np.float32)
             reward = -10.0
             truncated = False
             terminated = True
@@ -303,38 +281,13 @@ class PyFREnvironment(EnvBase):
             if self.count_episodes:
                 self.episode_count += 1
 
-        return TensorDict(
-            {
-                'observation': observation,
-                'reward': torch.tensor([reward], device=self.device),
-                'done': torch.tensor([terminated or truncated],
-                                     device=self.device, dtype=torch.bool),
-                'terminated': torch.tensor([terminated],
-                                           device=self.device,
-                                           dtype=torch.bool),
-                'truncated': torch.tensor([truncated],
-                                          device=self.device,
-                                          dtype=torch.bool),
-            },
-            batch_size=tensordict.shape
-        )
+            info = {
+                'step_count': self.step_count,
+                'time': float(self.current_time),
+                'solver_crash': True,
+            }
 
-    def _get_observation(self):
-        obs = self.rl_plugin._get_observation(self.solver)
-
-        if isinstance(obs, torch.Tensor):
-            return obs.to(self.device)
-
-        return torch.tensor(obs, device=self.device).float()
-
-    def _compute_reward(self):
-        return float(self.rl_plugin._get_reward(self.solver))
-
-    def _check_done(self) -> bool:
-        return self.step_count + 1 >= self._current_max_steps
-
-    def _set_seed(self, seed):
-        torch.manual_seed(seed)
+        return observation, reward, terminated, truncated, info
 
     def set_evaluation_mode(self, is_evaluating: bool):
         self.is_evaluating = is_evaluating
@@ -344,13 +297,12 @@ class PyFREnvironment(EnvBase):
         )
         self.count_episodes = not is_evaluating
 
-    def close(self, *, raise_if_closed=True, **kwargs):
+    def close(self):
         self._release_solver()
         try:
             self.mesh_reader.close()
         except Exception:
             pass
-        super().close(raise_if_closed=raise_if_closed)
 
 
 class InitialConditionManager:
