@@ -39,7 +39,8 @@ def main():
     ap_eval = sp.add_parser('evaluate', help='evaluate trained policy')
     ap_eval.add_argument('mesh', help='mesh file')
     ap_eval.add_argument('cfg', type=FileType('r'), help='config file')
-    ap_eval.add_argument('--episodes', type=int, default=10, help='number of evaluation episodes')
+    ap_eval.add_argument('--episodes', type=int, default=1,
+                        help='number of evaluation episodes (default: 1)')
     ap_eval.add_argument('--load-model', required=True, help='path to model checkpoint')
     ap_eval.add_argument('--ic-dir', default=None,
                         help='directory of initial condition snapshots (optional)')

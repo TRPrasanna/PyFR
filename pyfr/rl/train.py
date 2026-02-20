@@ -10,7 +10,8 @@ import torch.nn as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy as sb3_evaluate_policy
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
+from tqdm.auto import tqdm
 
 from pyfr.inifile import Inifile
 from pyfr.rl.env import PyFREnvironment
@@ -170,7 +171,6 @@ class HyperParameters:
     num_cells_value: int = 512
     activation_policy: str = 'Tanh'
     activation_value: str = 'Tanh'
-    state_ind_normal_scale: bool = False  # Not used by SB3 PPO
 
     # Training schedule
     episodes: int = 1200
@@ -185,6 +185,9 @@ class HyperParameters:
     entropy_eps: float = 1e-3
     lr: float = 3e-4
     max_grad_norm: float = 1.0
+    use_sde: bool = False
+    sde_sample_freq: int = -1
+    squash_output: bool = True
 
     # Evaluation settings
     eval_frequency: int = 1
@@ -262,6 +265,13 @@ class HyperParameters:
             setattr(params, field_name, value)
             params._param_sources[field_name] = 'config'
 
+        # Legacy TorchRL option; no longer supported in SB3 path.
+        if cfg.hasopt(section, 'state-ind-normal-scale'):
+            print(
+                "Warning: 'state-ind-normal-scale' is deprecated and ignored. "
+                "Use 'use-sde = true/false' for SB3 gSDE control."
+            )
+
         return params
 
     def print_summary(self, num_devices, num_envs):
@@ -282,8 +292,7 @@ class HyperParameters:
                 ('num_cells_policy', 'Size of policy network hidden layers'),
                 ('num_cells_value', 'Size of value network hidden layers'),
                 ('activation_policy', 'Activation function used by SB3 policy/value'),
-                ('activation_value', 'Read from config; SB3 shares activation_fn'),
-                ('state_ind_normal_scale', 'TorchRL-only option (ignored in SB3 PPO)')
+                ('activation_value', 'Read from config; SB3 shares activation_fn')
             ],
             'Training Schedule': [
                 ('episodes', 'Total training episodes target'),
@@ -297,7 +306,10 @@ class HyperParameters:
                 ('lmbda', 'GAE lambda parameter'),
                 ('entropy_eps', 'Entropy bonus coefficient'),
                 ('lr', 'Learning rate'),
-                ('max_grad_norm', 'Gradient clipping norm')
+                ('max_grad_norm', 'Gradient clipping norm'),
+                ('use_sde', 'Enable generalized State-Dependent Exploration'),
+                ('sde_sample_freq', 'Noise resample frequency (-1 = per rollout)'),
+                ('squash_output', 'Tanh-squash actions (requires use_sde=true)')
             ],
             'SB3 Derived Values': [
                 ('actions_per_episode', 'Actions per episode'),
@@ -428,16 +440,15 @@ class HyperParameters:
 
         print('\nSource: [C]=From .ini config file, [D]=Default, [-]=Derived/runtime')
 
-        if self.state_ind_normal_scale:
-            print(
-                "\nNote: 'state-ind-normal-scale' is not directly supported "
-                'by SB3 PPO and is ignored.'
-            )
-
         if self.activation_policy != self.activation_value:
             print(
                 '\nNote: SB3 uses a shared activation_fn for policy and value. '
                 f"Using activation_policy='{self.activation_policy}'."
+            )
+
+        if self.squash_output and not self.use_sde:
+            print(
+                '\nNote: squash_output=true requires use_sde=true in SB3.'
             )
 
 
@@ -467,6 +478,43 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
 
         self.best_model_path = os.path.join(checkpoint_dir, 'best-model.zip')
         self.latest_model_path = os.path.join(checkpoint_dir, 'latest-model.zip')
+
+        # TorchRL-like progress reporting state
+        self._pbar = None
+        self._episodes_shown = max(0, int(start_episode))
+        self._latest_train_reward = None
+        self._latest_eval_str = ''
+
+    def _current_lr(self) -> float:
+        try:
+            return float(self.model.policy.optimizer.param_groups[0]['lr'])
+        except Exception:
+            return 0.0
+
+    def _episodes_done(self) -> int:
+        return int(self._total_timesteps() / max(1, self.hp.actions_per_episode))
+
+    def _set_progress_postfix(self):
+        if self._pbar is None:
+            return
+
+        postfix = {}
+        if self._latest_train_reward is not None:
+            postfix['train_reward'] = f'{self._latest_train_reward:.5f}'
+        if self._latest_eval_str:
+            postfix['eval'] = self._latest_eval_str
+        postfix['lr'] = f'{self._current_lr():.2e}'
+
+        self._pbar.set_postfix(postfix)
+
+    def _sync_progress_bar(self):
+        if self._pbar is None:
+            return
+
+        done = min(self.hp.episodes, self._episodes_done())
+        if done > self._episodes_shown:
+            self._pbar.update(done - self._episodes_shown)
+            self._episodes_shown = done
 
     def _total_timesteps(self) -> int:
         # When resuming, some SB3 saves restore num_timesteps and some flows
@@ -514,13 +562,8 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
         episodes_done = int(total_timesteps / max(1, self.hp.actions_per_episode))
         batch_idx = int(total_timesteps / max(1, self.hp.rollout_size))
 
-        if self.verbose:
-            print(
-                f'\n[eval] episodes={episodes_done} '
-                f'batch={batch_idx} '
-                f'reward={self.latest_eval_reward:.6f} '
-                f'best={self.best_eval_reward:.6f}'
-            )
+        # Keep training output concise (TorchRL-like): do not print a
+        # per-evaluation summary line here.
 
         model_batch_path = os.path.join(self.checkpoint_dir,
                                         f'model-{batch_idx}.zip')
@@ -552,6 +595,19 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
                 episodes_done
             )
 
+        self._latest_eval_str = (
+            f'eval reward: {self.latest_eval_reward:.5f} '
+            f'(best: {self.best_eval_reward:.5f})'
+        )
+        self._set_progress_postfix()
+
+    def _on_training_start(self):
+        initial = min(max(0, self._episodes_shown), self.hp.episodes)
+        self._episodes_shown = initial
+        self._pbar = tqdm(total=self.hp.episodes, desc='Training', initial=initial)
+        self._set_progress_postfix()
+        return None
+
     def _on_step(self):
         if self.num_timesteps - self._last_eval_timestep >= self.eval_freq_steps:
             self._run_eval_and_checkpoint()
@@ -559,10 +615,26 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
 
         return True
 
+    def _on_rollout_end(self):
+        rb = getattr(self.model, 'rollout_buffer', None)
+        if rb is not None and hasattr(rb, 'rewards'):
+            try:
+                self._latest_train_reward = float(rb.rewards.mean())
+            except Exception:
+                pass
+
+        self._sync_progress_bar()
+        self._set_progress_postfix()
+        return None
+
     def _on_training_end(self):
         # Ensure at least one checkpoint exists even if eval frequency is large.
         if self.latest_eval_reward is None:
             self._run_eval_and_checkpoint()
+
+        self._sync_progress_bar()
+        if self._pbar is not None:
+            self._pbar.close()
 
 
 def train_agent(mesh_file, cfg_file, backend_name,
@@ -589,6 +661,24 @@ def train_agent(mesh_file, cfg_file, backend_name,
         print('No neuralnetwork-hyperparameters section found. Using defaults.')
 
     hp = HyperParameters.from_config(probe_env.cfg)
+
+    if hp.squash_output and not hp.use_sde:
+        # Keep backward compatibility for existing configs that do not set
+        # SB3 gSDE options: default squash_output=True is only meaningful with
+        # use_sde=True. If squash-output was explicitly requested in config,
+        # raise; otherwise disable it automatically.
+        squash_from_cfg = hp._param_sources.get('squash_output') == 'config'
+        if squash_from_cfg:
+            raise ValueError(
+                "Invalid hyperparameter combination: 'squash-output = true' "
+                "requires 'use-sde = true' in SB3."
+            )
+
+        print(
+            "Note: default 'squash-output = true' is disabled because "
+            "'use-sde = false'. Set 'use-sde = true' to enable squashing."
+        )
+        hp.squash_output = False
 
     num_devices = max(1, get_device_count(backend_name))
     num_envs = max(1, num_devices * max(1, hp.envs_per_device))
@@ -623,6 +713,7 @@ def train_agent(mesh_file, cfg_file, backend_name,
         train_env = DummyVecEnv(train_env_fns)
     else:
         train_env = SubprocVecEnv(train_env_fns, start_method='spawn')
+    train_env = VecMonitor(train_env)
 
     eval_env = DummyVecEnv([
         partial(
@@ -636,9 +727,11 @@ def train_agent(mesh_file, cfg_file, backend_name,
             evaluation_mode=True
         )
     ])
+    eval_env = VecMonitor(eval_env)
 
     policy_kwargs = {
         'activation_fn': _activation_from_name(hp.activation_policy),
+        'squash_output': hp.squash_output,
         'net_arch': {
             'pi': [hp.num_cells_policy] * hp.num_hidden_layers_policy,
             'vf': [hp.num_cells_value] * hp.num_hidden_layers_value,
@@ -694,6 +787,7 @@ def train_agent(mesh_file, cfg_file, backend_name,
             device=hp.torch_device,
             print_system_info=False
         )
+        model.verbose = 0
 
     if model is None:
         model = PPO(
@@ -708,11 +802,13 @@ def train_agent(mesh_file, cfg_file, backend_name,
             clip_range=hp.clip_epsilon,
             ent_coef=hp.entropy_eps,
             max_grad_norm=hp.max_grad_norm,
+            use_sde=hp.use_sde,
+            sde_sample_freq=hp.sde_sample_freq,
             policy_kwargs=policy_kwargs,
             tensorboard_log=tb_log_root,
             device=hp.torch_device,
             seed=hp.seed,
-            verbose=1,
+            verbose=0,
         )
 
     remaining_timesteps = hp.total_frames - start_timesteps

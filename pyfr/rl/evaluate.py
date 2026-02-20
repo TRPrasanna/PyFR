@@ -7,7 +7,12 @@ import numpy as np
 from stable_baselines3 import PPO
 
 from pyfr.rl.env import PyFREnvironment
-from .train import compare_configs, _load_metadata, _resolve_model_path
+from .train import (
+    HyperParameters,
+    compare_configs,
+    _load_metadata,
+    _resolve_model_path
+)
 
 
 def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
@@ -60,6 +65,22 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
     )
 
     env.set_evaluation_mode(True)
+
+    # Print hyperparameter summary (checkpoint preferred, else config).
+    hp = None
+    if metadata and isinstance(metadata.get('hyperparameters'), dict):
+        print('\nUsing hyperparameters from checkpoint')
+        hp = HyperParameters()
+        for key, value in metadata['hyperparameters'].items():
+            if hasattr(hp, key):
+                setattr(hp, key, value)
+    elif 'neuralnetwork-hyperparameters' in env.cfg.sections():
+        print('\nUsing hyperparameters from config file')
+        hp = HyperParameters.from_config(env.cfg)
+
+    if hp is not None:
+        hp._calculate_derived(env, num_envs=1)
+        hp.print_summary(num_devices=1, num_envs=1)
 
     all_episode_returns = []
     first_ep_actions = None
