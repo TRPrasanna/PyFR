@@ -6,6 +6,7 @@ import os
 import time
 from typing import Any
 
+import numpy as np
 import torch.nn as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
@@ -547,16 +548,24 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
         _save_metadata(model_path, metadata)
 
     def _run_eval_and_checkpoint(self):
-        mean_reward, _ = sb3_evaluate_policy(
+        # TorchRL parity using native SB3 API:
+        # mean per-step reward = sum(episode rewards) / sum(episode lengths)
+        # over deterministic evaluation episodes.
+        ep_rewards, ep_lengths = sb3_evaluate_policy(
             self.model,
             self.eval_env,
             n_eval_episodes=1,
             deterministic=True,
             render=False,
-            return_episode_rewards=False
+            return_episode_rewards=True,
+            warn=False
         )
 
-        self.latest_eval_reward = float(mean_reward)
+        total_reward = float(np.sum(ep_rewards))
+        total_steps = int(np.sum(ep_lengths))
+        self.latest_eval_reward = (
+            total_reward / total_steps if total_steps > 0 else 0.0
+        )
 
         total_timesteps = self._total_timesteps()
         episodes_done = int(total_timesteps / max(1, self.hp.actions_per_episode))
