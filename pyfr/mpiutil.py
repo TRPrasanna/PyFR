@@ -8,7 +8,15 @@ import weakref
 import numpy as np
 
 
+_mpi_init_done = False
+
+
 def init_mpi():
+    global _mpi_init_done
+
+    if _mpi_init_done:
+        return
+
     import mpi4py.rc
     from mpi4py import MPI
 
@@ -18,8 +26,9 @@ def init_mpi():
 
         enable_prefork()
 
-    # Manually initialise MPI with thread support
-    MPI.Init_thread()
+    # Manually initialise MPI with thread support if needed
+    if not MPI.Is_initialized():
+        MPI.Init_thread()
 
     # Prevent mpi4py from calling MPI_Finalize
     mpi4py.rc.finalize = False
@@ -60,6 +69,8 @@ def init_mpi():
 
     # Register our exit handler
     atexit.register(onexit)
+
+    _mpi_init_done = True
 
 
 def autofree(obj):

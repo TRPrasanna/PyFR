@@ -216,3 +216,251 @@ class NavierStokesCharRiemInvMassFlowBCInters(MassFlowBCMixin,
                                               NavierStokesBaseBCInters):
     type = 'char-riem-inv-mass-flow'
     cflux_state = 'ghost'
+
+
+class NavierStokesAdiaJetBCInters(NavierStokesBaseBCInters):
+    type = 'adia-jet'
+    cflux_state = 'ghost'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
+
+        self.c |= self._exp_opts(
+            ['u', 'v', 'w'][:self.ndims], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+
+class _AdiaJetRLControlMixin:
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
+
+        # Action interval used for linear interpolation in the kernel.
+        self.t_act_interval = be.matrix((1, 1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]',
+                           value=self.t_act_interval)
+        self.t_act_interval.set(np.array(
+            [[cfg.getfloat('solver-plugin-reinforcementlearning',
+                           'action-interval')]]
+        ))
+
+        self.control_params = be.matrix((1, 3))
+        self._set_external('control_params', 'broadcast fpdtype_t[1][3]',
+                           value=self.control_params)
+        self.control_params.set(np.array([[0.0, 0.0, 0.0]]))
+
+        self._current_target = 0.0
+        self._last_env_step = None
+
+    @classmethod
+    def preparefn(cls, bciface, mesh, elemap):
+        if bciface:
+            return bciface.prepare
+        else:
+            return None
+
+    def _target_from_env(self, env):
+        raise NotImplementedError
+
+    def prepare(self, system, ubank, t, kerns):
+        env = getattr(system, 'env', None)
+        if env is None:
+            return
+
+        env_step = int(getattr(env, 'step_count', -1))
+        if env_step == self._last_env_step:
+            return
+
+        target = float(self._target_from_env(env))
+        self.control_params.set(np.array([[self._current_target, target, t]]))
+        self._current_target = target
+        self._last_env_step = env_step
+
+
+class NavierStokesAdiaJetNeuralType5BCInters(_AdiaJetRLControlMixin,
+                                             NavierStokesBaseBCInters):
+    type = 'adia-jet-neural-type5'
+    cflux_state = 'ghost'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
+
+        self.c |= self._exp_opts(
+            ['u', 'v', 'w'][:self.ndims], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+        self.actuator_id = cfg.getint(cfgsect, 'actuator-number')
+
+    def _target_from_env(self, env):
+        ctrl = np.asarray(getattr(env, 'current_control', 0.0), dtype=np.float64)
+        return ctrl[self.actuator_id]
+
+
+class NavierStokesAdiaJetNeuralType5ResidualBCInters(_AdiaJetRLControlMixin,
+                                                     NavierStokesBaseBCInters):
+    type = 'adia-jet-neural-type5-residual'
+    cflux_state = 'ghost'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
+
+        self.c |= self._exp_opts(
+            ['u', 'v', 'w'][:self.ndims], lhs,
+            default={'u': 0, 'v': 0, 'w': 0}
+        )
+
+    def _target_from_env(self, env):
+        ctrl = np.asarray(getattr(env, 'current_control', 0.0), dtype=np.float64)
+        return -np.sum(ctrl)
+
+
+class _AdiaJetRLMultiControlMixin:
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
+
+        if cfg.hasopt(cfgsect, 'num-actuators'):
+            self.num_actuators = cfg.getint(cfgsect, 'num-actuators')
+        else:
+            self.num_actuators = cfg.getint(
+                'solver-plugin-reinforcementlearning', 'num-control-actions'
+            )
+
+        if self.num_actuators < 1:
+            raise ValueError('num-actuators must be >= 1')
+
+        # Compile-time template arg for unrolling actuator contributions.
+        self._tplargs['nctrl'] = self.num_actuators
+
+        # Action interval used for linear interpolation in the kernel.
+        self.t_act_interval = be.matrix((1, 1))
+        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]',
+                           value=self.t_act_interval)
+        self.t_act_interval.set(np.array(
+            [[cfg.getfloat('solver-plugin-reinforcementlearning',
+                           'action-interval')]]
+        ))
+
+        self.control_params = be.matrix((self.num_actuators, 3))
+        self._set_external(
+            'control_params',
+            f'broadcast fpdtype_t[{self.num_actuators}][3]',
+            value=self.control_params
+        )
+        self.control_params.set(np.zeros((self.num_actuators, 3)))
+
+        # Per-actuator spatial mask bounds:
+        #   <axis>-min<i>, <axis>-max<i>
+        # with aliases:
+        #   <axis><i>-min, <axis><i>-max
+        # where axis in {x, y, z} for the active dimensions.
+        self.actuator_bounds = be.matrix((self.num_actuators, 2*self.ndims))
+        self._set_external(
+            'actuator_bounds',
+            f'broadcast fpdtype_t[{self.num_actuators}][{2*self.ndims}]',
+            value=self.actuator_bounds
+        )
+        self.actuator_bounds.set(self._read_actuator_bounds(cfgsect, cfg))
+
+        # type6 always references ploc in the kernel for masking.
+        if 'ploc' not in self._external_args:
+            spec = f'in fpdtype_t[{self.ndims}]'
+            value = self._const_mat(lhs, 'get_ploc_for_inter')
+            self._set_external('ploc', spec, value=value)
+
+        self._current_targets = np.zeros(self.num_actuators)
+        self._last_env_step = None
+
+    @classmethod
+    def preparefn(cls, bciface, mesh, elemap):
+        if bciface:
+            return bciface.prepare
+        else:
+            return None
+
+    def _targets_from_env(self, env):
+        ctrl = np.asarray(getattr(env, 'current_control', 0.0), dtype=np.float64)
+        ctrl = np.atleast_1d(ctrl).ravel()
+
+        if ctrl.size < self.num_actuators:
+            raise ValueError(
+                f'Environment has {ctrl.size} control actions, but '
+                f'{self.num_actuators} are required by {self.cfgsect}'
+            )
+
+        return ctrl[:self.num_actuators]
+
+    def _read_actuator_bounds(self, cfgsect, cfg):
+        bounds = np.empty((self.num_actuators, 2*self.ndims), dtype=np.float64)
+        dnames = 'xyz'[:self.ndims]
+        inf = 1.0e100
+
+        for i in range(self.num_actuators):
+            for d, dn in enumerate(dnames):
+                lo = self._get_bound_opt(cfgsect, cfg, dn, i, 'min', -inf)
+                hi = self._get_bound_opt(cfgsect, cfg, dn, i, 'max', inf)
+
+                if lo > hi:
+                    raise ValueError(
+                        f'Invalid bounds for actuator {i} axis {dn}: '
+                        f'{lo} > {hi}'
+                    )
+
+                bounds[i, 2*d] = lo
+                bounds[i, 2*d + 1] = hi
+
+        return bounds
+
+    def _get_bound_opt(self, cfgsect, cfg, axis, aid, side, default):
+        # Preferred: x-min0 / x-max0
+        # Alias:     x0-min / x0-max
+        key1 = f'{axis}-{side}{aid}'
+        key2 = f'{axis}{aid}-{side}'
+
+        if cfg.hasopt(cfgsect, key1):
+            return cfg.getfloat(cfgsect, key1)
+        if cfg.hasopt(cfgsect, key2):
+            return cfg.getfloat(cfgsect, key2)
+        return default
+
+    def prepare(self, system, ubank, t, kerns):
+        env = getattr(system, 'env', None)
+        if env is None:
+            return
+
+        env_step = int(getattr(env, 'step_count', -1))
+        if env_step == self._last_env_step:
+            return
+
+        targets = self._targets_from_env(env)
+
+        params = np.empty((self.num_actuators, 3))
+        params[:, 0] = self._current_targets
+        params[:, 1] = targets
+        params[:, 2] = t
+
+        self.control_params.set(params)
+        self._current_targets = targets.copy()
+        self._last_env_step = env_step
+
+
+class NavierStokesAdiaJetNeuralType6BCInters(_AdiaJetRLMultiControlMixin,
+                                             NavierStokesBaseBCInters):
+    type = 'adia-jet-neural-type6'
+    cflux_state = 'ghost'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
+
+        comps = ['u', 'v', 'w'][:self.ndims]
+        expr_keys = []
+        defaults = {}
+
+        # Each actuator i takes ui(x,y,...) and vi(x,y,...) (and wi for 3-D).
+        for i in range(self.num_actuators):
+            for comp in comps:
+                key = f'{comp}{i}'
+                expr_keys.append(key)
+                defaults[key] = 0
+
+        self.c |= self._exp_opts(expr_keys, lhs, default=defaults)

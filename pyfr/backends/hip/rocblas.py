@@ -66,8 +66,8 @@ class HIPRocBLASKernels(HIPKernelProvider):
 
         self._cstream = backend.hip.create_stream()
 
-        # Ensure memory can be allocated in captured streams
-        os.environ['ROCBLAS_STREAM_ORDER_ALLOC'] = '1'
+        # Default to stream-ordered allocation, but respect user override.
+        os.environ.setdefault('ROCBLAS_STREAM_ORDER_ALLOC', '1')
 
         # Load and wrap rocBLAS
         self._wrappers = RocBLASWrappers()

@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 
 from pyfr.backends.base import BaseBackend
@@ -12,7 +14,7 @@ class OpenCLBackend(BaseBackend):
         super().__init__(cfg)
 
         from pyfr.backends.opencl.compiler import OpenCLCompiler
-        from pyfr.backends.opencl.driver import OpenCL
+        from pyfr.backends.opencl.driver import OpenCL, OpenCLError
 
         # Load and wrap OpenCL
         self.cl = OpenCL()
@@ -94,8 +96,19 @@ class OpenCLBackend(BaseBackend):
         # Pointwise kernels
         self.pointwise = self._providers[0]
 
-        # Queues (in and out of order)
-        self.queue = self.cl.queue(out_of_order=True)
+        # Main command queue. Some OpenCL stacks do not support
+        # out-of-order queues; transparently fall back when needed.
+        ooq = cfg.getbool('backend-opencl', 'out-of-order-queue', True)
+        try:
+            self.queue = self.cl.queue(out_of_order=ooq)
+        except OpenCLError:
+            if not ooq:
+                raise
+
+            warnings.warn('Unable to create out-of-order OpenCL queue; '
+                          'falling back to in-order queue',
+                          RuntimeWarning)
+            self.queue = self.cl.queue(out_of_order=False)
 
     def run_kernels(self, kernels, wait=False):
         # Submit the kernels to the command queue

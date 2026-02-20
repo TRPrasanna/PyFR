@@ -42,6 +42,7 @@ modules = [
     'pyfr.partitioners',
     'pyfr.plugins',
     'pyfr.plugins.kernels',
+    'pyfr.rl',
     'pyfr.quadrules',
     'pyfr.readers',
     'pyfr.solvers',
@@ -116,7 +117,14 @@ install_requires = [
     'numpy >= 2.4.2',
     'platformdirs >= 2.2.0',
     'pytools >= 2016.2.1',
-    'rtree >= 1.4.1'
+    'rtree >= 1.4.1',
+    'torch >= 2.6.0',
+    'torchrl >= 0.7.1',
+    'tensordict >= 0.6.2',
+    'tensorboard >= 2.18.0',
+    'scipy >= 1.13.1',
+    'matplotlib >= 3.10.0',
+    'tqdm >= 4.67.0'
 ]
 
 # Soft dependencies
@@ -126,7 +134,8 @@ extras_require = {
 
 # Scripts
 console_scripts = [
-    'pyfr = pyfr.__main__:main'
+    'pyfr = pyfr.__main__:main',
+    'pyfr-rl = pyfr.rl.cli:main'
 ]
 
 # Info
