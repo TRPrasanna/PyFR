@@ -43,6 +43,8 @@ modules = [
     'pyfr.plugins',
     'pyfr.plugins.kernels',
     'pyfr.rl',
+    'pyfr.rl.algorithms',
+    'pyfr.rl.core',
     'pyfr.quadrules',
     'pyfr.readers',
     'pyfr.solvers',

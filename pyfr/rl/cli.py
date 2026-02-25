@@ -28,6 +28,11 @@ def main():
     ap_train.add_argument('--ic-dir', default=None,
                          help='directory of initial condition snapshots')
     ap_train.add_argument('--load-model', help='load existing model checkpoint to continue training')
+    ap_train.add_argument(
+        '--algorithm',
+        default=None,
+        help='RL algorithm override (e.g., ppo, ppo-lstm)'
+    )
     ap_train.set_defaults(process=process_train)
 
     # Add backend argument
@@ -44,6 +49,11 @@ def main():
     ap_eval.add_argument('--load-model', required=True, help='path to model checkpoint')
     ap_eval.add_argument('--ic-dir', default=None,
                         help='directory of initial condition snapshots (optional)')
+    ap_eval.add_argument(
+        '--algorithm',
+        default=None,
+        help='RL algorithm override (e.g., ppo, ppo-lstm)'
+    )
     ap_eval.add_argument('--backend', '-b', choices=backends, required=True)
     ap_eval.set_defaults(process=process_evaluate)
 
@@ -66,7 +76,8 @@ def process_train(args):
         backend_name=args.backend,
         checkpoint_dir=args.checkpoint_dir,
         ic_dir=args.ic_dir,
-        load_model=args.load_model
+        load_model=args.load_model,
+        algorithm=args.algorithm
     )
 
 def process_evaluate(args):
@@ -77,5 +88,6 @@ def process_evaluate(args):
         backend_name=args.backend,
         load_model=args.load_model,
         ic_dir=args.ic_dir,
-        episodes=args.episodes
+        episodes=args.episodes,
+        algorithm=args.algorithm
     )

@@ -4,19 +4,44 @@ import time
 
 import matplotlib.pyplot as plt
 import numpy as np
-from stable_baselines3 import PPO
 
-from pyfr.rl.env import PyFREnvironment
-from .train import (
-    HyperParameters,
-    compare_configs,
-    _load_metadata,
-    _resolve_model_path
+from pyfr.rl.algorithms import (
+    get_algorithm_spec,
+    is_recurrent_algorithm,
+    load_model as load_algorithm_model,
+    normalize_algorithm_name,
 )
+from pyfr.rl.core import (
+    HyperParameters,
+    _load_metadata,
+    _resolve_model_path,
+    compare_configs,
+)
+from pyfr.rl.env import PyFREnvironment
+
+
+def _resolve_eval_algorithm(cli_algorithm: str | None,
+                            metadata: dict | None,
+                            hp: HyperParameters | None = None) -> str:
+    selected = normalize_algorithm_name(
+        cli_algorithm or (hp.algorithm if hp is not None else 'ppo')
+    )
+
+    if metadata and metadata.get('algorithm'):
+        ckpt_algorithm = normalize_algorithm_name(metadata['algorithm'])
+        if cli_algorithm and selected != ckpt_algorithm:
+            raise ValueError(
+                "Checkpoint algorithm mismatch: "
+                f"'--algorithm {selected}' requested, "
+                f"but checkpoint uses '{ckpt_algorithm}'."
+            )
+        selected = ckpt_algorithm
+
+    return selected
 
 
 def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
-                    ic_dir=None, episodes=1):
+                    ic_dir=None, episodes=1, algorithm=None):
     """Evaluate a trained SB3 policy."""
     if hasattr(cfg_file, 'name'):
         cfg_path = cfg_file.name
@@ -52,9 +77,6 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         else:
             print('Config files match.')
 
-    print(f'Loading SB3 model: {model_path}')
-    model = PPO.load(model_path, device='cpu')
-
     env = PyFREnvironment(
         mesh_file=mesh_file,
         cfg_file=cfg_path,
@@ -78,9 +100,25 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         print('\nUsing hyperparameters from config file')
         hp = HyperParameters.from_config(env.cfg)
 
+    selected_algorithm = _resolve_eval_algorithm(algorithm, metadata, hp)
+    if hp is not None:
+        hp.algorithm = selected_algorithm
+
+    algo_spec = get_algorithm_spec(selected_algorithm)
+
+    print(f'Loading SB3 model ({algo_spec.display_name}): {model_path}')
+    model = load_algorithm_model(
+        selected_algorithm,
+        model_path,
+        env=None,
+        device='cpu'
+    )
+
     if hp is not None:
         hp._calculate_derived(env, num_envs=1)
         hp.print_summary(num_devices=1, num_envs=1)
+
+    recurrent = is_recurrent_algorithm(selected_algorithm)
 
     all_episode_returns = []
     first_ep_actions = None
@@ -94,14 +132,28 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
             ep_actions = []
             ep_rewards = []
 
+            lstm_states = None
+            episode_starts = np.array([True], dtype=bool)
+
             while not done:
-                action, _ = model.predict(obs, deterministic=True)
+                if recurrent:
+                    action, lstm_states = model.predict(
+                        obs,
+                        state=lstm_states,
+                        episode_start=episode_starts,
+                        deterministic=True
+                    )
+                else:
+                    action, _ = model.predict(obs, deterministic=True)
+
                 obs, reward, terminated, truncated, _ = env.step(action)
 
                 ep_actions.append(np.asarray(action, dtype=np.float64).reshape(-1))
                 ep_rewards.append(float(reward))
 
                 done = bool(terminated or truncated)
+                if recurrent:
+                    episode_starts[0] = done
 
             ep_rewards_arr = np.asarray(ep_rewards, dtype=np.float64)
             ep_return = float(ep_rewards_arr.sum())
@@ -131,6 +183,8 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         if metadata:
             print('\nCheckpoint Metadata:')
             print('-' * 40)
+            if 'algorithm' in metadata:
+                print(f"Algorithm:             {metadata['algorithm']}")
             if 'current_reward' in metadata:
                 print(f"Stored current reward: {metadata['current_reward']:.7e}")
             if 'best_reward' in metadata:
