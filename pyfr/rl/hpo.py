@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import time
 from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Any
@@ -338,6 +339,40 @@ def _make_pruner(optuna, settings: HPOSettings):
     raise ValueError(f"Unsupported HPO pruner '{settings.pruner}'. Use 'hyperband' or 'none'.")
 
 
+def _create_study_with_retry(optuna, create_kwargs: dict[str, Any],
+                             retries: int = 15, sleep_s: float = 1.0):
+    """
+    Create/load an Optuna study, tolerating SQLite schema-init races.
+
+    When multiple workers start simultaneously on SQLite, one worker may
+    create tables while others see transient "table ... already exists"
+    OperationalError. Retry briefly and then continue normally.
+    """
+    last_exc = None
+
+    for i in range(max(1, retries)):
+        try:
+            return optuna.create_study(**create_kwargs)
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            schema_race = (
+                'table studies already exists' in msg
+                or ('table' in msg and 'already exists' in msg)
+            )
+            if not schema_race:
+                raise
+
+            if i == 0:
+                print(
+                    'Note: detected concurrent SQLite schema initialization; '
+                    'retrying study creation...'
+                )
+            time.sleep(max(0.1, sleep_s))
+
+    raise last_exc
+
+
 def run_hpo(mesh_file, cfg_file, backend_name, checkpoint_dir='hpo-runs',
             ic_dir=None, algorithm=None, study_name=None, storage=None,
             n_trials=None, timeout=None, sampler=None, pruner=None,
@@ -472,7 +507,7 @@ def run_hpo(mesh_file, cfg_file, backend_name, checkpoint_dir='hpo-runs',
         create_kwargs['study_name'] = settings.study_name
         create_kwargs['load_if_exists'] = settings.load_if_exists
 
-    study = optuna.create_study(**create_kwargs)
+    study = _create_study_with_retry(optuna, create_kwargs)
 
     def objective(trial):
         trial_hp = copy.deepcopy(base_hp)
