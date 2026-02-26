@@ -44,7 +44,8 @@ class HPOSettings:
 
     trial_updates: int = 6
     episodes_per_batch: int = 4
-    envs_per_trial: int = 1
+    # 0 means auto (one environment per visible backend device).
+    envs_per_trial: int = 0
     eval_episodes: int = 1
     save_best_model: bool = True
 
@@ -68,6 +69,9 @@ class HPOSettings:
                 value = cfg.getliteral(section, key)
             elif field_name in {'timeout', 'device_id'}:
                 value = cfg.getint(section, key)
+            elif field_name == 'envs_per_trial':
+                raw = cfg.get(section, key).strip().lower()
+                value = 0 if raw == 'auto' else int(raw)
             elif field_name in {'study_name', 'storage', 'direction', 'sampler', 'pruner'}:
                 value = cfg.get(section, key)
             else:
@@ -115,7 +119,9 @@ class HPOSettings:
         settings.reduction_factor = max(2, int(settings.reduction_factor))
         settings.trial_updates = max(1, int(settings.trial_updates))
         settings.episodes_per_batch = max(1, int(settings.episodes_per_batch))
-        settings.envs_per_trial = max(1, int(settings.envs_per_trial))
+        settings.envs_per_trial = int(settings.envs_per_trial)
+        if settings.envs_per_trial < 0:
+            settings.envs_per_trial = 0
         settings.eval_episodes = max(1, int(settings.eval_episodes))
 
         return settings
@@ -376,7 +382,9 @@ def run_hpo(mesh_file, cfg_file, backend_name, checkpoint_dir='hpo-runs',
     if device_id is not None:
         settings.device_id = int(device_id)
     if envs_per_trial is not None:
-        settings.envs_per_trial = max(1, int(envs_per_trial))
+        settings.envs_per_trial = int(envs_per_trial)
+        if settings.envs_per_trial < 0:
+            settings.envs_per_trial = 0
     if episodes_per_batch is not None:
         settings.episodes_per_batch = max(1, int(episodes_per_batch))
     if trial_updates is not None:
@@ -397,6 +405,14 @@ def run_hpo(mesh_file, cfg_file, backend_name, checkpoint_dir='hpo-runs',
         default_db = os.path.abspath(os.path.join(checkpoint_dir, 'hpo.db'))
         settings.storage = f'sqlite:///{default_db}'
         print(f'Note: no HPO storage configured; using {settings.storage}')
+
+    visible_devices = max(1, get_device_count(backend_name))
+    if settings.envs_per_trial <= 0:
+        settings.envs_per_trial = visible_devices
+        print(
+            'Note: envs-per-trial=auto -> '
+            f'using {settings.envs_per_trial} env(s) from detected devices.'
+        )
 
     derive_ref = _DeriveRef(probe_env.dtend, probe_env.action_interval)
     probe_env.close()
@@ -437,8 +453,6 @@ def run_hpo(mesh_file, cfg_file, backend_name, checkpoint_dir='hpo-runs',
     os.makedirs(checkpoint_dir, exist_ok=True)
     tb_root = os.path.join(checkpoint_dir, 'tensorboard_logs')
     os.makedirs(tb_root, exist_ok=True)
-
-    visible_devices = max(1, get_device_count(backend_name))
 
     def _device_for_env(env_idx: int) -> int:
         if settings.device_id is None:
