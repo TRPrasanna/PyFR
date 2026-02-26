@@ -1,5 +1,6 @@
 from dataclasses import asdict
 import os
+import sys
 import time
 from typing import Any
 
@@ -88,6 +89,8 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
         self._episodes_shown = max(0, int(start_episode))
         self._latest_train_reward = None
         self._latest_eval_str = ''
+        self._is_tty = sys.stderr.isatty()
+        self._training_start_walltime = None
 
     def _current_lr(self) -> float:
         try:
@@ -99,7 +102,7 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
         return int(self._total_timesteps() / max(1, self.hp.actions_per_episode))
 
     def _set_progress_postfix(self):
-        if self._pbar is None:
+        if self._pbar is None or not self._is_tty:
             return
 
         postfix = {}
@@ -112,7 +115,7 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
         self._pbar.set_postfix(postfix)
 
     def _sync_progress_bar(self):
-        if self._pbar is None:
+        if self._pbar is None or not self._is_tty:
             return
 
         done = min(self.hp.episodes, self._episodes_done())
@@ -206,10 +209,14 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
         self._set_progress_postfix()
 
     def _on_training_start(self):
+        self._training_start_walltime = time.time()
         initial = min(max(0, self._episodes_shown), self.hp.episodes)
         self._episodes_shown = initial
-        self._pbar = tqdm(total=self.hp.episodes, desc='Training', initial=initial)
-        self._set_progress_postfix()
+        if self._is_tty:
+            self._pbar = tqdm(total=self.hp.episodes, desc='Training', initial=initial)
+            self._set_progress_postfix()
+        else:
+            self._pbar = None
         return None
 
     def _on_step(self):
@@ -229,6 +236,38 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
 
         self._sync_progress_bar()
         self._set_progress_postfix()
+
+        if not self._is_tty:
+            episodes_done = min(self.hp.episodes, self._episodes_done())
+            elapsed = (
+                int(time.time() - self._training_start_walltime)
+                if self._training_start_walltime is not None else 0
+            )
+            hh = elapsed // 3600
+            mm = (elapsed % 3600) // 60
+            ss = elapsed % 60
+
+            train_str = (
+                f'{self._latest_train_reward:.5f}'
+                if self._latest_train_reward is not None else 'n/a'
+            )
+            eval_str = (
+                f'{self.latest_eval_reward:.5f}'
+                if self.latest_eval_reward is not None else 'n/a'
+            )
+            best_str = (
+                f'{self.best_eval_reward:.5f}'
+                if self.best_eval_reward != float('-inf') else 'n/a'
+            )
+            print(
+                '[train] '
+                f'episodes={episodes_done}/{self.hp.episodes} '
+                f'train_reward={train_str} '
+                f'eval={eval_str} '
+                f'best={best_str} '
+                f'lr={self._current_lr():.2e} '
+                f'elapsed={hh:02d}:{mm:02d}:{ss:02d}'
+            )
         return None
 
     def _on_training_end(self):
@@ -237,6 +276,71 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
             self._run_eval_and_checkpoint()
 
         self._sync_progress_bar()
-        if self._pbar is not None:
+        if self._pbar is not None and self._is_tty:
             self._pbar.close()
 
+
+class SB3OptunaPruningCallback(BaseCallback):
+    def __init__(self, trial, eval_env, hp,
+                 recurrent_policy: bool = False,
+                 n_eval_episodes: int = 1,
+                 best_model_path: str | None = None,
+                 verbose: int = 1):
+        super().__init__(verbose=verbose)
+
+        self.trial = trial
+        self.eval_env = eval_env
+        self.hp = hp
+        self.recurrent_policy = recurrent_policy
+        self.n_eval_episodes = max(1, int(n_eval_episodes))
+        self.best_model_path = best_model_path
+
+        self.eval_freq_steps = max(1, hp.eval_frequency * hp.rollout_size)
+        self._last_eval_timestep = 0
+
+        self.latest_eval_reward = None
+        self.best_eval_reward = float('-inf')
+        self.pruned = False
+        self.pruned_update = None
+
+    def _on_step(self):
+        if self.num_timesteps - self._last_eval_timestep < self.eval_freq_steps:
+            return True
+
+        self.latest_eval_reward = _evaluate_mean_step_reward(
+            self.model,
+            self.eval_env,
+            n_eval_episodes=self.n_eval_episodes,
+            recurrent=self.recurrent_policy
+        )
+
+        update_idx = max(1, int(self.model.num_timesteps / max(1, self.hp.rollout_size)))
+        self.trial.report(float(self.latest_eval_reward), step=update_idx)
+
+        if self.latest_eval_reward > self.best_eval_reward:
+            self.best_eval_reward = float(self.latest_eval_reward)
+            if self.best_model_path is not None:
+                self.model.save(self.best_model_path)
+
+        if self.verbose:
+            print(
+                '[hpo] '
+                f'trial={self.trial.number} '
+                f'update={update_idx} '
+                f'eval={self.latest_eval_reward:.5f} '
+                f'best={self.best_eval_reward:.5f}'
+            )
+
+        if self.trial.should_prune():
+            self.pruned = True
+            self.pruned_update = update_idx
+            if self.verbose:
+                print(
+                    '[hpo] '
+                    f'trial={self.trial.number} '
+                    f'pruned_at_update={update_idx}'
+                )
+            return False
+
+        self._last_eval_timestep = int(self.num_timesteps)
+        return True

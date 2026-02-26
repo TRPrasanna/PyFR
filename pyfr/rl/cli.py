@@ -57,6 +57,42 @@ def main():
     ap_eval.add_argument('--backend', '-b', choices=backends, required=True)
     ap_eval.set_defaults(process=process_evaluate)
 
+    # HPO command
+    ap_hpo = sp.add_parser('hpo', help='run hyperparameter optimization (Optuna)')
+    ap_hpo.add_argument('mesh', help='mesh file')
+    ap_hpo.add_argument('cfg', type=FileType('r'), help='config file')
+    ap_hpo.add_argument('--checkpoint-dir', default='hpo-runs',
+                        help='directory to save HPO artifacts')
+    ap_hpo.add_argument('--ic-dir', default=None,
+                        help='directory of initial condition snapshots')
+    ap_hpo.add_argument(
+        '--algorithm',
+        default=None,
+        help='RL algorithm override (e.g., ppo, ppo-lstm)'
+    )
+    ap_hpo.add_argument('--study-name', default=None,
+                        help='Optuna study name')
+    ap_hpo.add_argument('--storage', default=None,
+                        help='Optuna storage URL (e.g., sqlite:///hpo.db)')
+    ap_hpo.add_argument('--n-trials', type=int, default=None,
+                        help='number of HPO trials')
+    ap_hpo.add_argument('--timeout', type=int, default=None,
+                        help='time limit in seconds for HPO')
+    ap_hpo.add_argument('--sampler', choices=['tpe', 'random'], default=None,
+                        help='Optuna sampler')
+    ap_hpo.add_argument('--pruner', choices=['hyperband', 'none'], default=None,
+                        help='Optuna pruner')
+    ap_hpo.add_argument('--device-id', type=int, default=None,
+                        help='starting backend device id for this worker')
+    ap_hpo.add_argument('--envs-per-trial', type=int, default=None,
+                        help='vectorized environments per trial')
+    ap_hpo.add_argument('--episodes-per-batch', type=int, default=None,
+                        help='episodes collected per update during HPO')
+    ap_hpo.add_argument('--trial-updates', type=int, default=None,
+                        help='number of PPO updates per trial')
+    ap_hpo.add_argument('--backend', '-b', choices=backends, required=True)
+    ap_hpo.set_defaults(process=process_hpo)
+
 
     # Parse args
     args = ap.parse_args()
@@ -90,4 +126,27 @@ def process_evaluate(args):
         ic_dir=args.ic_dir,
         episodes=args.episodes,
         algorithm=args.algorithm
+    )
+
+
+def process_hpo(args):
+    from .hpo import run_hpo
+
+    run_hpo(
+        mesh_file=args.mesh,
+        cfg_file=args.cfg,
+        backend_name=args.backend,
+        checkpoint_dir=args.checkpoint_dir,
+        ic_dir=args.ic_dir,
+        algorithm=args.algorithm,
+        study_name=args.study_name,
+        storage=args.storage,
+        n_trials=args.n_trials,
+        timeout=args.timeout,
+        sampler=args.sampler,
+        pruner=args.pruner,
+        device_id=args.device_id,
+        envs_per_trial=args.envs_per_trial,
+        episodes_per_batch=args.episodes_per_batch,
+        trial_updates=args.trial_updates
     )

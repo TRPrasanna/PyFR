@@ -125,6 +125,7 @@ install_requires = [
     'sb3-contrib >= 2.7.0',
     'gymnasium >= 1.0.0',
     'tensorboard >= 2.18.0',
+    'optuna >= 4.0.0',
     'scipy >= 1.13.1',
     'matplotlib >= 3.10.0',
     'tqdm >= 4.67.0'
