@@ -36,6 +36,7 @@ class HPOSettings:
     sampler: str = 'tpe'
     n_startup_trials: int = 8
     tpe_multivariate: bool = False
+    tpe_constant_liar: bool = True
     seed: int = 0
 
     pruner: str = 'hyperband'
@@ -318,7 +319,15 @@ def _make_sampler(optuna, settings: HPOSettings):
         }
         if settings.tpe_multivariate:
             kwargs['multivariate'] = True
-        return optuna.samplers.TPESampler(**kwargs)
+        if settings.tpe_constant_liar:
+            kwargs['constant_liar'] = True
+        try:
+            return optuna.samplers.TPESampler(**kwargs)
+        except TypeError:
+            # Backward compatibility with older Optuna versions that do not
+            # support constant_liar.
+            kwargs.pop('constant_liar', None)
+            return optuna.samplers.TPESampler(**kwargs)
     if sampler == 'random':
         return optuna.samplers.RandomSampler(seed=settings.seed)
 
@@ -337,6 +346,30 @@ def _make_pruner(optuna, settings: HPOSettings):
         )
 
     raise ValueError(f"Unsupported HPO pruner '{settings.pruner}'. Use 'hyperband' or 'none'.")
+
+
+def _worker_seed_offset(device_id: int | None) -> int:
+    # Prefer explicit distributed rank ids when available.
+    rank_env_keys = (
+        'SLURM_PROCID',
+        'OMPI_COMM_WORLD_RANK',
+        'PMI_RANK',
+        'RANK',
+        'LOCAL_RANK',
+    )
+    for key in rank_env_keys:
+        raw = os.getenv(key)
+        if raw is None or raw == '':
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+
+    if device_id is not None:
+        return int(device_id)
+
+    return 0
 
 
 def _create_study_with_retry(optuna, create_kwargs: dict[str, Any],
@@ -425,6 +458,15 @@ def run_hpo(mesh_file, cfg_file, backend_name, checkpoint_dir='hpo-runs',
     if trial_updates is not None:
         settings.trial_updates = max(1, int(trial_updates))
 
+    seed_offset = _worker_seed_offset(settings.device_id)
+    effective_seed = int(settings.seed) + seed_offset
+    if seed_offset != 0:
+        print(
+            f'Note: applying worker seed offset {seed_offset} '
+            f'(base={settings.seed}, effective={effective_seed}).'
+        )
+    settings.seed = effective_seed
+
     if settings.max_resource > settings.trial_updates:
         print(
             'Note: reducing hpo.max_resource to match trial_updates '
@@ -478,6 +520,10 @@ def run_hpo(mesh_file, cfg_file, backend_name, checkpoint_dir='hpo-runs',
     print(f'Storage:            {settings.storage}')
     print(f'Pruner:             {settings.pruner}')
     print(f'Sampler:            {settings.sampler}')
+    if settings.sampler.strip().lower() == 'tpe':
+        print(f'TPE multivariate:   {settings.tpe_multivariate}')
+        print(f'TPE constant liar:  {settings.tpe_constant_liar}')
+    print(f'Sampler seed:       {settings.seed}')
     print(f'Trials:             {settings.n_trials}')
     print(f'Trial updates:      {settings.trial_updates}')
     print(f'Episodes/update:    {settings.episodes_per_batch}')
