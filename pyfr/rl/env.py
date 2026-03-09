@@ -10,7 +10,7 @@ import numpy as np
 
 from pyfr.backends import get_backend
 from pyfr.inifile import Inifile
-from pyfr.mpiutil import init_mpi
+from pyfr.mpiutil import get_comm_rank_root, init_mpi
 from pyfr.readers.native import NativeReader
 from pyfr.solvers import get_solver
 
@@ -23,15 +23,18 @@ class PyFREnvironment(gym.Env):
     def __init__(self, mesh_file, cfg_file, backend_name, device_id,
                  ic_dir=None, print_diagnostic=False):
         init_mpi()
+        self.comm, self.rank, self.root = get_comm_rank_root()
+        self.is_root = self.rank == self.root
+        self.print_diagnostic = print_diagnostic and self.is_root
 
         # Keep one mesh reader open and reuse it for loading restart solutions
         self.mesh_reader = NativeReader(mesh_file)
         self.mesh = self.mesh_reader.mesh
         self.cfg = Inifile.load(cfg_file)
 
-        if backend_name in {'hip', 'cuda'}:
+        if backend_name in {'hip', 'cuda'} and device_id is not None:
             self.cfg.set(f'backend-{backend_name}', 'device-id', device_id)
-            if print_diagnostic:
+            if self.print_diagnostic:
                 print(f'Using {backend_name} device {device_id}')
 
         self.backend = get_backend(backend_name, self.cfg)
@@ -96,13 +99,15 @@ class PyFREnvironment(gym.Env):
         if ic_dir is not None:
             try:
                 self.ic_manager = InitialConditionManager(
-                    ic_dir, self.mesh.uuid, print_diagnostic=print_diagnostic
+                    ic_dir, self.mesh.uuid,
+                    print_diagnostic=self.print_diagnostic
                 )
             except ValueError as e:
-                print(f'\nWarning: {e}')
-                print('Continuing without initial condition snapshots...')
+                if self.is_root:
+                    print(f'\nWarning: {e}')
+                    print('Continuing without initial condition snapshots...')
         else:
-            if print_diagnostic:
+            if self.print_diagnostic:
                 print('\nNote: No initial condition directory provided.')
                 print('Training will use default initial conditions.')
 
@@ -114,7 +119,7 @@ class PyFREnvironment(gym.Env):
         obs_size = self.rl_plugin.observation_size
         self.observation_size = obs_size
 
-        if print_diagnostic:
+        if self.print_diagnostic:
             try:
                 var_list = self.rl_plugin.obs_var_names
                 print(f"Observation variables: {', '.join(var_list)}")
@@ -141,7 +146,7 @@ class PyFREnvironment(gym.Env):
             dtype=np.float32,
         )
 
-        if print_diagnostic:
+        if self.print_diagnostic:
             print('Environment initialized.')
 
         self.episode_count = 0
@@ -157,18 +162,24 @@ class PyFREnvironment(gym.Env):
             return None
 
         try:
-            if self.is_evaluating:
-                ic_file = self.ic_manager.get_eval_ic()
+            if self.is_root:
+                if self.is_evaluating:
+                    ic_file = self.ic_manager.get_eval_ic()
+                else:
+                    ic_file = self.ic_manager.get_random_ic()
             else:
-                ic_file = self.ic_manager.get_random_ic()
+                ic_file = None
+
+            ic_file = self.comm.bcast(ic_file, root=self.root)
 
             if ic_file is None:
                 return None
 
             return self.mesh_reader.load_soln(ic_file)
         except Exception as e:
-            print(f'Warning: Failed to load IC file: {e}')
-            print('Using default initial conditions.')
+            if self.is_root:
+                print(f'Warning: Failed to load IC file: {e}')
+                print('Using default initial conditions.')
             return None
 
     def _init_solver(self, initsoln=None):
@@ -271,7 +282,8 @@ class PyFREnvironment(gym.Env):
             }
 
         except RuntimeError as e:
-            print(f'Solver crashed: {e}. Last actions were: {self.current_control}')
+            if self.is_root:
+                print(f'Solver crashed: {e}. Last actions were: {self.current_control}')
 
             observation = np.zeros(self.observation_space.shape, dtype=np.float32)
             reward = -10.0
@@ -339,7 +351,7 @@ class InitialConditionManager:
             raise ValueError(f'IC directory {self.ic_dir} not found')
 
         ic_files = []
-        for f in os.listdir(self.ic_dir):
+        for f in sorted(os.listdir(self.ic_dir)):
             if not f.endswith('.pyfrs'):
                 continue
 
@@ -363,6 +375,6 @@ class InitialConditionManager:
         if not self.unused_files:
             return None
 
-        ic_file = random.choice(list(self.unused_files))
+        ic_file = random.choice(sorted(self.unused_files))
         self.unused_files.remove(ic_file)
         return ic_file

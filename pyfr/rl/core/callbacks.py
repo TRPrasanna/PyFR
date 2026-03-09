@@ -9,6 +9,8 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy as sb3_evaluate_policy
 from tqdm.auto import tqdm
 
+from pyfr.mpiutil import get_comm_rank_root
+
 from .utils import save_metadata
 
 
@@ -83,13 +85,15 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
 
         self.best_model_path = os.path.join(checkpoint_dir, 'best-model.zip')
         self.latest_model_path = os.path.join(checkpoint_dir, 'latest-model.zip')
+        self.comm, self.rank, self.root = get_comm_rank_root()
+        self.is_root = self.rank == self.root
 
         # TorchRL-like progress reporting state
         self._pbar = None
         self._episodes_shown = max(0, int(start_episode))
         self._latest_train_reward = None
         self._latest_eval_str = ''
-        self._is_tty = sys.stderr.isatty()
+        self._is_tty = self.is_root and sys.stderr.isatty()
         self._training_start_walltime = None
 
     def _current_lr(self) -> float:
@@ -137,6 +141,9 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
 
     def _save_with_metadata(self, model_path: str, eval_reward: float,
                             batch_idx: int, episode_idx: int):
+        if not self.is_root:
+            return
+
         self.model.save(model_path)
 
         metadata = {
@@ -190,7 +197,7 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
         if self.latest_eval_reward > self.best_eval_reward:
             self.best_eval_reward = self.latest_eval_reward
             self.best_eval_episode = episodes_done
-            if self.verbose:
+            if self.verbose and self.is_root:
                 print(
                     f'New best eval reward: {self.best_eval_reward:.6f} '
                     f'at episode {episodes_done}'
@@ -237,7 +244,7 @@ class SB3EvalAndCheckpointCallback(BaseCallback):
         self._sync_progress_bar()
         self._set_progress_postfix()
 
-        if not self._is_tty:
+        if not self._is_tty and self.is_root:
             episodes_done = min(self.hp.episodes, self._episodes_done())
             elapsed = (
                 int(time.time() - self._training_start_walltime)

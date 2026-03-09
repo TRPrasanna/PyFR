@@ -2,7 +2,7 @@ from functools import partial
 import os
 import time
 
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 
 from pyfr.rl.algorithms import (
     create_model as create_algorithm_model,
@@ -21,6 +21,7 @@ from pyfr.rl.core import (
     get_device_count,
 )
 from pyfr.rl.env import PyFREnvironment
+from pyfr.mpiutil import get_comm_rank_root, init_mpi
 
 
 def _make_pyfr_env(mesh_file, cfg_path, backend_name, device_id,
@@ -41,7 +42,8 @@ def _make_pyfr_env(mesh_file, cfg_path, backend_name, device_id,
 
 
 def _resolve_selected_algorithm(hp: HyperParameters, cli_algorithm: str | None,
-                                metadata: dict | None) -> str:
+                                metadata: dict | None,
+                                announce: bool = True) -> str:
     selected = normalize_algorithm_name(cli_algorithm or hp.algorithm)
 
     if metadata and metadata.get('algorithm'):
@@ -53,7 +55,7 @@ def _resolve_selected_algorithm(hp: HyperParameters, cli_algorithm: str | None,
                 f"but checkpoint uses '{ckpt_algorithm}'."
             )
 
-        if ckpt_algorithm != selected:
+        if ckpt_algorithm != selected and announce:
             print(
                 'Note: overriding configured algorithm '
                 f"'{selected}' with checkpoint algorithm '{ckpt_algorithm}'."
@@ -66,6 +68,12 @@ def _resolve_selected_algorithm(hp: HyperParameters, cli_algorithm: str | None,
 def train_agent(mesh_file, cfg_file, backend_name,
                 checkpoint_dir='checkpoints', ic_dir=None, load_model=None,
                 algorithm=None):
+    init_mpi()
+    comm, rank, root = get_comm_rank_root()
+    is_root = rank == root
+    mpi_world_size = comm.size
+    collective_mode = mpi_world_size > 1
+
     if hasattr(cfg_file, 'name'):
         cfg_path = cfg_file.name
     else:
@@ -75,19 +83,24 @@ def train_agent(mesh_file, cfg_file, backend_name,
         with open(cfg_path, 'r') as f:
             config_content = f.read()
     except Exception as e:
-        print(f'Warning: Could not read config file: {e}')
+        if is_root:
+            print(f'Warning: Could not read config file: {e}')
         config_content = None
+
+    probe_device_id = (
+        'local-rank' if collective_mode and backend_name in {'hip', 'cuda'} else 0
+    )
 
     # Probe one environment for diagnostics and to compute derived params.
     probe_env = PyFREnvironment(
-        mesh_file, cfg_path, backend_name, 0,
-        ic_dir=ic_dir, print_diagnostic=True
+        mesh_file, cfg_path, backend_name, probe_device_id,
+        ic_dir=ic_dir, print_diagnostic=is_root
     )
 
-    if 'neuralnetwork-hyperparameters' not in probe_env.cfg.sections():
+    if 'neuralnetwork-hyperparameters' not in probe_env.cfg.sections() and is_root:
         print('No neuralnetwork-hyperparameters section found. Using defaults.')
 
-    hp = HyperParameters.from_config(probe_env.cfg)
+    hp = HyperParameters.from_config(probe_env.cfg, announce=is_root)
 
     resolved_model_path = None
     metadata = None
@@ -108,7 +121,9 @@ def train_agent(mesh_file, cfg_file, backend_name,
 
         metadata = _load_metadata(resolved_model_path)
 
-    selected_algorithm = _resolve_selected_algorithm(hp, algorithm, metadata)
+    selected_algorithm = _resolve_selected_algorithm(
+        hp, algorithm, metadata, announce=is_root
+    )
     hp.algorithm = selected_algorithm
 
     if hp.squash_output and not hp.use_sde:
@@ -123,10 +138,11 @@ def train_agent(mesh_file, cfg_file, backend_name,
                 "requires 'use-sde = true' in SB3."
             )
 
-        print(
-            "Note: default 'squash-output = true' is disabled because "
-            "'use-sde = false'. Set 'use-sde = true' to enable squashing."
-        )
+        if is_root:
+            print(
+                "Note: default 'squash-output = true' is disabled because "
+                "'use-sde = false'. Set 'use-sde = true' to enable squashing."
+            )
         hp.squash_output = False
 
     if is_recurrent_algorithm(selected_algorithm):
@@ -158,61 +174,85 @@ def train_agent(mesh_file, cfg_file, backend_name,
         best_reward = float(metadata.get('best_reward', float('-inf')))
 
         if config_content and metadata.get('config_content'):
-            print('\nVerifying config files...')
             cfg_diffs = compare_configs(metadata['config_content'],
                                         config_content)
-            if cfg_diffs:
-                print('\nWARNING: Config differences detected:')
-                for line_num, ckpt_line, curr_line in cfg_diffs:
-                    print(f'Line {line_num}:')
-                    print(f'  Checkpoint: {ckpt_line}')
-                    print(f'  Current:    {curr_line}')
-            else:
-                print('Config files match.')
+            if is_root:
+                print('\nVerifying config files...')
+                if cfg_diffs:
+                    print('\nWARNING: Config differences detected:')
+                    for line_num, ckpt_line, curr_line in cfg_diffs:
+                        print(f'Line {line_num}:')
+                        print(f'  Checkpoint: {ckpt_line}')
+                        print(f'  Current:    {curr_line}')
+                else:
+                    print('Config files match.')
 
-        if hp.print_config_on_load and metadata.get('config_content'):
+        if hp.print_config_on_load and metadata.get('config_content') and is_root:
             print('\n=== CHECKPOINT CONFIG FILE CONTENT ===\n')
             print(metadata['config_content'])
             print('\n=======================================\n')
 
-    num_devices = max(1, get_device_count(backend_name))
-    num_envs = max(1, num_devices * max(1, hp.envs_per_device))
+    visible_devices = max(1, get_device_count(backend_name))
+    num_devices = mpi_world_size if collective_mode else 1
+    num_envs = 1
 
-    hp._calculate_derived(probe_env, num_envs)
-    hp.print_summary(num_devices=num_devices, num_envs=num_envs)
+    if collective_mode and hp.envs_per_device != 1 and is_root:
+        print(
+            "Note: 'envs-per-device' is ignored in MPI collective mode; "
+            'using exactly one environment across all ranks.'
+        )
+    hp.envs_per_device = 1
+
+    hp._calculate_derived(probe_env, num_envs, announce=is_root)
+    if is_root:
+        if collective_mode:
+            print(
+                f'\nMPI collective mode enabled across {mpi_world_size} rank(s). '
+                'One RL environment will span the full MPI world.'
+            )
+            if backend_name in {'cuda', 'hip'}:
+                print("Backend device mapping: device-id = 'local-rank'")
+        elif visible_devices > 1 and backend_name in {'cuda', 'hip'}:
+            print(
+                '\nNote: this branch uses a single environment. '
+                'To use multiple GPUs, launch one MPI rank per GPU via '
+                '`srun` or `mpiexec` so the environment can span them collectively.'
+            )
+        hp.print_summary(num_devices=num_devices, num_envs=num_envs)
 
     probe_env.close()
 
     algo_spec = get_algorithm_spec(selected_algorithm)
 
-    print(f"\nFound {num_devices} devices for backend '{backend_name}'")
-    print(
-        f"Using SB3 ({algo_spec.display_name}) "
-        f'with {num_envs} environment(s).'
-    )
+    if is_root:
+        print(f"\nFound {num_devices} effective device/rank slots for backend '{backend_name}'")
+        print(
+            f"Using SB3 ({algo_spec.display_name}) "
+            f'with {num_envs} environment(s).'
+        )
 
     os.makedirs(checkpoint_dir, exist_ok=True)
-    tb_log_root = os.path.join(checkpoint_dir, 'tensorboard_logs')
-    os.makedirs(tb_log_root, exist_ok=True)
+    tb_log_root = os.path.join(checkpoint_dir, 'tensorboard_logs') if is_root else None
+    if tb_log_root is not None:
+        os.makedirs(tb_log_root, exist_ok=True)
 
+    train_device_id = (
+        'local-rank' if collective_mode and backend_name in {'cuda', 'hip'} else 0
+    )
     train_env_fns = [
         partial(
             _make_pyfr_env,
             mesh_file=mesh_file,
             cfg_path=cfg_path,
             backend_name=backend_name,
-            device_id=(i % num_devices),
+            device_id=train_device_id,
             ic_dir=ic_dir,
             print_diagnostic=False,
             evaluation_mode=False
         )
-        for i in range(num_envs)
     ]
 
-    if num_envs == 1:
-        train_env = DummyVecEnv(train_env_fns)
-    else:
-        train_env = SubprocVecEnv(train_env_fns, start_method='spawn')
+    train_env = DummyVecEnv(train_env_fns)
     train_env = VecMonitor(train_env)
 
     eval_env = DummyVecEnv([
@@ -221,7 +261,7 @@ def train_agent(mesh_file, cfg_file, backend_name,
             mesh_file=mesh_file,
             cfg_path=cfg_path,
             backend_name=backend_name,
-            device_id=0,
+            device_id=train_device_id,
             ic_dir=ic_dir,
             print_diagnostic=False,
             evaluation_mode=True
@@ -252,10 +292,11 @@ def train_agent(mesh_file, cfg_file, backend_name,
     model = None
 
     if load_model:
-        print(
-            f"Loading SB3 model ({algo_spec.display_name}): "
-            f'{resolved_model_path}'
-        )
+        if is_root:
+            print(
+                f"Loading SB3 model ({algo_spec.display_name}): "
+                f'{resolved_model_path}'
+            )
         model = load_algorithm_model(
             selected_algorithm,
             resolved_model_path,
@@ -273,12 +314,16 @@ def train_agent(mesh_file, cfg_file, backend_name,
             tensorboard_log=tb_log_root,
         )
 
+    if hasattr(model, 'set_random_seed'):
+        model.set_random_seed(hp.seed)
+
     remaining_timesteps = hp.total_frames - start_timesteps
     if remaining_timesteps <= 0:
-        print(
-            'No remaining timesteps to train: '
-            f'total_frames={hp.total_frames}, start_timesteps={start_timesteps}'
-        )
+        if is_root:
+            print(
+                'No remaining timesteps to train: '
+                f'total_frames={hp.total_frames}, start_timesteps={start_timesteps}'
+            )
         train_env.close()
         eval_env.close()
         return
@@ -296,7 +341,7 @@ def train_agent(mesh_file, cfg_file, backend_name,
         start_episode=start_episode,
         start_timesteps=start_timesteps,
         best_eval_reward=best_reward,
-        verbose=1,
+        verbose=1 if is_root else 0,
     )
 
     model.learn(

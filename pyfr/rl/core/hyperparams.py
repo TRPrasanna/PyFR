@@ -69,7 +69,7 @@ class HyperParameters:
             'n_steps', 'rollout_size', 'batch_size'
         }
 
-    def _calculate_derived(self, env, num_envs):
+    def _calculate_derived(self, env, num_envs, announce: bool = True):
         self.actions_per_episode = max(1, int(env.dtend / env.action_interval))
         self.frames_per_batch = self.episodes_per_batch * self.actions_per_episode
         self.total_frames = self.episodes * self.actions_per_episode
@@ -81,18 +81,19 @@ class HyperParameters:
         desired_mb = max(1, self.desired_num_minibatches)
         if self.rollout_size % desired_mb != 0:
             adjusted = get_closest_divisor(self.rollout_size, desired_mb)
-            print(
-                'Warning: rollout_size '
-                f'({self.rollout_size}) is not divisible by '
-                f'desired_num_minibatches ({desired_mb}). '
-                f'Adjusted desired_num_minibatches to {adjusted}.'
-            )
+            if announce:
+                print(
+                    'Warning: rollout_size '
+                    f'({self.rollout_size}) is not divisible by '
+                    f'desired_num_minibatches ({desired_mb}). '
+                    f'Adjusted desired_num_minibatches to {adjusted}.'
+                )
             self.desired_num_minibatches = adjusted
 
         self.batch_size = max(1, self.rollout_size // self.desired_num_minibatches)
 
     @classmethod
-    def from_config(cls, cfg: Inifile) -> 'HyperParameters':
+    def from_config(cls, cfg: Inifile, announce: bool = True) -> 'HyperParameters':
         params = cls()
 
         if 'neuralnetwork-hyperparameters' not in cfg.sections():
@@ -122,10 +123,11 @@ class HyperParameters:
 
         # Legacy TorchRL option; no longer supported in SB3 path.
         if cfg.hasopt(section, 'state-ind-normal-scale'):
-            print(
-                "Warning: 'state-ind-normal-scale' is deprecated and ignored. "
-                "Use 'use-sde = true/false' for SB3 gSDE control."
-            )
+            if announce:
+                print(
+                    "Warning: 'state-ind-normal-scale' is deprecated and ignored. "
+                    "Use 'use-sde = true/false' for SB3 gSDE control."
+                )
 
         return params
 

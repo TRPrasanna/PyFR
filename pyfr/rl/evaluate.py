@@ -5,6 +5,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 
+from pyfr.mpiutil import get_comm_rank_root, init_mpi
 from pyfr.rl.algorithms import (
     get_algorithm_spec,
     is_recurrent_algorithm,
@@ -43,6 +44,11 @@ def _resolve_eval_algorithm(cli_algorithm: str | None,
 def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
                     ic_dir=None, episodes=1, algorithm=None):
     """Evaluate a trained SB3 policy."""
+    init_mpi()
+    comm, rank, root = get_comm_rank_root()
+    is_root = rank == root
+    collective_mode = comm.size > 1
+
     if hasattr(cfg_file, 'name'):
         cfg_path = cfg_file.name
     else:
@@ -52,38 +58,46 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         with open(cfg_path, 'r') as f:
             config_content = f.read()
     except Exception as e:
-        print(f'Warning: Could not read config file: {e}')
+        if is_root:
+            print(f'Warning: Could not read config file: {e}')
         config_content = None
 
     model_path = _resolve_model_path(load_model)
     if not os.path.exists(model_path):
-        print(f'Error: Model file not found: {load_model}')
+        if is_root:
+            print(f'Error: Model file not found: {load_model}')
         sys.exit(1)
 
     if model_path.endswith('.pt'):
-        print('Error: TorchRL .pt checkpoints are not compatible with SB3 evaluation.')
+        if is_root:
+            print('Error: TorchRL .pt checkpoints are not compatible with SB3 evaluation.')
         sys.exit(1)
 
     metadata = _load_metadata(model_path)
     if metadata and config_content and metadata.get('config_content'):
-        print('\nVerifying config files...')
         diffs = compare_configs(metadata['config_content'], config_content)
-        if diffs:
-            print('\nWARNING: Config file differences detected:')
-            for line_num, ckpt_line, curr_line in diffs:
-                print(f'Line {line_num}:')
-                print(f'  Checkpoint: {ckpt_line}')
-                print(f'  Current:    {curr_line}')
-        else:
-            print('Config files match.')
+        if is_root:
+            print('\nVerifying config files...')
+            if diffs:
+                print('\nWARNING: Config file differences detected:')
+                for line_num, ckpt_line, curr_line in diffs:
+                    print(f'Line {line_num}:')
+                    print(f'  Checkpoint: {ckpt_line}')
+                    print(f'  Current:    {curr_line}')
+            else:
+                print('Config files match.')
+
+    eval_device_id = (
+        'local-rank' if collective_mode and backend_name in {'cuda', 'hip'} else 0
+    )
 
     env = PyFREnvironment(
         mesh_file=mesh_file,
         cfg_file=cfg_path,
         backend_name=backend_name,
-        device_id=0,
+        device_id=eval_device_id,
         ic_dir=ic_dir,
-        print_diagnostic=True
+        print_diagnostic=is_root
     )
 
     env.set_evaluation_mode(True)
@@ -91,14 +105,16 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
     # Print hyperparameter summary (checkpoint preferred, else config).
     hp = None
     if metadata and isinstance(metadata.get('hyperparameters'), dict):
-        print('\nUsing hyperparameters from checkpoint')
+        if is_root:
+            print('\nUsing hyperparameters from checkpoint')
         hp = HyperParameters()
         for key, value in metadata['hyperparameters'].items():
             if hasattr(hp, key):
                 setattr(hp, key, value)
     elif 'neuralnetwork-hyperparameters' in env.cfg.sections():
-        print('\nUsing hyperparameters from config file')
-        hp = HyperParameters.from_config(env.cfg)
+        if is_root:
+            print('\nUsing hyperparameters from config file')
+        hp = HyperParameters.from_config(env.cfg, announce=is_root)
 
     selected_algorithm = _resolve_eval_algorithm(algorithm, metadata, hp)
     if hp is not None:
@@ -106,7 +122,8 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
 
     algo_spec = get_algorithm_spec(selected_algorithm)
 
-    print(f'Loading SB3 model ({algo_spec.display_name}): {model_path}')
+    if is_root:
+        print(f'Loading SB3 model ({algo_spec.display_name}): {model_path}')
     model = load_algorithm_model(
         selected_algorithm,
         model_path,
@@ -115,8 +132,10 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
     )
 
     if hp is not None:
-        hp._calculate_derived(env, num_envs=1)
-        hp.print_summary(num_devices=1, num_envs=1)
+        hp._calculate_derived(env, num_envs=1, announce=is_root)
+        if is_root:
+            hp.print_summary(num_devices=comm.size if collective_mode else 1,
+                             num_envs=1)
 
     recurrent = is_recurrent_algorithm(selected_algorithm)
 
@@ -161,38 +180,40 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
 
             all_episode_returns.append(ep_return)
 
-            print(
-                f'Episode {ep + 1}/{episodes}: '
-                f'steps={len(ep_rewards)} '
-                f'return={ep_return:.7e} '
-                f'mean_step_reward={ep_mean:.7e}'
-            )
+            if is_root:
+                print(
+                    f'Episode {ep + 1}/{episodes}: '
+                    f'steps={len(ep_rewards)} '
+                    f'return={ep_return:.7e} '
+                    f'mean_step_reward={ep_mean:.7e}'
+                )
 
             if ep == 0:
                 first_ep_actions = np.asarray(ep_actions, dtype=np.float64)
                 first_ep_rewards = ep_rewards_arr
 
         returns = np.asarray(all_episode_returns, dtype=np.float64)
-        print('\nEvaluation Results:')
-        print('-' * 40)
-        print(f'Episodes: {episodes}')
-        print(f'Mean episode return: {returns.mean():.7e}')
-        print(f'Std episode return:  {returns.std():.7e}')
-        print(f'Min/Max return:      {returns.min():.7e} / {returns.max():.7e}')
-
-        if metadata:
-            print('\nCheckpoint Metadata:')
+        if is_root:
+            print('\nEvaluation Results:')
             print('-' * 40)
-            if 'algorithm' in metadata:
-                print(f"Algorithm:             {metadata['algorithm']}")
-            if 'current_reward' in metadata:
-                print(f"Stored current reward: {metadata['current_reward']:.7e}")
-            if 'best_reward' in metadata:
-                print(f"Stored best reward:    {metadata['best_reward']:.7e}")
-            if 'best_episode' in metadata:
-                print(f"Best reward episode:   {metadata['best_episode']}")
+            print(f'Episodes: {episodes}')
+            print(f'Mean episode return: {returns.mean():.7e}')
+            print(f'Std episode return:  {returns.std():.7e}')
+            print(f'Min/Max return:      {returns.min():.7e} / {returns.max():.7e}')
 
-        if first_ep_actions is not None and first_ep_rewards is not None:
+            if metadata:
+                print('\nCheckpoint Metadata:')
+                print('-' * 40)
+                if 'algorithm' in metadata:
+                    print(f"Algorithm:             {metadata['algorithm']}")
+                if 'current_reward' in metadata:
+                    print(f"Stored current reward: {metadata['current_reward']:.7e}")
+                if 'best_reward' in metadata:
+                    print(f"Stored best reward:    {metadata['best_reward']:.7e}")
+                if 'best_episode' in metadata:
+                    print(f"Best reward episode:   {metadata['best_episode']}")
+
+        if is_root and first_ep_actions is not None and first_ep_rewards is not None:
             num_steps = len(first_ep_rewards)
             num_actions = first_ep_actions.shape[1] if first_ep_actions.ndim == 2 else 1
 
