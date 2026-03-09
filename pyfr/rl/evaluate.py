@@ -6,6 +6,7 @@ import numpy as np
 
 from pyfr.mpiutil import get_comm_rank_root, init_mpi
 from pyfr.rl.algorithms import (
+    create_model as create_algorithm_model,
     get_algorithm_spec,
     is_recurrent_algorithm,
     load_model as load_algorithm_model,
@@ -13,6 +14,7 @@ from pyfr.rl.algorithms import (
 )
 from pyfr.rl.core import (
     HyperParameters,
+    _activation_from_name,
     _load_metadata,
     _resolve_model_path,
     compare_configs,
@@ -45,8 +47,49 @@ def _resolve_eval_algorithm(cli_algorithm: str | None,
     return selected
 
 
+def _build_policy_kwargs(hp: HyperParameters) -> dict:
+    policy_kwargs = {
+        'activation_fn': _activation_from_name(hp.activation_policy),
+        'squash_output': hp.squash_output,
+        'net_arch': {
+            'pi': [hp.num_cells_policy] * hp.num_hidden_layers_policy,
+            'vf': [hp.num_cells_value] * hp.num_hidden_layers_value,
+        }
+    }
+
+    if is_recurrent_algorithm(hp.algorithm):
+        policy_kwargs.update({
+            'lstm_hidden_size': hp.lstm_hidden_size,
+            'n_lstm_layers': hp.n_lstm_layers,
+            'shared_lstm': hp.shared_lstm,
+            'enable_critic_lstm': hp.enable_critic_lstm,
+        })
+
+        if hp.lstm_dropout > 0.0:
+            policy_kwargs['lstm_kwargs'] = {'dropout': hp.lstm_dropout}
+
+    return policy_kwargs
+
+
+def _maybe_reset_sde_noise(model, step_idx: int, stochastic: bool, n_envs: int = 1):
+    if not stochastic or not getattr(model, 'use_sde', False):
+        return
+
+    if not hasattr(model, 'policy') or not hasattr(model.policy, 'reset_noise'):
+        return
+
+    sde_sample_freq = int(getattr(model, 'sde_sample_freq', -1))
+    should_reset = step_idx == 0 or (
+        sde_sample_freq > 0 and step_idx % sde_sample_freq == 0
+    )
+
+    if should_reset:
+        model.policy.reset_noise(n_envs)
+
+
 def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
-                    ic_dir=None, episodes=1, algorithm=None):
+                    ic_dir=None, episodes=1, algorithm=None,
+                    stochastic: bool = False):
     """Evaluate a trained SB3 policy."""
     init_mpi()
     comm, rank, root = get_comm_rank_root()
@@ -66,28 +109,31 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
             print(f'Warning: Could not read config file: {e}')
         config_content = None
 
-    model_path = _resolve_model_path(load_model)
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f'Model file not found: {load_model}')
+    model_path = None
+    metadata = None
+    if load_model:
+        model_path = _resolve_model_path(load_model)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f'Model file not found: {load_model}')
 
-    if model_path.endswith('.pt'):
-        raise ValueError(
-            'TorchRL .pt checkpoints are not compatible with SB3 evaluation.'
-        )
+        if model_path.endswith('.pt'):
+            raise ValueError(
+                'TorchRL .pt checkpoints are not compatible with SB3 evaluation.'
+            )
 
-    metadata = _load_metadata(model_path)
-    if metadata and config_content and metadata.get('config_content'):
-        diffs = compare_configs(metadata['config_content'], config_content)
-        if is_root:
-            print('\nVerifying config files...')
-            if diffs:
-                print('\nWARNING: Config file differences detected:')
-                for line_num, ckpt_line, curr_line in diffs:
-                    print(f'Line {line_num}:')
-                    print(f'  Checkpoint: {ckpt_line}')
-                    print(f'  Current:    {curr_line}')
-            else:
-                print('Config files match.')
+        metadata = _load_metadata(model_path)
+        if metadata and config_content and metadata.get('config_content'):
+            diffs = compare_configs(metadata['config_content'], config_content)
+            if is_root:
+                print('\nVerifying config files...')
+                if diffs:
+                    print('\nWARNING: Config file differences detected:')
+                    for line_num, ckpt_line, curr_line in diffs:
+                        print(f'Line {line_num}:')
+                        print(f'  Checkpoint: {ckpt_line}')
+                        print(f'  Current:    {curr_line}')
+                else:
+                    print('Config files match.')
 
     eval_device_id = (
         'local-rank' if collective_mode and backend_name in {'cuda', 'hip'} else 0
@@ -115,7 +161,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         workers_active = collective_mode and is_root
         env = CollectiveEnvController('eval', raw_env) if collective_mode else raw_env
 
-        # Print hyperparameter summary (checkpoint preferred, else config).
+        # Print hyperparameter summary (checkpoint preferred, else config/defaults).
         hp = None
         if metadata and isinstance(metadata.get('hyperparameters'), dict):
             if is_root:
@@ -124,31 +170,93 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
             for key, value in metadata['hyperparameters'].items():
                 if hasattr(hp, key):
                     setattr(hp, key, value)
-        elif 'neuralnetwork-hyperparameters' in raw_env.cfg.sections():
+        else:
+            has_hp_section = 'neuralnetwork-hyperparameters' in raw_env.cfg.sections()
             if is_root:
-                print('\nUsing hyperparameters from config file')
+                if has_hp_section:
+                    print('\nUsing hyperparameters from config file')
+                else:
+                    print('\nNo neuralnetwork-hyperparameters section found. Using defaults.')
             hp = HyperParameters.from_config(raw_env.cfg, announce=is_root)
 
         selected_algorithm = _resolve_eval_algorithm(algorithm, metadata, hp)
         if hp is not None:
             hp.algorithm = selected_algorithm
 
-        algo_spec = get_algorithm_spec(selected_algorithm)
+        if hp.squash_output and not hp.use_sde:
+            squash_from_cfg = hp._param_sources.get('squash_output') == 'config'
+            if squash_from_cfg:
+                raise ValueError(
+                    "Invalid hyperparameter combination: 'squash-output = true' "
+                    "requires 'use-sde = true' in SB3."
+                )
+            if is_root:
+                print(
+                    "Note: default 'squash-output = true' is disabled because "
+                    "'use-sde = false'. Set 'use-sde = true' to enable squashing."
+                )
+            hp.squash_output = False
 
-        if is_root:
-            print(f'Loading SB3 model ({algo_spec.display_name}): {model_path}')
-        model = load_algorithm_model(
-            selected_algorithm,
-            model_path,
-            env=None,
-            device='cpu'
-        )
+        if is_recurrent_algorithm(selected_algorithm):
+            if hp.shared_lstm and hp.enable_critic_lstm:
+                raise ValueError(
+                    "Invalid PPO-LSTM hyperparameters: 'shared-lstm = true' and "
+                    "'enable-critic-lstm = true' are mutually exclusive."
+                )
+            if hp.lstm_dropout < 0.0 or hp.lstm_dropout >= 1.0:
+                raise ValueError(
+                    "Invalid PPO-LSTM hyperparameters: 'lstm-dropout' must be in "
+                    '[0, 1).'
+                )
+            if hp.n_lstm_layers < 1:
+                raise ValueError(
+                    "Invalid PPO-LSTM hyperparameters: 'n-lstm-layers' must be >= 1."
+                )
+            if hp.lstm_hidden_size < 1:
+                raise ValueError(
+                    "Invalid PPO-LSTM hyperparameters: 'lstm-hidden-size' must be >= 1."
+                )
+
+        algo_spec = get_algorithm_spec(selected_algorithm)
 
         if hp is not None:
             hp._calculate_derived(raw_env, num_envs=1, announce=is_root)
             if is_root:
                 hp.print_summary(num_devices=comm.size if collective_mode else 1,
                                  num_envs=1)
+
+        policy_kwargs = _build_policy_kwargs(hp)
+        deterministic_eval = not stochastic
+
+        if model_path is not None:
+            if is_root:
+                print(f'Loading SB3 model ({algo_spec.display_name}): {model_path}')
+            model = load_algorithm_model(
+                selected_algorithm,
+                model_path,
+                env=None,
+                device='cpu'
+            )
+        else:
+            if is_root:
+                print(
+                    'Warning: --load-model was not provided. '
+                    f'Evaluating a fresh untrained {algo_spec.display_name} '
+                    'policy initialized from the current config.'
+                )
+            model = create_algorithm_model(
+                selected_algorithm,
+                env=env,
+                hp=hp,
+                policy_kwargs=policy_kwargs,
+                tensorboard_log=None,
+            )
+
+        if is_root:
+            print(
+                'Evaluation action mode: '
+                f"{'stochastic' if stochastic else 'deterministic'}"
+            )
 
         recurrent = is_recurrent_algorithm(selected_algorithm)
 
@@ -165,17 +273,27 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
 
             lstm_states = None
             episode_starts = np.array([True], dtype=bool)
+            rollout_step_idx = 0
 
             while not done:
+                _maybe_reset_sde_noise(
+                    model,
+                    rollout_step_idx,
+                    stochastic=stochastic,
+                    n_envs=1
+                )
                 if recurrent:
                     action, lstm_states = model.predict(
                         obs,
                         state=lstm_states,
                         episode_start=episode_starts,
-                        deterministic=True
+                        deterministic=deterministic_eval
                     )
                 else:
-                    action, _ = model.predict(obs, deterministic=True)
+                    action, _ = model.predict(
+                        obs,
+                        deterministic=deterministic_eval
+                    )
 
                 obs, reward, terminated, truncated, _ = env.step(action)
 
@@ -185,6 +303,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
                 done = bool(terminated or truncated)
                 if recurrent:
                     episode_starts[0] = done
+                rollout_step_idx += 1
 
             ep_rewards_arr = np.asarray(ep_rewards, dtype=np.float64)
             ep_return = float(ep_rewards_arr.sum())
