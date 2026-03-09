@@ -235,7 +235,8 @@ def train_agent(mesh_file, cfg_file, backend_name,
             f'with {num_envs} environment(s).'
         )
 
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    if is_root:
+        os.makedirs(checkpoint_dir, exist_ok=True)
     tb_log_root = os.path.join(checkpoint_dir, 'tensorboard_logs') if is_root else None
     if tb_log_root is not None:
         os.makedirs(tb_log_root, exist_ok=True)

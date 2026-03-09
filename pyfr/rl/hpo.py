@@ -9,6 +9,7 @@ from typing import Any
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
 from pyfr.inifile import Inifile
+from pyfr.mpiutil import get_comm_rank_root, init_mpi
 from pyfr.rl.algorithms import (
     create_model as create_algorithm_model,
     get_algorithm_spec,
@@ -411,6 +412,17 @@ def run_hpo(mesh_file, cfg_file, backend_name, checkpoint_dir='hpo-runs',
             n_trials=None, timeout=None, sampler=None, pruner=None,
             device_id=None, envs_per_trial=None, episodes_per_batch=None,
             trial_updates=None):
+    init_mpi()
+    comm, rank, root = get_comm_rank_root()
+    if comm.size > 1:
+        if rank == root:
+            raise RuntimeError(
+                'MPI collective mode is not supported for '
+                "'pyfr-rl hpo'. Launch exactly one rank per HPO worker "
+                'instead of running HPO under MPI.'
+            )
+        raise RuntimeError('MPI collective mode is not supported for pyfr-rl hpo.')
+
     try:
         import optuna
     except ImportError as exc:

@@ -1,6 +1,8 @@
 import gc
 import os
 import random
+import sys
+import traceback
 from datetime import datetime
 from typing import List
 
@@ -103,20 +105,18 @@ class PyFREnvironment(gym.Env):
         self.step_count = -1
 
         self.ic_manager = None
-        if ic_dir is not None:
+        if self.is_root and ic_dir is not None:
             try:
                 self.ic_manager = InitialConditionManager(
                     ic_dir, self.mesh.uuid,
                     print_diagnostic=self.print_diagnostic
                 )
             except ValueError as e:
-                if self.is_root:
-                    print(f'\nWarning: {e}')
-                    print('Continuing without initial condition snapshots...')
-        else:
-            if self.print_diagnostic:
-                print('\nNote: No initial condition directory provided.')
-                print('Training will use default initial conditions.')
+                print(f'\nWarning: {e}')
+                print('Continuing without initial condition snapshots...')
+        elif self.print_diagnostic:
+            print('\nNote: No initial condition directory provided.')
+            print('Training will use default initial conditions.')
 
         self.is_evaluating = False
 
@@ -165,29 +165,30 @@ class PyFREnvironment(gym.Env):
         self.pbar = pbar
 
     def _load_restart_soln(self):
-        if self.ic_manager is None:
-            return None
+        payload = {'ic_file': None, 'error': None}
 
-        try:
-            if self.is_root:
+        if self.is_root and self.ic_manager is not None:
+            try:
                 if self.is_evaluating:
-                    ic_file = self.ic_manager.get_eval_ic()
+                    payload['ic_file'] = self.ic_manager.get_eval_ic()
                 else:
-                    ic_file = self.ic_manager.get_random_ic()
-            else:
-                ic_file = None
+                    payload['ic_file'] = self.ic_manager.get_random_ic()
+            except Exception as e:
+                payload['error'] = str(e)
 
-            ic_file = self.comm.bcast(ic_file, root=self.root)
+        payload = self.comm.bcast(payload, root=self.root)
 
-            if ic_file is None:
-                return None
-
-            return self.mesh_reader.load_soln(ic_file)
-        except Exception as e:
+        if payload['error'] is not None:
             if self.is_root:
-                print(f'Warning: Failed to load IC file: {e}')
+                print(f"Warning: Failed to load IC file: {payload['error']}")
                 print('Using default initial conditions.')
             return None
+
+        ic_file = payload['ic_file']
+        if ic_file is None:
+            return None
+
+        return self.mesh_reader.load_soln(ic_file)
 
     def _init_solver(self, initsoln=None):
         self._release_solver()
@@ -280,7 +281,7 @@ class PyFREnvironment(gym.Env):
             truncated = self._check_done()
             terminated = False
 
-            if truncated and self.count_episodes:
+            if truncated and self.count_episodes and self.is_root:
                 self.episode_count += 1
 
             info = {
@@ -297,7 +298,7 @@ class PyFREnvironment(gym.Env):
             truncated = False
             terminated = True
 
-            if self.count_episodes:
+            if self.count_episodes and self.is_root:
                 self.episode_count += 1
 
             info = {
@@ -433,6 +434,24 @@ def serve_collective_envs(envs: dict[str, PyFREnvironment]):
                 active_envs.pop(env_name, None)
             else:
                 raise RuntimeError(f"Unknown collective command '{cmd}'.")
+    except BaseException as exc:
+        exc_name = type(exc).__name__
+        cmd = payload.get('cmd') if 'payload' in locals() and payload else '<none>'
+        env_name = payload.get('env') if 'payload' in locals() and payload else '<none>'
+        print(
+            '[mpi-worker] '
+            f'rank={rank} env={env_name} cmd={cmd} '
+            f'error={exc_name}: {exc}',
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc()
+        sys.stderr.flush()
+
+        try:
+            comm.Abort(1)
+        finally:
+            raise
     finally:
         for env in active_envs.values():
             try:

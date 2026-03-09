@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 
 import matplotlib.pyplot as plt
@@ -69,14 +68,12 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
 
     model_path = _resolve_model_path(load_model)
     if not os.path.exists(model_path):
-        if is_root:
-            print(f'Error: Model file not found: {load_model}')
-        sys.exit(1)
+        raise FileNotFoundError(f'Model file not found: {load_model}')
 
     if model_path.endswith('.pt'):
-        if is_root:
-            print('Error: TorchRL .pt checkpoints are not compatible with SB3 evaluation.')
-        sys.exit(1)
+        raise ValueError(
+            'TorchRL .pt checkpoints are not compatible with SB3 evaluation.'
+        )
 
     metadata = _load_metadata(model_path)
     if metadata and config_content and metadata.get('config_content'):
