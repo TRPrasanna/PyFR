@@ -1,4 +1,3 @@
-from functools import partial
 import os
 import time
 
@@ -20,7 +19,12 @@ from pyfr.rl.core import (
     compare_configs,
     get_device_count,
 )
-from pyfr.rl.env import PyFREnvironment
+from pyfr.rl.env import (
+    CollectiveEnvController,
+    PyFREnvironment,
+    serve_collective_envs,
+    stop_collective_workers,
+)
 from pyfr.mpiutil import get_comm_rank_root, init_mpi
 
 
@@ -239,118 +243,146 @@ def train_agent(mesh_file, cfg_file, backend_name,
     train_device_id = (
         'local-rank' if collective_mode and backend_name in {'cuda', 'hip'} else 0
     )
-    train_env_fns = [
-        partial(
-            _make_pyfr_env,
+    train_base_env = None
+    eval_base_env = None
+    train_env = None
+    eval_env = None
+    workers_active = False
+    try:
+        train_base_env = _make_pyfr_env(
             mesh_file=mesh_file,
             cfg_path=cfg_path,
             backend_name=backend_name,
             device_id=train_device_id,
             ic_dir=ic_dir,
             print_diagnostic=False,
-            evaluation_mode=False
+            evaluation_mode=False,
         )
-    ]
-
-    train_env = DummyVecEnv(train_env_fns)
-    train_env = VecMonitor(train_env)
-
-    eval_env = DummyVecEnv([
-        partial(
-            _make_pyfr_env,
+        eval_base_env = _make_pyfr_env(
             mesh_file=mesh_file,
             cfg_path=cfg_path,
             backend_name=backend_name,
             device_id=train_device_id,
             ic_dir=ic_dir,
             print_diagnostic=False,
-            evaluation_mode=True
+            evaluation_mode=True,
         )
-    ])
-    eval_env = VecMonitor(eval_env)
 
-    policy_kwargs = {
-        'activation_fn': _activation_from_name(hp.activation_policy),
-        'squash_output': hp.squash_output,
-        'net_arch': {
-            'pi': [hp.num_cells_policy] * hp.num_hidden_layers_policy,
-            'vf': [hp.num_cells_value] * hp.num_hidden_layers_value,
+        if collective_mode and not is_root:
+            serve_collective_envs({
+                'train': train_base_env,
+                'eval': eval_base_env,
+            })
+            return
+
+        workers_active = collective_mode and is_root
+
+        if collective_mode:
+            train_base_env = CollectiveEnvController('train', train_base_env)
+            eval_base_env = CollectiveEnvController('eval', eval_base_env)
+
+        policy_kwargs = {
+            'activation_fn': _activation_from_name(hp.activation_policy),
+            'squash_output': hp.squash_output,
+            'net_arch': {
+                'pi': [hp.num_cells_policy] * hp.num_hidden_layers_policy,
+                'vf': [hp.num_cells_value] * hp.num_hidden_layers_value,
+            }
         }
-    }
 
-    if is_recurrent_algorithm(selected_algorithm):
-        policy_kwargs.update({
-            'lstm_hidden_size': hp.lstm_hidden_size,
-            'n_lstm_layers': hp.n_lstm_layers,
-            'shared_lstm': hp.shared_lstm,
-            'enable_critic_lstm': hp.enable_critic_lstm,
-        })
+        if is_recurrent_algorithm(selected_algorithm):
+            policy_kwargs.update({
+                'lstm_hidden_size': hp.lstm_hidden_size,
+                'n_lstm_layers': hp.n_lstm_layers,
+                'shared_lstm': hp.shared_lstm,
+                'enable_critic_lstm': hp.enable_critic_lstm,
+            })
 
-        if hp.lstm_dropout > 0.0:
-            policy_kwargs['lstm_kwargs'] = {'dropout': hp.lstm_dropout}
+            if hp.lstm_dropout > 0.0:
+                policy_kwargs['lstm_kwargs'] = {'dropout': hp.lstm_dropout}
 
-    model = None
+        train_env = DummyVecEnv([lambda env=train_base_env: env])
+        train_env = VecMonitor(train_env)
 
-    if load_model:
-        if is_root:
-            print(
-                f"Loading SB3 model ({algo_spec.display_name}): "
-                f'{resolved_model_path}'
+        eval_env = DummyVecEnv([lambda env=eval_base_env: env])
+        eval_env = VecMonitor(eval_env)
+
+        model = None
+
+        if load_model:
+            if is_root:
+                print(
+                    f"Loading SB3 model ({algo_spec.display_name}): "
+                    f'{resolved_model_path}'
+                )
+            model = load_algorithm_model(
+                selected_algorithm,
+                resolved_model_path,
+                env=train_env,
+                device=hp.torch_device,
             )
-        model = load_algorithm_model(
-            selected_algorithm,
-            resolved_model_path,
-            env=train_env,
-            device=hp.torch_device,
-        )
-        model.verbose = 0
+            model.verbose = 0
 
-    if model is None:
-        model = create_algorithm_model(
-            selected_algorithm,
-            env=train_env,
+        if model is None:
+            model = create_algorithm_model(
+                selected_algorithm,
+                env=train_env,
+                hp=hp,
+                policy_kwargs=policy_kwargs,
+                tensorboard_log=tb_log_root,
+            )
+
+        if hasattr(model, 'set_random_seed'):
+            model.set_random_seed(hp.seed)
+
+        remaining_timesteps = hp.total_frames - start_timesteps
+        if remaining_timesteps <= 0:
+            if is_root:
+                print(
+                    'No remaining timesteps to train: '
+                    f'total_frames={hp.total_frames}, start_timesteps={start_timesteps}'
+                )
+            return
+
+        wallclock_datetime = time.strftime('%Y-%m-%d_%H-%M-%S')
+
+        callback = SB3EvalAndCheckpointCallback(
+            eval_env=eval_env,
             hp=hp,
-            policy_kwargs=policy_kwargs,
-            tensorboard_log=tb_log_root,
+            checkpoint_dir=checkpoint_dir,
+            cfg_path=cfg_path,
+            config_content=config_content,
+            algorithm_name=selected_algorithm,
+            recurrent_policy=is_recurrent_algorithm(selected_algorithm),
+            start_episode=start_episode,
+            start_timesteps=start_timesteps,
+            best_eval_reward=best_reward,
+            verbose=1 if is_root else 0,
         )
 
-    if hasattr(model, 'set_random_seed'):
-        model.set_random_seed(hp.seed)
+        model.learn(
+            total_timesteps=remaining_timesteps,
+            callback=callback,
+            reset_num_timesteps=(start_timesteps == 0),
+            tb_log_name=wallclock_datetime,
+            progress_bar=False,
+        )
+    finally:
+        if train_env is not None:
+            train_env.close()
+        else:
+            try:
+                train_base_env.close()
+            except Exception:
+                pass
 
-    remaining_timesteps = hp.total_frames - start_timesteps
-    if remaining_timesteps <= 0:
-        if is_root:
-            print(
-                'No remaining timesteps to train: '
-                f'total_frames={hp.total_frames}, start_timesteps={start_timesteps}'
-            )
-        train_env.close()
-        eval_env.close()
-        return
+        if eval_env is not None:
+            eval_env.close()
+        else:
+            try:
+                eval_base_env.close()
+            except Exception:
+                pass
 
-    wallclock_datetime = time.strftime('%Y-%m-%d_%H-%M-%S')
-
-    callback = SB3EvalAndCheckpointCallback(
-        eval_env=eval_env,
-        hp=hp,
-        checkpoint_dir=checkpoint_dir,
-        cfg_path=cfg_path,
-        config_content=config_content,
-        algorithm_name=selected_algorithm,
-        recurrent_policy=is_recurrent_algorithm(selected_algorithm),
-        start_episode=start_episode,
-        start_timesteps=start_timesteps,
-        best_eval_reward=best_reward,
-        verbose=1 if is_root else 0,
-    )
-
-    model.learn(
-        total_timesteps=remaining_timesteps,
-        callback=callback,
-        reset_num_timesteps=(start_timesteps == 0),
-        tb_log_name=wallclock_datetime,
-        progress_bar=False,
-    )
-
-    train_env.close()
-    eval_env.close()
+        if workers_active:
+            stop_collective_workers(comm, root)

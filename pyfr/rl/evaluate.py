@@ -18,7 +18,12 @@ from pyfr.rl.core import (
     _resolve_model_path,
     compare_configs,
 )
-from pyfr.rl.env import PyFREnvironment
+from pyfr.rl.env import (
+    CollectiveEnvController,
+    PyFREnvironment,
+    serve_collective_envs,
+    stop_collective_workers,
+)
 
 
 def _resolve_eval_algorithm(cli_algorithm: str | None,
@@ -91,59 +96,69 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         'local-rank' if collective_mode and backend_name in {'cuda', 'hip'} else 0
     )
 
-    env = PyFREnvironment(
-        mesh_file=mesh_file,
-        cfg_file=cfg_path,
-        backend_name=backend_name,
-        device_id=eval_device_id,
-        ic_dir=ic_dir,
-        print_diagnostic=is_root
-    )
-
-    env.set_evaluation_mode(True)
-
-    # Print hyperparameter summary (checkpoint preferred, else config).
-    hp = None
-    if metadata and isinstance(metadata.get('hyperparameters'), dict):
-        if is_root:
-            print('\nUsing hyperparameters from checkpoint')
-        hp = HyperParameters()
-        for key, value in metadata['hyperparameters'].items():
-            if hasattr(hp, key):
-                setattr(hp, key, value)
-    elif 'neuralnetwork-hyperparameters' in env.cfg.sections():
-        if is_root:
-            print('\nUsing hyperparameters from config file')
-        hp = HyperParameters.from_config(env.cfg, announce=is_root)
-
-    selected_algorithm = _resolve_eval_algorithm(algorithm, metadata, hp)
-    if hp is not None:
-        hp.algorithm = selected_algorithm
-
-    algo_spec = get_algorithm_spec(selected_algorithm)
-
-    if is_root:
-        print(f'Loading SB3 model ({algo_spec.display_name}): {model_path}')
-    model = load_algorithm_model(
-        selected_algorithm,
-        model_path,
-        env=None,
-        device='cpu'
-    )
-
-    if hp is not None:
-        hp._calculate_derived(env, num_envs=1, announce=is_root)
-        if is_root:
-            hp.print_summary(num_devices=comm.size if collective_mode else 1,
-                             num_envs=1)
-
-    recurrent = is_recurrent_algorithm(selected_algorithm)
-
-    all_episode_returns = []
-    first_ep_actions = None
-    first_ep_rewards = None
-
+    raw_env = None
+    env = None
+    workers_active = False
     try:
+        raw_env = PyFREnvironment(
+            mesh_file=mesh_file,
+            cfg_file=cfg_path,
+            backend_name=backend_name,
+            device_id=eval_device_id,
+            ic_dir=ic_dir,
+            print_diagnostic=is_root
+        )
+
+        raw_env.set_evaluation_mode(True)
+
+        if collective_mode and not is_root:
+            serve_collective_envs({'eval': raw_env})
+            return
+
+        workers_active = collective_mode and is_root
+        env = CollectiveEnvController('eval', raw_env) if collective_mode else raw_env
+
+        # Print hyperparameter summary (checkpoint preferred, else config).
+        hp = None
+        if metadata and isinstance(metadata.get('hyperparameters'), dict):
+            if is_root:
+                print('\nUsing hyperparameters from checkpoint')
+            hp = HyperParameters()
+            for key, value in metadata['hyperparameters'].items():
+                if hasattr(hp, key):
+                    setattr(hp, key, value)
+        elif 'neuralnetwork-hyperparameters' in raw_env.cfg.sections():
+            if is_root:
+                print('\nUsing hyperparameters from config file')
+            hp = HyperParameters.from_config(raw_env.cfg, announce=is_root)
+
+        selected_algorithm = _resolve_eval_algorithm(algorithm, metadata, hp)
+        if hp is not None:
+            hp.algorithm = selected_algorithm
+
+        algo_spec = get_algorithm_spec(selected_algorithm)
+
+        if is_root:
+            print(f'Loading SB3 model ({algo_spec.display_name}): {model_path}')
+        model = load_algorithm_model(
+            selected_algorithm,
+            model_path,
+            env=None,
+            device='cpu'
+        )
+
+        if hp is not None:
+            hp._calculate_derived(raw_env, num_envs=1, announce=is_root)
+            if is_root:
+                hp.print_summary(num_devices=comm.size if collective_mode else 1,
+                                 num_envs=1)
+
+        recurrent = is_recurrent_algorithm(selected_algorithm)
+
+        all_episode_returns = []
+        first_ep_actions = None
+        first_ep_rewards = None
+
         for ep in range(episodes):
             obs, _ = env.reset()
             done = False
@@ -220,7 +235,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
             if first_ep_actions.ndim == 1:
                 first_ep_actions = first_ep_actions.reshape(-1, 1)
 
-            time_array = np.arange(num_steps, dtype=np.float64) * env.action_interval
+            time_array = np.arange(num_steps, dtype=np.float64) * raw_env.action_interval
 
             print('\nFirst Episode Action History:')
             column_width = 16
@@ -266,5 +281,12 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         return float(returns.mean())
 
     finally:
-        env.set_evaluation_mode(False)
-        env.close()
+        if env is not None:
+            env.set_evaluation_mode(False)
+            env.close()
+        elif raw_env is not None:
+            raw_env.set_evaluation_mode(False)
+            raw_env.close()
+
+        if workers_active:
+            stop_collective_workers(comm, root)

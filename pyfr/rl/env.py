@@ -15,6 +15,13 @@ from pyfr.readers.native import NativeReader
 from pyfr.solvers import get_solver
 
 
+_CMD_RESET = 'reset'
+_CMD_STEP = 'step'
+_CMD_SET_MODE = 'set-mode'
+_CMD_CLOSE = 'close'
+_CMD_STOP = 'stop'
+
+
 class PyFREnvironment(gym.Env):
     """PyFR environment compatible with Gymnasium/SB3."""
 
@@ -315,6 +322,123 @@ class PyFREnvironment(gym.Env):
             self.mesh_reader.close()
         except Exception:
             pass
+
+
+class CollectiveEnvController(gym.Env):
+    """Root-rank controller for a collective PyFR environment."""
+
+    metadata = {}
+
+    def __init__(self, env_name: str, env: PyFREnvironment):
+        self.env_name = env_name
+        self.env = env
+        self.comm = env.comm
+        self.rank = env.rank
+        self.root = env.root
+
+        if self.rank != self.root:
+            raise RuntimeError(
+                'CollectiveEnvController can only be created on the root rank.'
+            )
+
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+        self.metadata = getattr(env, 'metadata', {})
+        self._closed = False
+
+    def _broadcast(self, payload):
+        self.comm.bcast(payload, root=self.root)
+
+    def reset(self, *, seed=None, options=None):
+        self._broadcast({
+            'cmd': _CMD_RESET,
+            'env': self.env_name,
+            'seed': seed,
+            'options': options,
+        })
+        return self.env.reset(seed=seed, options=options)
+
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float64)
+        self._broadcast({
+            'cmd': _CMD_STEP,
+            'env': self.env_name,
+            'action': action,
+        })
+        return self.env.step(action)
+
+    def set_evaluation_mode(self, is_evaluating: bool):
+        self._broadcast({
+            'cmd': _CMD_SET_MODE,
+            'env': self.env_name,
+            'is_evaluating': bool(is_evaluating),
+        })
+        self.env.set_evaluation_mode(is_evaluating)
+
+    def close(self):
+        if self._closed:
+            return
+
+        self._broadcast({
+            'cmd': _CMD_CLOSE,
+            'env': self.env_name,
+        })
+        self.env.close()
+        self._closed = True
+
+
+def stop_collective_workers(comm, root: int):
+    comm.bcast({'cmd': _CMD_STOP}, root=root)
+
+
+def serve_collective_envs(envs: dict[str, PyFREnvironment]):
+    if not envs:
+        return
+
+    sample_env = next(iter(envs.values()))
+    comm = sample_env.comm
+    root = sample_env.root
+    rank = sample_env.rank
+
+    if rank == root:
+        raise RuntimeError('serve_collective_envs must run on non-root ranks.')
+
+    active_envs = dict(envs)
+
+    try:
+        while True:
+            payload = comm.bcast(None, root=root)
+            cmd = payload.get('cmd')
+
+            if cmd == _CMD_STOP:
+                break
+
+            env_name = payload.get('env')
+            if env_name not in active_envs:
+                raise RuntimeError(f"Unknown collective environment '{env_name}'.")
+
+            env = active_envs[env_name]
+
+            if cmd == _CMD_RESET:
+                env.reset(
+                    seed=payload.get('seed'),
+                    options=payload.get('options')
+                )
+            elif cmd == _CMD_STEP:
+                env.step(payload['action'])
+            elif cmd == _CMD_SET_MODE:
+                env.set_evaluation_mode(payload['is_evaluating'])
+            elif cmd == _CMD_CLOSE:
+                env.close()
+                active_envs.pop(env_name, None)
+            else:
+                raise RuntimeError(f"Unknown collective command '{cmd}'.")
+    finally:
+        for env in active_envs.values():
+            try:
+                env.close()
+            except Exception:
+                pass
 
 
 class InitialConditionManager:
