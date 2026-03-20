@@ -7,6 +7,7 @@ from pyfr.plugins.fluidflux import FluidFluxPlugin
 from pyfr.plugins.fwh import FWHPlugin
 from pyfr.plugins.integrate import IntegratePlugin
 from pyfr.plugins.nancheck import NaNCheckPlugin
+from pyfr.plugins.obsmatch import ObsMatchPlugin
 from pyfr.plugins.pseudostats import PseudoStatsPlugin
 from pyfr.plugins.reinforcementlearning import ReinforcementLearningPlugin
 from pyfr.plugins.residual import ResidualPlugin
