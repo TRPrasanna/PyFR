@@ -163,6 +163,8 @@ class ObsMatchPlugin(PostactionMixin, BaseSolnPlugin):
 
         self.best_mismatch = np.inf
         self.best_time = np.nan
+        self.saved_best_mismatch = np.inf
+        self.saved_best_time = np.nan
         self.last_mismatch = np.nan
         self.last_time = np.nan
         self.nchecks = 0
@@ -212,6 +214,9 @@ class ObsMatchPlugin(PostactionMixin, BaseSolnPlugin):
                 self.last_time = float(state[3])
                 self.nchecks = int(round(state[4]))
                 self.match_found = bool(round(state[5]))
+            if len(state) >= 8:
+                self.saved_best_mismatch = float(state[6])
+                self.saved_best_time = float(state[7])
 
         serialiser.register(self.get_serialiser_prefix(), self._serialise_state)
 
@@ -227,6 +232,8 @@ class ObsMatchPlugin(PostactionMixin, BaseSolnPlugin):
             self.last_time,
             float(self.nchecks),
             float(self.match_found),
+            self.saved_best_mismatch,
+            self.saved_best_time,
         ])
 
     def _load_target(self, obs_vars):
@@ -375,10 +382,15 @@ class ObsMatchPlugin(PostactionMixin, BaseSolnPlugin):
                 save = True
                 reason = 'match'
             elif is_best and self.save_best and (
-                np.isinf(prev_best) or prev_best - metric > self.save_delta
+                np.isinf(self.saved_best_mismatch)
+                or self.saved_best_mismatch - metric > self.save_delta
             ):
                 save = True
                 reason = 'best'
+
+            if save and is_best:
+                self.saved_best_mismatch = metric
+                self.saved_best_time = intg.tcurr
 
             abort = bool(new_match and self.stop_on_match)
 
@@ -405,6 +417,8 @@ class ObsMatchPlugin(PostactionMixin, BaseSolnPlugin):
                 'last_time': self.last_time,
                 'nchecks': self.nchecks,
                 'match_found': self.match_found,
+                'saved_best_mismatch': self.saved_best_mismatch,
+                'saved_best_time': self.saved_best_time,
                 'save': save,
                 'save_reason': reason,
                 'abort': abort,
@@ -421,6 +435,8 @@ class ObsMatchPlugin(PostactionMixin, BaseSolnPlugin):
         self.last_time = payload['last_time']
         self.nchecks = payload['nchecks']
         self.match_found = payload['match_found']
+        self.saved_best_mismatch = payload['saved_best_mismatch']
+        self.saved_best_time = payload['saved_best_time']
 
         if payload['save']:
             self._save_state(intg, payload['metric'], payload['save_reason'])
