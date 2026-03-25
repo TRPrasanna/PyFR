@@ -56,7 +56,11 @@ def main():
         ap.print_help()
 
 def process_train(args):
-    print(f"Starting training with checkpoint dir: {args.checkpoint_dir}")
+    from pyfr.mpiutil import get_comm_rank_root, init_mpi
+    init_mpi()
+    _, rank, root = get_comm_rank_root()
+    if rank == root:
+        print(f"Starting training with checkpoint dir: {args.checkpoint_dir}")
     from .train import train_agent
 
     train_agent(

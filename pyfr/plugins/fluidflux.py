@@ -80,7 +80,8 @@ class FluidFluxPlugin(BaseSolnPlugin):
 
     def _init_hdf5(self):
         outf = open_hdf5_a(self.cfg.get(self.cfgsect, 'file'))
-        nvars = 1 + self.ndims + self._mcomp
+        # HDF5 rows store time plus the full flux vector.
+        nvars = 2 + self.ndims + self._mcomp
 
         dset = self.cfg.get(self.cfgsect, 'file-dataset')
         if dset in outf:
