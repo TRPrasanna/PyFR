@@ -1,3 +1,5 @@
+import numpy as np
+
 from pyfr.inifile import Inifile
 from pyfr.mpiutil import get_comm_rank_root
 from pyfr.plugins.base import BaseSolnPlugin, PostactionMixin, RegionMixin
@@ -43,17 +45,23 @@ class WriterPlugin(PostactionMixin, RegionMixin, BaseSolnPlugin):
         # Figure out the shape of each element type in our region
         ershapes = {etype: (self.nvars, emap[etype].nupts) for etype in erdata}
 
+        # Output data type.  When the integrator is running mixed-precision,
+        # the authoritative state is fp64 and we must persist it at that
+        # precision so a restart can rehydrate the fp64 mirror faithfully.
+        if getattr(intg.backend, 'mixed_precision', False):
+            self.fpdtype = np.float64
+        else:
+            self.fpdtype = intg.backend.fpdtype
+
         # Construct the solution writer
         self._writer = NativeWriter.from_integrator(intg, basedir, basename,
-                                                    'soln')
+                                                    'soln',
+                                                    fpdtype=self.fpdtype)
         self._writer.set_shapes_eidxs(ershapes, erdata, field_groups,
                                       self._aux_fields, ndims=self.ndims)
 
         # Asynchronous output options
         self._async_timeout = self.cfg.getfloat(cfgsect, 'async-timeout', 60)
-
-        # Output data type
-        self.fpdtype = intg.backend.fpdtype
 
         # Trigger-only mode: no dt-out when gated by a trigger
         self._trigger_only = (self.trigger is not None and

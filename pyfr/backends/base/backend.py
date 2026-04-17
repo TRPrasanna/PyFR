@@ -46,6 +46,13 @@ class BaseBackend:
         self.fpdtype_eps = float(np.finfo(self.fpdtype).eps)
         self.fpdtype_max = float(np.finfo(self.fpdtype).max)
 
+        # Optional mixed precision mode: keeps the explicit time-integrator
+        # state in fp64 while operators remain at the backend precision
+        self.mixed_precision = cfg.getbool('backend', 'mixed-precision', False)
+        if self.mixed_precision and prec != 'single':
+            raise ValueError("'mixed-precision = true' requires "
+                             "'precision = single'")
+
         # Memory model
         match cfg.get('backend', 'memory-model', 'normal'):
             case 'normal':

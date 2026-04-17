@@ -2,6 +2,7 @@ import re
 
 from pyfr.integrators.explicit import (BaseExplicitController,
                                        BaseExplicitStepper)
+from pyfr.integrators.explicit.mixedprec import MixedPrecisionExplicitMixin
 from pyfr.integrators.implicit import (BaseImplicitController,
                                        BaseImplicitStepper)
 from pyfr.integrators.implicit.krylov import BaseKrylovSolver
@@ -16,8 +17,17 @@ def get_integrator(backend, systemcls, mesh, initsoln, cfg):
     if form == 'explicit':
         cc = subclass_where(BaseExplicitController, controller_name=cn)
         sc = subclass_where(BaseExplicitStepper, stepper_name=sn)
-        bases = (cc, sc)
+        if getattr(backend, 'mixed_precision', False):
+            bases = (MixedPrecisionExplicitMixin, cc, sc)
+        else:
+            bases = (cc, sc)
     elif form == 'implicit':
+        if getattr(backend, 'mixed_precision', False):
+            raise NotImplementedError(
+                "'mixed-precision = true' is only supported for the explicit "
+                "formulation"
+            )
+
         cc = subclass_where(BaseImplicitController, controller_name=cn)
         sc = subclass_where(BaseImplicitStepper, stepper_name=sn)
 
