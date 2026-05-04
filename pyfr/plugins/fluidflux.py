@@ -1,16 +1,16 @@
 import numpy as np
 
 from pyfr.mpiutil import get_comm_rank_root, mpi
-from pyfr.plugins.base import (BaseSolnPlugin, DatasetAppender,
-                               init_csv, open_hdf5_a)
-from pyfr.plugins.fluidforce import FluidForceIntegrator
+from pyfr.plugins.common import DatasetAppender, init_csv, open_hdf5_a
+from pyfr.plugins.soln.base import BaseSolnPlugin
+from pyfr.plugins.soln.fluidforce import FluidForceIntegrator
 
 
 class FluidFluxPlugin(BaseSolnPlugin):
     name = 'fluidflux'
-    systems = ['ac-euler', 'ac-navier-stokes', 'euler', 'navier-stokes']
+    systems = 'euler|navier-stokes'
     formulations = ['dual', 'std']
-    dimensions = [2, 3]
+    dimensions = '2|3'
 
     def __init__(self, intg, cfgsect, suffix):
         super().__init__(intg, cfgsect, suffix)

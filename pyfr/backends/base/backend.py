@@ -1,14 +1,19 @@
-from collections import defaultdict
+from collections import namedtuple
+from contextlib import contextmanager
 from functools import cached_property, wraps
 from itertools import count
 import math
-from weakref import WeakKeyDictionary, WeakValueDictionary
+from weakref import WeakSet, WeakValueDictionary
 
 import numpy as np
 
-from pyfr.backends.base.kernels import NotSuitableError
+from pyfr.backends.base.provider import NotSuitableError
 from pyfr.backends.base.makoutil import mfilttag
+from pyfr.backends.base.types import Extent, StorageRegion
 from pyfr.template import DottedTemplateLookup
+
+
+MemoryInfo = namedtuple('MemoryInfo', ['current', 'peak', 'free', 'total'])
 
 
 def recordmat(fn):
@@ -26,6 +31,8 @@ def recordmat(fn):
 
 class BaseBackend:
     name = None
+    has_double = True
+    _annotator = None
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -38,8 +45,8 @@ class BaseBackend:
 
         # Convert to a NumPy data type
         self.fpdtype = np.dtype(prec).type
-        self.fpdtype_eps = np.finfo(self.fpdtype).eps
-        self.fpdtype_max = np.finfo(self.fpdtype).max
+        self.fpdtype_eps = float(np.finfo(self.fpdtype).eps)
+        self.fpdtype_max = float(np.finfo(self.fpdtype).max)
 
         # Memory model
         match cfg.get('backend', 'memory-model', 'normal'):
@@ -58,13 +65,15 @@ class BaseBackend:
         self.mats = WeakValueDictionary()
         self._mat_counter = count()
 
-        # Aliases and extents
-        self._pend_aliases = {}
-        self._pend_extents = defaultdict(list)
-        self._comm_extents = set()
+        # Extents
+        self._extents = {}
+        self._all_extents = WeakSet()
 
-        # Mapping from backend objects to memory extents
-        self._obj_extents = WeakKeyDictionary()
+        # Peak memory tracking
+        self._mem_peak = 0
+
+    def _extent_alloc_bytes(self, nbytes):
+        return nbytes - (nbytes % -self.alignb)
 
     @cached_property
     def lookup(self):
@@ -83,62 +92,24 @@ class BaseBackend:
         return lookup
 
     def malloc(self, obj, extent):
-        # If no extent has been specified then autocommit
-        if extent is None:
-            # Perform the allocation
-            data = self._malloc_checked(obj.nbytes)
-
-            # Fire the callback
-            obj.onalloc(data, 0)
-
-            # Retain a (weak) reference to the allocated extent
-            self._obj_extents[obj] = data
-        # Otherwise defer the allocation
-        else:
-            # Check that the extent has not already been committed
-            if extent in self._comm_extents:
-                raise ValueError(f'Extent "{extent}" has already been '
-                                 'allocated')
-
-            # Append
-            self._pend_extents[extent].append(obj)
-
-            # Permit obj to be aliased
-            self._pend_aliases[obj] = []
-
-    def alias(self, obj, aobj):
-        if obj.nbytes > aobj.nbytes:
-            raise ValueError('Object too large to alias')
-
-        try:
-            obj.onalloc(self._obj_extents[aobj], aobj.offset)
-        except KeyError:
-            self._pend_aliases[aobj].append(obj)
+        match extent:
+            case None:
+                ext = Extent()
+                ext.reserve(obj, self._extent_alloc_bytes(obj.nbytes))
+                ext.commit(self._malloc_checked)
+                self._track_extent(ext)
+            case str() as name:
+                ext = self._extents.setdefault(name, Extent(name))
+                ext.reserve(obj, self._extent_alloc_bytes(obj.nbytes))
+            case storage:
+                obj.onalloc(storage.basedata, storage.offset)
+                obj._storage_root = storage.storage_root
 
     def commit(self):
-        for reqs in self._pend_extents.values():
-            # Determine the required allocation size
-            sz = sum(obj.nbytes - (obj.nbytes % -self.alignb) for obj in reqs)
-
-            # Perform the allocation
-            data = self._malloc_checked(sz)
-
-            offset = 0
-            for obj in reqs:
-                for aobj in [obj] + self._pend_aliases[obj]:
-                    # Fire the objects allocation callback
-                    aobj.onalloc(data, offset)
-
-                    # Retain a (weak) reference to the allocated extent
-                    self._obj_extents[aobj] = data
-
-                # Increment the offset
-                offset += obj.nbytes - (obj.nbytes % -self.alignb)
-
-        # Mark the extents as committed and clear
-        self._comm_extents.update(self._pend_extents)
-        self._pend_aliases.clear()
-        self._pend_extents.clear()
+        for ext in self._extents.values():
+            ext.commit(self._malloc_checked)
+            self._track_extent(ext)
+        self._extents.clear()
 
     def _malloc_checked(self, nbytes):
         if self.ixdtype == np.int32 and nbytes > 4*2**31 - 1:
@@ -149,6 +120,15 @@ class BaseBackend:
 
     def _malloc_impl(self, nbytes):
         pass
+
+    def _track_extent(self, ext):
+        self._all_extents.add(ext)
+        mem = sum(e.nbytes for e in self._all_extents)
+        self._mem_peak = max(self._mem_peak, mem)
+
+    def memory_info(self):
+        mem = sum(e.nbytes for e in self._all_extents)
+        return MemoryInfo(mem, self._mem_peak, None, None)
 
     @recordmat
     def const_matrix(self, initval, dtype=None, tags=set()):
@@ -164,60 +144,74 @@ class BaseBackend:
         return self.const_matrix_cls(self, dtype, initval, tags)
 
     @recordmat
-    def matrix(self, ioshape, initval=None, extent=None, aliases=None,
-               tags=set(), dtype=None):
+    def matrix(self, ioshape, initval=None, extent=None, tags=set(),
+               dtype=None):
         dtype = dtype or self.fpdtype
-        return self.matrix_cls(self, dtype, ioshape, initval, extent, aliases,
-                               tags)
+        return self.matrix_cls(self, dtype, ioshape, initval, extent, tags)
+
+    def storage_view(self, parent, offset, nbytes):
+        return StorageRegion(parent, offset, nbytes)
 
     @recordmat
     def matrix_slice(self, mat, ra, rb, ca, cb):
         return self.matrix_slice_cls(self, mat, ra, rb, ca, cb)
 
     @recordmat
-    def xchg_matrix(self, ioshape, initval=None, extent=None, aliases=None,
-                    tags=set()):
+    def xchg_matrix(self, ioshape, initval=None, extent=None, tags=set()):
         return self.xchg_matrix_cls(self, self.fpdtype, ioshape, initval,
-                                    extent, aliases, tags)
+                                    extent, tags)
 
     def xchg_matrix_for_view(self, view, tags=set()):
         return self.xchg_matrix((view.nvrow, view.nvcol*view.n), tags=tags)
 
-    def view(self, matmap, rmap, cmap, rstridemap=None, vshape=(), tags=set()):
+    def view(self, matmap, rmap, cmap, rstridemap=1, vshape=(), tags=set()):
         return self.view_cls(self, matmap, rmap, cmap, rstridemap, vshape,
                              tags)
 
-    def xchg_view(self, matmap, rmap, cmap, rstridemap=None, vshape=(),
+    def xchg_view(self, matmap, rmap, cmap, rstridemap=1, vshape=(),
                   tags=set()):
         return self.xchg_view_cls(self, matmap, rmap, cmap, rstridemap,
                                   vshape, tags)
 
+    @contextmanager
+    def region(self, name):
+        if self._annotator:
+            self._annotator.push(name)
+
+        try:
+            yield
+        finally:
+            if self._annotator:
+                self.wait()
+                self._annotator.pop(name)
+
     def kernel(self, name, *args, **kwargs):
-        best_kern = None
+        with self.region('kernel-setup'):
+            best_kern = None
 
-        # Loop through each kernel provider instance
-        for prov in self._providers:
-            # See if it can potentially provide the requested kernel
-            kern_meth = getattr(prov, name, None)
-            if kern_meth:
-                ifac = self.autotune_ifac
+            # Loop through each kernel provider instance
+            for prov in self._providers:
+                # See if it can potentially provide the requested kernel
+                kern_meth = getattr(prov, name, None)
+                if kern_meth:
+                    ifac = self.autotune_ifac
 
-                try:
-                    # Ask the provider for the kernel
-                    kern = kern_meth(*args, **kwargs)
-                except NotSuitableError:
-                    continue
+                    try:
+                        # Ask the provider for the kernel
+                        kern = kern_meth(*args, **kwargs)
+                    except NotSuitableError:
+                        continue
 
-                # Evaluate this kernel compared to the best seen so far
-                if best_kern is None or kern.dt < ifac*best_kern.dt:
-                    best_kern = kern
+                    # Evaluate this kernel compared to the best seen so far
+                    if best_kern is None or kern.dt < ifac*best_kern.dt:
+                        best_kern = kern
 
-                    # If there is no benchmark data then short circut
-                    if np.isnan(best_kern.dt):
-                        return best_kern
+                        # If there is no benchmark data then short circut
+                        if np.isnan(best_kern.dt):
+                            return best_kern
 
         if best_kern is None:
-            raise KeyError(f'Kernel "{name}" has no providers')
+            raise KeyError(f'Kernel {name!r} has no providers')
 
         return best_kern
 

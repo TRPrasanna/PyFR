@@ -3,9 +3,7 @@ import numpy as np
 from pyfr.solvers.baseadvecdiff import (BaseAdvectionDiffusionBCInters,
                                         BaseAdvectionDiffusionIntInters,
                                         BaseAdvectionDiffusionMPIInters)
-from pyfr.solvers.euler.inters import (FluidIntIntersMixin,
-                                       FluidMPIIntersMixin,
-                                       MassFlowBCMixin)
+from pyfr.solvers.euler.inters import MassFlowBCMixin, PressureBCMixin
 
 
 class TplargsMixin:
@@ -14,7 +12,7 @@ class TplargsMixin:
 
         rsolver = self.cfg.get('solver-interfaces', 'riemann-solver')
         visc_corr = self.cfg.get('solver', 'viscosity-correction', 'none')
-        shock_capturing = self.cfg.get('solver', 'shock-capturing')
+        shock_capturing = self.cfg.get('solver', 'shock-capturing', 'none')
         if shock_capturing == 'entropy-filter':
             self.p_min = self.cfg.getfloat('solver-entropy-filter', 'p-min',
                                            1e-6)
@@ -29,7 +27,6 @@ class TplargsMixin:
 
 
 class NavierStokesIntInters(TplargsMixin,
-                            FluidIntIntersMixin,
                             BaseAdvectionDiffusionIntInters):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -39,20 +36,18 @@ class NavierStokesIntInters(TplargsMixin,
 
         self.kernels['con_u'] = lambda: self._be.kernel(
             'intconu', tplargs=self._tplargs, dims=[self.ninterfpts],
-            ulin=self._scal_lhs, urin=self._scal_rhs,
+            ulin=self.scal_lhs, urin=self.scal_rhs,
             ulout=self._comm_lhs, urout=self._comm_rhs
         )
         self.kernels['comm_flux'] = lambda: self._be.kernel(
             'intcflux', tplargs=self._tplargs, dims=[self.ninterfpts],
-            ul=self._scal_lhs, ur=self._scal_rhs,
+            ul=self.scal_lhs, ur=self.scal_rhs,
             gradul=self._vect_lhs, gradur=self._vect_rhs,
-            artviscl=self._artvisc_lhs, artviscr=self._artvisc_rhs,
-            nl=self._pnorm_lhs
+            artvisc=self.artvisc, nl=self._pnorm_lhs
         )
 
 
 class NavierStokesMPIInters(TplargsMixin,
-                            FluidMPIIntersMixin,
                             BaseAdvectionDiffusionMPIInters):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -62,14 +57,13 @@ class NavierStokesMPIInters(TplargsMixin,
 
         self.kernels['con_u'] = lambda: self._be.kernel(
             'mpiconu', tplargs=self._tplargs, dims=[self.ninterfpts],
-            ulin=self._scal_lhs, urin=self._scal_rhs, ulout=self._comm_lhs
+            ulin=self.scal_lhs, urin=self.scal_rhs, ulout=self._comm_lhs
         )
         self.kernels['comm_flux'] = lambda: self._be.kernel(
             'mpicflux', tplargs=self._tplargs, dims=[self.ninterfpts],
-            ul=self._scal_lhs, ur=self._scal_rhs,
+            ul=self.scal_lhs, ur=self.scal_rhs,
             gradul=self._vect_lhs, gradur=self._vect_rhs,
-            artviscl=self._artvisc_lhs, artviscr=self._artvisc_rhs,
-            nl=self._pnorm_lhs
+            artvisc=self.artvisc, nl=self._pnorm_lhs
         )
 
 
@@ -88,27 +82,28 @@ class NavierStokesBaseBCInters(TplargsMixin, BaseAdvectionDiffusionBCInters):
 
         self.kernels['con_u'] = lambda: self._be.kernel(
             'bcconu', tplargs=self._tplargs, dims=[self.ninterfpts],
-            extrns=self._external_args, ulin=self._scal_lhs,
+            extrns=self._external_args, ulin=self.scal_lhs,
             ulout=self._comm_lhs, nlin=self._pnorm_lhs,
             **self._external_vals
         )
         self.kernels['comm_flux'] = lambda: self._be.kernel(
             'bccflux', tplargs=self._tplargs, dims=[self.ninterfpts],
-            extrns=self._external_args, ul=self._scal_lhs,
+            extrns=self._external_args, ul=self.scal_lhs,
             gradul=self._vect_lhs, nl=self._pnorm_lhs,
-            artviscl=self._artvisc_lhs, **self._external_vals
+            artvisc=self.artvisc, **self._external_vals
         )
 
-        if self._ef_enabled:
-            self._be.pointwise.register(
-                'pyfr.solvers.navstokes.kernels.bccent'
-            )
+    def comm_entropy_kernel(self, entmin_lhs):
+        # Physics-specific callback for entropy filtering
+        self._be.pointwise.register(
+            'pyfr.solvers.navstokes.kernels.bccent'
+        )
 
-            self.kernels['comm_entropy'] = lambda: self._be.kernel(
-                'bccent', tplargs=self._tplargs, dims=[self.ninterfpts],
-                extrns=self._external_args, entmin_lhs=self._entmin_lhs,
-                nl=self._pnorm_lhs, ul=self._scal_lhs, **self._external_vals
-            )
+        return lambda: self._be.kernel(
+            'bccent', tplargs=self._tplargs, dims=[self.ninterfpts],
+            extrns=self._external_args, entmin_lhs=entmin_lhs,
+            nl=self._pnorm_lhs, ul=self.scal_lhs, **self._external_vals
+        )
 
 
 class NavierStokesNoSlpIsotWallBCInters(NavierStokesBaseBCInters):
@@ -218,9 +213,15 @@ class NavierStokesCharRiemInvMassFlowBCInters(MassFlowBCMixin,
     cflux_state = 'ghost'
 
 
+class NavierStokesCharRiemInvPressureBCInters(PressureBCMixin,
+                                              NavierStokesBaseBCInters):
+    type = 'char-riem-inv-pressure'
+    cflux_state = 'ghost'
+
+
 class NavierStokesAdiaJetBCInters(NavierStokesBaseBCInters):
     type = 'adia-jet'
-    cflux_state = 'ghost'
+    cflux_state = 'ghost-imperm'
 
     def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
         super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
@@ -237,16 +238,16 @@ class _AdiaJetRLControlMixin:
 
         # Action interval used for linear interpolation in the kernel.
         self.t_act_interval = be.matrix((1, 1))
-        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]',
-                           value=self.t_act_interval)
+        self.set_external('t_act_interval', 'broadcast fpdtype_t[1][1]',
+                          value=self.t_act_interval)
         self.t_act_interval.set(np.array(
             [[cfg.getfloat('solver-plugin-reinforcementlearning',
                            'action-interval')]]
         ))
 
         self.control_params = be.matrix((1, 3))
-        self._set_external('control_params', 'broadcast fpdtype_t[1][3]',
-                           value=self.control_params)
+        self.set_external('control_params', 'broadcast fpdtype_t[1][3]',
+                          value=self.control_params)
         self.control_params.set(np.array([[0.0, 0.0, 0.0]]))
 
         self._current_target = 0.0
@@ -280,7 +281,7 @@ class _AdiaJetRLControlMixin:
 class NavierStokesAdiaJetNeuralType5BCInters(_AdiaJetRLControlMixin,
                                              NavierStokesBaseBCInters):
     type = 'adia-jet-neural-type5'
-    cflux_state = 'ghost'
+    cflux_state = 'ghost-imperm'
 
     def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
         super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
@@ -300,7 +301,7 @@ class NavierStokesAdiaJetNeuralType5BCInters(_AdiaJetRLControlMixin,
 class NavierStokesAdiaJetNeuralType5ResidualBCInters(_AdiaJetRLControlMixin,
                                                      NavierStokesBaseBCInters):
     type = 'adia-jet-neural-type5-residual'
-    cflux_state = 'ghost'
+    cflux_state = 'ghost-imperm'
 
     def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
         super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
@@ -334,15 +335,15 @@ class _AdiaJetRLMultiControlMixin:
 
         # Action interval used for linear interpolation in the kernel.
         self.t_act_interval = be.matrix((1, 1))
-        self._set_external('t_act_interval', 'broadcast fpdtype_t[1][1]',
-                           value=self.t_act_interval)
+        self.set_external('t_act_interval', 'broadcast fpdtype_t[1][1]',
+                          value=self.t_act_interval)
         self.t_act_interval.set(np.array(
             [[cfg.getfloat('solver-plugin-reinforcementlearning',
                            'action-interval')]]
         ))
 
         self.control_params = be.matrix((self.num_actuators, 3))
-        self._set_external(
+        self.set_external(
             'control_params',
             f'broadcast fpdtype_t[{self.num_actuators}][3]',
             value=self.control_params
@@ -355,7 +356,7 @@ class _AdiaJetRLMultiControlMixin:
         #   <axis><i>-min, <axis><i>-max
         # where axis in {x, y, z} for the active dimensions.
         self.actuator_bounds = be.matrix((self.num_actuators, 2*self.ndims))
-        self._set_external(
+        self.set_external(
             'actuator_bounds',
             f'broadcast fpdtype_t[{self.num_actuators}][{2*self.ndims}]',
             value=self.actuator_bounds
@@ -366,7 +367,7 @@ class _AdiaJetRLMultiControlMixin:
         if 'ploc' not in self._external_args:
             spec = f'in fpdtype_t[{self.ndims}]'
             value = self._const_mat(lhs, 'get_ploc_for_inter')
-            self._set_external('ploc', spec, value=value)
+            self.set_external('ploc', spec, value=value)
 
         self._current_targets = np.zeros(self.num_actuators)
         self._last_env_step = None
@@ -447,7 +448,7 @@ class _AdiaJetRLMultiControlMixin:
 class NavierStokesAdiaJetNeuralType6BCInters(_AdiaJetRLMultiControlMixin,
                                              NavierStokesBaseBCInters):
     type = 'adia-jet-neural-type6'
-    cflux_state = 'ghost'
+    cflux_state = 'ghost-imperm'
 
     def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
         super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)

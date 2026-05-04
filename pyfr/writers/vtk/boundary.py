@@ -1,11 +1,16 @@
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 
 import numpy as np
 
 from pyfr.cache import memoize
+from pyfr.plugins.postproc.adapters import BoundaryPostProcData
+from pyfr.polys import get_polybasis
 from pyfr.shapes import BaseShape
-from pyfr.util import subclass_where
+from pyfr.util import first, subclass_where
 from pyfr.writers.vtk.base import BaseVTKWriter, interpolate_pts
+
+
+FaceInfo = namedtuple('FaceInfo', 'etype fidx svpts norm')
 
 
 def _search(a, v):
@@ -16,12 +21,12 @@ def _search(a, v):
 class VTKBoundaryWriter(BaseVTKWriter):
     type = 'boundary'
     output_curved = True
-    output_partition = True
 
     def __init__(self, meshf, boundaries, **kwargs):
         super().__init__(meshf, **kwargs)
 
         self.boundaries = boundaries
+        self._surface_info = defaultdict(list)
 
         if self.ndims != 3:
             raise RuntimeError('Boundary export only supported for 3D grids')
@@ -30,7 +35,6 @@ class VTKBoundaryWriter(BaseVTKWriter):
         super()._load_soln(*args, **kwargs)
 
         ecount = defaultdict(int)
-        self._surface_info = defaultdict(list)
 
         rmesh, smesh = self.reader.mesh, self.mesh
         cidxs = [smesh.codec.index(f'bc/{b}') for b in self.boundaries]
@@ -59,13 +63,13 @@ class VTKBoundaryWriter(BaseVTKWriter):
             # Obtain the associated surface info
             for stype, *info in self._get_surface_info(etype, eoff, fidx):
                 ecount[stype] += len(info[-1])
-                self._surface_info[stype].append((etype, *info))
+                self._surface_info[stype].append(info)
 
         self.einfo = list(ecount.items())
 
     @memoize
     def _get_shape(self, etype, cfg):
-        nspts = len(self.mesh.spts[etype])
+        nspts = self.reader.f[f'eles/{etype}'].dtype['nodes'].shape[0]
         return subclass_where(BaseShape, name=etype)(nspts, cfg)
 
     @memoize
@@ -77,7 +81,7 @@ class VTKBoundaryWriter(BaseVTKWriter):
         ishapecls = subclass_where(BaseShape, name=itype)
 
         # Obtain the visualisation points on this face
-        svpts = np.array(ishapecls.std_ele(self.etypes_div[itype]))
+        svpts = ishapecls.std_ele(self.etypes_div[itype])
         svpts = np.vstack(np.broadcast_arrays(*proj(*svpts.T))).T
 
         if self.ho_output:
@@ -86,7 +90,14 @@ class VTKBoundaryWriter(BaseVTKWriter):
         mesh_op = shape.sbasis.nodal_basis_at(svpts)
         soln_op = shape.ubasis.nodal_basis_at(svpts)
 
-        return itype, mesh_op, soln_op
+        # Linear basis for P1 vertex data
+        linspts = subclass_where(BaseShape, name=etype).std_ele(1)
+        lbasis = get_polybasis(etype, 1, linspts)
+        lin_op = lbasis.nodal_basis_at(svpts)
+
+        finfo = FaceInfo(etype, fidx, svpts, norm)
+
+        return itype, mesh_op, soln_op, lin_op, finfo
 
     def _get_surface_info(self, etype, eoffs, fidxs):
         info, idxs = {}, defaultdict(list)
@@ -99,21 +110,83 @@ class VTKBoundaryWriter(BaseVTKWriter):
 
         return [(*info[f], idxs[f]) for f in info]
 
-    def _prepare_pts(self, itype):
-        vspts, vsoln, curved, part = [], [], [], []
+    def _extra_point_shapes(self, key):
+        if key in self._surface_info:
+            etypes = [info[-2].etype for info in self._surface_info[key]]
+        else:
+            etypes = [key]
 
-        for etype, mesh_op, soln_op, idxs in self._surface_info[itype]:
+        shapes = set()
+        for etype in etypes:
+            shapes.update(super()._extra_point_shapes(etype))
+            shape = self._get_shape(etype, self.cfg)
+            shapes.add((len(shape.linspts),))
+
+        return shapes
+
+    def _resolve_etype(self, key):
+        if key is None:
+            key = first(self._surface_info)
+
+        if key in self._surface_info:
+            key = first(self._surface_info[key])[-2].etype
+
+        return key
+
+    def _prepare_pts(self, itype):
+        vspts, vsoln, curved = [], [], []
+        cellf, pointf = defaultdict(list), defaultdict(list)
+
+        pshapes = self._extra_point_shapes(itype)
+        for mesh_op, soln_op, lin_op, finfo, idxs in self._surface_info[itype]:
+            etype = finfo.etype
             spts = self.mesh.spts[etype][:, idxs]
-            soln = self.soln[etype][..., idxs]
+            soln = self.soln.data[etype][..., idxs]
             soln = soln.swapaxes(0, 1).astype(self.dtype)
 
             # Pre-process the solution
             soln = self._pre_proc_fields(soln).swapaxes(0, 1)
 
-            vspts.append(interpolate_pts(mesh_op, spts))
-            vsoln.append(interpolate_pts(soln_op, soln))
-            curved.append(self.mesh.spts_curved[etype][idxs])
-            part.append(self.soln[f'{etype}-parts'][idxs])
+            face_vpts = interpolate_pts(mesh_op, spts)
+            face_vsoln = interpolate_pts(soln_op, soln)
 
-        return (np.hstack(vspts), np.dstack(vsoln),
-                np.hstack(curved), np.hstack(part))
+            vspts.append(face_vpts)
+            vsoln.append(face_vsoln)
+            curved.append(self.mesh.spts_curved[etype][idxs])
+
+            # Extract aux fields
+            nupts = soln.shape[0]
+            for fname, arr in self.soln.aux.get(etype, {}).items():
+                data = arr[idxs]
+                shape = data.shape[1:]
+
+                if shape in pshapes:
+                    pshape = shape
+                elif shape[:-1] in pshapes:
+                    pshape = shape[:-1]
+                else:
+                    cellf[fname].append(data)
+                    continue
+
+                op = soln_op if pshape == (nupts,) else lin_op
+                pointf[fname].append(
+                    interpolate_pts(op, np.moveaxis(data, 0, 1))
+                )
+
+            soln_t = face_vsoln.transpose(1, 0, 2)
+            ploc = face_vpts.transpose(2, 0, 1)
+
+            adapter = BoundaryPostProcData(self.soln, soln_t, ploc,
+                                           self.elementscls, spts, finfo)
+            for pp in self.pp_plugins:
+                pp.run(adapter)
+
+            for fname, arr in adapter.fields.items():
+                pointf[fname].append(arr)
+
+        # Concatenate extra fields
+        cellf = {k: np.hstack(v) for k, v in cellf.items()}
+        pointf = {k: np.hstack(v) for k, v in pointf.items()}
+
+        return (np.hstack(vspts), np.dstack(vsoln), np.hstack(curved), cellf,
+                pointf)

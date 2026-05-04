@@ -4,18 +4,13 @@ import numpy as np
 from rtree.index import Index, Property
 
 from pyfr.cache import memoize
-from pyfr.mpiutil import get_comm_rank_root, get_start_end_csize, mpi
+from pyfr.mpiutil import autofree, get_comm_rank_root, get_start_end_csize, mpi
 from pyfr.polys import get_polybasis
 from pyfr.shapes import BaseShape
 from pyfr.util import subclass_where
 
 
 class PointLocator:
-    # Cache MPI reduction operations keyed by (dtype descriptor, ndim).
-    # Creating an MPI user-op for every point-location call can exhaust
-    # the MPI implementation limit in long RL runs with frequent resets.
-    _minloc_ops = {}
-
     def __init__(self, mesh, fine_order=6):
         self.mesh = mesh
         self.fine_order = fine_order
@@ -25,9 +20,10 @@ class PointLocator:
 
         # Allocate the location buffer
         dtype = [('dist', float), ('cidx', np.int16), ('eidx', np.int64),
-                 ('tloc', float, self.mesh.ndims)]
+                 ('rank', np.int32), ('tloc', float, self.mesh.ndims)]
         locs = np.zeros(npts, dtype=dtype)
         locs['dist'] = np.inf
+        locs['rank'] = rank
 
         # Reduce over each of our element types
         for etype, eidxs in self.mesh.eidxs.items():
@@ -41,7 +37,7 @@ class PointLocator:
                     l['cidx'], l['eidx'] = cidx, eidxs[eidx]
 
         # Reduce over all ranks
-        self._minloc(comm.Allreduce, mpi.IN_PLACE, locs, ndim=3)
+        self._minloc(comm.Allreduce, mpi.IN_PLACE, locs, ndim=4)
 
         return locs
 
@@ -78,44 +74,64 @@ class PointLocator:
 
         return locs
 
+    def locate_disjoint(self, pts):
+        comm, rank, root = get_comm_rank_root()
+
+        # Determine how many points each rank has to locate
+        npts = np.empty(comm.size, dtype=int)
+        npts[rank] = len(pts)
+        comm.Allgather(mpi.IN_PLACE, npts)
+
+        # Iterate through each rank with points
+        result = None
+        for r in np.flatnonzero(npts):
+            # Broadcast the points from rank r
+            if rank == r:
+                buf = np.ascontiguousarray(pts, dtype=float)
+            else:
+                buf = np.empty((npts[r], self.mesh.ndims), dtype=float)
+            comm.Bcast(buf, root=r)
+
+            # Perform the location
+            locs = self.locate(buf)
+
+            if rank == r:
+                result = locs
+
+        return result
+
     @memoize
     def _get_shape_basis(self, etype, nspts):
         shape = subclass_where(BaseShape, name=etype)
         order = shape.order_from_npts(nspts)
-        basis = get_polybasis(etype, order + 1, shape.std_ele(order))
+        basis = get_polybasis(etype, order, shape.std_ele(order))
 
         return shape, basis
 
+    @memoize
+    def _get_minloc_op(self, dtype, ndim):
+        fields = list(dtype.fields)[:ndim]
+
+        def op(pmem, qmem, dt):
+            p = np.frombuffer(pmem, dtype=dtype)
+            q = np.frombuffer(qmem, dtype=dtype)
+
+            lmask = p[fields[0]] < q[fields[0]]
+            emask = p[fields[0]] == q[fields[0]]
+
+            for f in fields[1:]:
+                lmask |= emask & (p[f] < q[f])
+                emask &= p[f] == q[f]
+
+            q[lmask] = p[lmask]
+
+        return autofree(mpi.Op.Create(op, commute=False))
+
     def _minloc(self, coll, x, y, ndim=None):
-        dtype = y.dtype
-        key = (repr(dtype.descr), ndim)
-
-        if key in self._minloc_ops:
-            op = self._minloc_ops[key]
-        else:
-            fields = tuple(list(dtype.fields)[:ndim])
-
-            def opfn(pmem, qmem, dt):
-                p = np.frombuffer(pmem, dtype=dtype)
-                q = np.frombuffer(qmem, dtype=dtype)
-
-                lmask = p[fields[0]] < q[fields[0]]
-                emask = p[fields[0]] == q[fields[0]]
-
-                for f in fields[1:]:
-                    lmask |= emask & (p[f] < q[f])
-                    emask &= p[f] == q[f]
-
-                q[lmask] = p[lmask]
-
-            # Keep a process-local cache of ops and reuse them.
-            op = mpi.Op.Create(opfn, commute=False)
-            self._minloc_ops[key] = op
-
         sbuf = (x, mpi.BYTE) if x is not mpi.IN_PLACE else x
         rbuf = (y, mpi.BYTE)
 
-        coll(sbuf, rbuf, op=op)
+        coll(sbuf, rbuf, op=self._get_minloc_op(y.dtype, ndim))
 
     @memoize
     def _get_nodes_off_tree(self):
@@ -211,7 +227,7 @@ class PointLocator:
 
     def _initial_tlocs(self, etype, spts, plocs):
         shape, basis = self._get_shape_basis(etype, len(spts))
-        tpts = np.array(shape.std_ele(self.fine_order))
+        tpts = shape.std_ele(self.fine_order)
 
         # Obtain a fine sampling of points inside each element
         fop = basis.nodal_basis_at(tpts)
@@ -258,25 +274,11 @@ class PointSampler:
     def __init__(self, mesh, spts, slocs=None):
         locf = ['cidx', 'eidx', 'tloc']
         self.mesh = mesh
+        self.pts = np.asanyarray(spts, dtype=float)
 
-        # Named point set
-        if isinstance(spts, str):
-            comm, rank, root = get_comm_rank_root()
-
-            if rank == root:
-                sinfo = mesh.raw[f'plugins/sampler/{spts}'][:]
-            else:
-                sinfo = None
-
-            sinfo = comm.bcast(sinfo, root=root)
-
-            self.pts, self.locs = sinfo['ploc'], sinfo[locf]
-        # Points with location data
-        elif slocs is not None:
-            self.pts, self.locs = spts, slocs[locf]
-        # Points without location data
+        if slocs is not None:
+            self.locs = slocs[locf]
         else:
-            self.pts = np.array(spts)
             self.locs = PointLocator(mesh).locate(self.pts)[locf]
 
     def configure_with_intg_nvars(self, intg, nvars):
@@ -348,9 +350,29 @@ class PointSampler:
             # Form the reordering list
             self._ptsinv = np.argsort([i for pr in ptsrank for i in pr])
 
-    def sample(self, solns, process=None):
+    def gather(self, samples):
         comm, rank, root = get_comm_rank_root()
 
+        if rank == root:
+            comm.Gatherv(samples, self._ptsrecv, root=root)
+            return self._ptsbuf[self._ptsinv]
+        else:
+            comm.Gatherv(samples, None, root=root)
+            return None
+
+    def etype_pinfo(self):
+        etype_flat = defaultdict(list)
+        for et, ei, idxs, ops in self.pinfo:
+            if np.ndim(idxs) == 0:
+                etype_flat[et].append((ei, ops[0], idxs))
+            else:
+                for idx, op in zip(idxs, ops):
+                    etype_flat[et].append((ei, op, idx))
+
+        return {et: tuple(map(np.array, zip(*recs)))
+                for et, recs in etype_flat.items()}
+
+    def sample(self, solns, process=None):
         # Perform the sampling
         samples = np.empty((self.pcount, self.nvars))
         for et, ei, idxs, ops in self.pinfo:
@@ -361,9 +383,4 @@ class PointSampler:
             samples = np.ascontiguousarray(process(samples))
 
         # Gather to the root rank and return
-        if rank == root:
-            comm.Gatherv(samples, self._ptsrecv, root=root)
-            return self._ptsbuf[self._ptsinv]
-        else:
-            comm.Gatherv(samples, None, root=root)
-            return None
+        return self.gather(samples)

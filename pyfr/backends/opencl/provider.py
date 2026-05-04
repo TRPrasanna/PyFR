@@ -37,7 +37,10 @@ class OpenCLUnorderedMetaKernel(BaseUnorderedMetaKernel):
 
 class OpenCLKernelProvider(BaseKernelProvider):
     def _benchmark(self, kfunc, nbench=4, nwarmup=1):
-        queue = self.backend.cl.queue(profiling=True)
+        try:
+            queue = self._bench_queue
+        except AttributeError:
+            self._bench_queue = queue = self.backend.cl.queue(profiling=True)
 
         for i in range(nbench + nwarmup):
             if i == nwarmup:
@@ -100,6 +103,8 @@ class OpenCLPointwiseKernelProvider(OpenCLKernelProvider,
 
         class PointwiseKernel(OpenCLKernel):
             if rtargs:
+                rtnames = tuple(k for _, k in rtargs)
+
                 def bind(self, **kwargs):
                     for i, k in rtargs:
                         if k in kwargs:

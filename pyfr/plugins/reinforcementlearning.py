@@ -5,8 +5,8 @@ import operator
 import numpy as np
 
 from pyfr.mpiutil import get_comm_rank_root, mpi
-from pyfr.plugins.base import BaseSolverPlugin
-from pyfr.plugins.fluidforce import FluidForceIntegrator
+from pyfr.plugins.soln.fluidforce import FluidForceIntegrator
+from pyfr.plugins.solver.base import BaseSolverPlugin
 from pyfr.points import PointSampler
 
 
@@ -20,9 +20,9 @@ def _integrate_trapezoid(y, x):
 
 class ReinforcementLearningPlugin(BaseSolverPlugin):
     name = 'reinforcementlearning'
-    systems = ['ac-navier-stokes', 'navier-stokes']
+    systems = 'navier-stokes'
     formulations = ['std']
-    dimensions = [2, 3]
+    dimensions = '2|3'
 
     def __init__(self, intg, cfgsect, suffix=None):
         super().__init__(intg, cfgsect, suffix)

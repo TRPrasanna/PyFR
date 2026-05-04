@@ -11,7 +11,9 @@
 % for i, v in enumerate('uvw'[:ndims]):
     ur[${i + 1}] = -ul[${i + 1}] + 2.0*ul[0]*control*(${c[v]});
 % endfor
-    ur[${nvars - 1}] = ul[${nvars - 1}];
+    ur[${nvars - 1}] = ul[${nvars - 1}]
+                     - (0.5/ul[0])*${pyfr.dot('ul[{i}]', i=(1, ndims + 1))}
+                     + (0.5/ur[0])*${pyfr.dot('ur[{i}]', i=(1, ndims + 1))};
 </%pyfr:macro>
 
 <%pyfr:macro name='bc_ldg_state' params='ul, nl, ur' externs='ploc, t, control_params, t_act_interval'>
