@@ -4,8 +4,10 @@ import operator
 
 import numpy as np
 
+from pyfr.cache import memoize
 from pyfr.mpiutil import get_comm_rank_root, mpi
 from pyfr.plugins._surface import cross_fluxpts
+from pyfr.plugins.mixins import BackendMixin
 from pyfr.plugins.soln.fluidforce import FluidForceIntegrator
 from pyfr.plugins.solver.base import BaseSolverPlugin
 from pyfr.points import PointSampler
@@ -19,7 +21,7 @@ def _integrate_trapezoid(y, x):
         return np.trapz(y, x=x)
 
 
-class ReinforcementLearningPlugin(BaseSolverPlugin):
+class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
     name = 'reinforcementlearning'
     systems = 'navier-stokes'
     formulations = ['std']
@@ -43,8 +45,19 @@ class ReinforcementLearningPlugin(BaseSolverPlugin):
         spts = self.cfg.get(cfgsect, 'probe-pts')
         if ',' in spts:
             spts = self.cfg.getliteral(cfgsect, 'probe-pts')
+            locs = None
+        else:
+            if rank == root:
+                pdata = intg.system.mesh.raw[f'plugins/sampler/{spts}'][:]
+            else:
+                pdata = None
 
-        self.psampler = PointSampler(intg.system.mesh, spts)
+            pdata = comm.bcast(pdata, root=root)
+
+            spts = pdata['ploc']
+            locs = pdata[['cidx', 'eidx', 'tloc']]
+
+        self.psampler = PointSampler(intg.system.mesh, spts, locs)
         self.psampler.configure_with_intg_nvars(intg, self.nvars)
 
         default_var_list = ['u', 'v', 'p']
@@ -131,6 +144,52 @@ class ReinforcementLearningPlugin(BaseSolverPlugin):
         self.used_variables = self.expr_evaluator.find_used_variables(
             self.reward_function
         )
+
+        self._init_backend(intg)
+        self._init_sampler_kernels(intg)
+
+    def _init_sampler_kernels(self, intg):
+        backend = self.backend
+
+        backend.pointwise.register('pyfr.plugins.soln.kernels.sample')
+
+        self._sample_tplargs_common = {
+            'ndims': self.ndims, 'nvars': self.nvars, 'nsvars': self.nvars,
+            'has_grads': False, 'primitive': self.fmt == 'primitive',
+            'c': self.cfg.items_as('constants', float),
+            'eos_mod': self._eos_mod
+        }
+
+        self._sample_edata = []
+        for et, (eidxs, wts, smap) in self.psampler.etype_pinfo().items():
+            npts = len(eidxs)
+            nupts = intg.system.ele_map[intg.system.ele_types[et]].nupts
+
+            self._sample_edata.append({
+                'idx': et,
+                'eidxs': eidxs,
+                'nupts': nupts,
+                'wts': backend.const_matrix(wts.T, tags={'align'}),
+                'out': backend.matrix((self.nvars, npts), tags={'align'}),
+                'map': smap
+            })
+
+    @memoize
+    def _get_sampler_kerns(self, uidx):
+        kerns = []
+
+        for ed in self._sample_edata:
+            tplargs = {**self._sample_tplargs_common, 'nupts': ed['nupts']}
+
+            u = self._make_view(self._ele_banks[ed['idx']][uidx],
+                                ed['eidxs'], (ed['nupts'], self.nvars))
+
+            kerns.append(self.backend.pointwise.sample(
+                tplargs=tplargs, dims=[len(ed['eidxs'])],
+                u=u, gradu=None, wts=ed['wts'], out=ed['out']
+            ))
+
+        return kerns
 
     def _control_value(self, intg):
         env = getattr(intg, 'env', None) or getattr(intg.system, 'env', None)
@@ -278,17 +337,19 @@ class ReinforcementLearningPlugin(BaseSolverPlugin):
     def _get_observation(self, solver):
         comm, rank, root = get_comm_rank_root()
 
-        samps = self.psampler.sample(list(solver.soln))
+        self.backend.run_kernels(self._get_sampler_kerns(solver.idxcurr))
+
+        samples = np.empty((self.psampler.pcount, self.nvars))
+        for ed in self._sample_edata:
+            samples[ed['map']] = ed['out'].get().T
+
+        samps = self.psampler.gather(samples)
 
         if rank == root:
             if samps is None:
                 obs = np.zeros(self.observation_size, dtype=np.float32)
             else:
                 samps = np.array(samps)
-
-                if self.fmt == 'primitive' and samps.size:
-                    samps = self.elementscls.con_to_pri(samps.T, self.cfg)
-                    samps = np.array(samps).T
 
                 if samps.size:
                     samps = samps[:, self.var_indices]
