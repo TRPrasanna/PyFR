@@ -1,6 +1,7 @@
 import numpy as np
 
 from pyfr.mpiutil import get_comm_rank_root, mpi
+from pyfr.plugins._surface import cross_fluxpts
 from pyfr.plugins.common import DatasetAppender, init_csv, open_hdf5_a
 from pyfr.plugins.soln.base import BaseSolnPlugin
 from pyfr.plugins.soln.fluidforce import FluidForceIntegrator
@@ -144,23 +145,22 @@ class FluidFluxPlugin(BaseSolnPlugin):
             qwts = self.ff_int.qwts[etype, fidx]
             norms = self.ff_int.norms[etype, fidx]
 
+            rhovn = np.einsum('dfe,dfe->fe', rhovs, norms)
+            momflux = rhovn[None, :, :]*vs
+
             # 1) Mass flux: \int rho v \cdot n dS
-            flux[0] += np.einsum('i,jim,mij->', qwts, rhovs, norms)
+            flux[0] += np.einsum('f,fe->', qwts, rhovn)
 
             # 2) Momentum flux: \int rho v_k (v \cdot n) dS
-            flux[1:ndims + 1] += np.einsum('i,jim,mij,kim->k',
-                                           qwts, rhovs, norms, vs)
+            flux[1:ndims + 1] += np.einsum('f,dfe->d', qwts, momflux)
 
             if self._mcomp:
                 # Flux points positions relative to the moment origin
                 rfpts = self.ff_int.rfpts[etype, fidx]
 
-                # Normal momentum flux vector at each flux point
-                momflux = np.einsum('jim,mij,kim->kim', rhovs, norms, vs)
-
                 # Moments from r x (momentum flux)
-                rcf = np.atleast_3d(np.cross(rfpts, momflux.T))
-                flux[ndims + 1:] += np.einsum('i,jik->k', qwts, rcf)
+                rcf = cross_fluxpts(rfpts, momflux)
+                flux[ndims + 1:] += np.einsum('f,mfe->m', qwts, rcf)
 
         # Reduce and output if we're the root rank
         if rank != root:

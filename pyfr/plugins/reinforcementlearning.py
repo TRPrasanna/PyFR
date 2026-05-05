@@ -5,6 +5,7 @@ import operator
 import numpy as np
 
 from pyfr.mpiutil import get_comm_rank_root, mpi
+from pyfr.plugins._surface import cross_fluxpts
 from pyfr.plugins.soln.fluidforce import FluidForceIntegrator
 from pyfr.plugins.solver.base import BaseSolverPlugin
 from pyfr.points import PointSampler
@@ -227,14 +228,16 @@ class ReinforcementLearningPlugin(BaseSolverPlugin):
                 qwts = ff_int.qwts[etype, fidx]
                 norms = ff_int.norms[etype, fidx]
 
-                fm[pidx, :ndims] += np.einsum('i...,ij,jik', qwts, p, norms)
+                pforce = p[None, :, :]*norms
+                fm[pidx, :ndims] += np.einsum('f,dfe->d', qwts, pforce)
 
                 # Momentum flux contribution
                 vs = np.array(pri_vars[1:-1])
                 rho = np.ones_like(vs[0]) if self._ac else pri_vars[0]
                 rhovs = rho[None, :, :] * vs
-                fm[midx, :ndims] += np.einsum('i,jim,mij,kim->k',
-                                              qwts, rhovs, norms, vs)
+                rhovn = np.einsum('dfe,dfe->fe', rhovs, norms)
+                momflux = rhovn[None, :, :]*vs
+                fm[midx, :ndims] += np.einsum('f,dfe->d', qwts, momflux)
 
                 if self._viscous:
                     duupts = grads[etype][..., ff_int.eidxs[etype, fidx]]
@@ -249,23 +252,21 @@ class ReinforcementLearningPlugin(BaseSolverPlugin):
                     else:
                         vis = self.stress_tensor(ufpts, dufpts)
 
-                    fm[vidx, :ndims] += np.einsum('i...,klij,jil',
-                                                  qwts, vis, norms)
+                    viscf = np.einsum('dkfe,kfe->dfe', vis, norms)
+                    fm[vidx, :ndims] += np.einsum('f,dfe->d', qwts, viscf)
 
                 if self._mcomp:
                     rfpts = ff_int.rfpts[etype, fidx]
-                    rcn = np.atleast_3d(np.cross(rfpts, norms))
 
-                    fm[pidx, ndims:] += np.einsum('i...,ij,jik->k', qwts, p, rcn)
+                    rcf = cross_fluxpts(rfpts, pforce)
+                    fm[pidx, ndims:] += np.einsum('f,mfe->m', qwts, rcf)
 
-                    momflux = np.einsum('jim,mij,kim->kim', rhovs, norms, vs)
-                    rcf = np.atleast_3d(np.cross(rfpts, momflux.T))
-                    fm[midx, ndims:] += np.einsum('i,jik->k', qwts, rcf)
+                    rcf = cross_fluxpts(rfpts, momflux)
+                    fm[midx, ndims:] += np.einsum('f,mfe->m', qwts, rcf)
 
                     if self._viscous:
-                        viscf = np.einsum('ijkl,lkj->lki', vis, norms)
-                        rcf = np.atleast_3d(np.cross(rfpts, viscf))
-                        fm[vidx, ndims:] += np.einsum('i,jik->k', qwts, rcf)
+                        rcf = cross_fluxpts(rfpts, viscf)
+                        fm[vidx, ndims:] += np.einsum('f,mfe->m', qwts, rcf)
 
         if rank != root:
             comm.Reduce(fm, None, op=mpi.SUM, root=root)

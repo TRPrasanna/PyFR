@@ -59,6 +59,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         ic_dir=ic_dir, print_diagnostic=is_root
     )
     raw_env.set_evaluation_mode(True)
+    base_env = raw_env
 
     # Non-root ranks: serve and return
     if collective_mode and not is_root:
@@ -88,19 +89,19 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
             for key, value in hp_dict.items():
                 if hasattr(hp, key):
                     setattr(hp, key, value)
-            hp._calculate_derived(env)
+            hp._calculate_derived(base_env)
         else:
             print(
                 "No hyperparameters in checkpoint, "
                 "using values from config file"
             )
-            if 'neuralnetwork-hyperparameters' not in env.cfg.sections():
+            if 'neuralnetwork-hyperparameters' not in base_env.cfg.sections():
                 print(
                     "No neuralnetwork-hyperparameters section found "
                     "in config file. Using default hyperparameters."
                 )
-            hp = HyperParameters.from_config(env.cfg)
-            hp._calculate_derived(env)
+            hp = HyperParameters.from_config(base_env.cfg)
+            hp._calculate_derived(base_env)
 
         # Compare config files if both are available
         if 'config_content' in checkpoint and config_content:
@@ -244,7 +245,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
                 actions = actions.reshape(-1, 1)
             num_actions = actions.shape[1]
             time_array = (
-                np.arange(len(actions)) * raw_env.action_interval
+                np.arange(len(actions)) * base_env.action_interval
             )
 
             # Print action history

@@ -25,11 +25,17 @@ dependencies = [
     "gimmik >= 3.2.1",
     "h5py >= 2.10",
     "mako >= 1.0.0",
+    "matplotlib",
     "mpi4py >= 4.0.0",
     "numpy >= 2.4.2",
     "platformdirs >= 2.2.0",
     "pytools >= 2016.2.1",
     "rtree >= 1.4.1",
+    "tensorboard",
+    "tensordict",
+    "torch",
+    "torchrl",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +46,7 @@ Homepage = "https://www.pyfr.org/"
 
 [project.scripts]
 pyfr = "pyfr.__main__:main"
+pyfr-rl = "pyfr.rl.cli:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "pyfr._version.__version__"}
