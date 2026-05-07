@@ -1,6 +1,5 @@
 import itertools as it
 from functools import cached_property
-from math import exp
 import re
 
 import numpy as np
@@ -44,11 +43,11 @@ class BaseShape:
         if self.antialias - {'flux', 'surf-flux'}:
             raise ValueError('Invalid anti-alias options')
 
-        self.ubasis = get_polybasis(self.name, self.order + 1, self.upts)
+        self.ubasis = get_polybasis(self.name, self.order, self.upts)
 
         if nspts:
             self.nsptsord = nsptord = self.order_from_npts(nspts)
-            self.sbasis = get_polybasis(self.name, nsptord + 1, self.spts)
+            self.sbasis = get_polybasis(self.name, nsptord, self.spts)
 
             # Basis for free-stream metric
             # We need p-th order pseudo grid points, which includes
@@ -57,7 +56,7 @@ class BaseShape:
             # on the both adjacent cells.
             # Ref. 1 JCP 281, 28-54, Sec 4.2
             # Ref. 2 JSC 26(3), 301-327, Definition 1
-            self.mbasis = get_polybasis(self.name, max(self.order + 1, 2),
+            self.mbasis = get_polybasis(self.name, max(self.order, 1),
                                         self.mpts)
 
     @classmethod
@@ -134,23 +133,6 @@ class BaseShape:
     @property
     def m9(self):
         return block_diag([self.m8]*self.ndims)
-
-    @cached_property
-    @clean
-    def m10(self):
-        ub = self.ubasis
-
-        n = max(sum(dd) for dd in ub.degrees)
-        ncut = self.cfg.getint('soln-filter', 'cutoff')
-        order = self.cfg.getint('soln-filter', 'order')
-        alpha = self.cfg.getfloat('soln-filter', 'alpha')
-
-        A = np.ones(self.nupts)
-        for i, d in enumerate(sum(dd) for dd in ub.degrees):
-            if d >= ncut < n:
-                A[i] = exp(-alpha*((d - ncut)/(n - ncut))**order)
-
-        return np.linalg.solve(ub.vdm, A[:, None]*ub.vdm).T
 
     @cached_property
     def nupts(self):
@@ -303,7 +285,7 @@ class BaseShape:
 
             pts = get_quadrule(kind, rule, npts).pts
 
-            fb[kind] = get_polybasis(kind, self.order + 1, pts)
+            fb[kind] = get_polybasis(kind, self.order, pts)
 
         return fb
 
@@ -348,11 +330,11 @@ class TensorProdShape:
     @classmethod
     def std_ele(cls, sptord):
         pts1d = np.linspace(-1, 1, sptord + 1)
-        return [p[::-1] for p in it.product(pts1d, repeat=cls.ndims)]
+        return np.array([p[::-1] for p in it.product(pts1d, repeat=cls.ndims)])
 
     @classmethod
-    def valid_spt(cls, pt, tol=1e-9):
-        return all(abs(p) < 1 + tol for p in pt)
+    def valid_spt(cls, spt, tol=1e-9):
+        return (np.abs(spt) < 1 + tol).all(axis=-1)
 
 
 class QuadShape(TensorProdShape, BaseShape):
@@ -382,6 +364,12 @@ class QuadShape(TensorProdShape, BaseShape):
          '((1 - x[0])*V[2][1] - (x[0] + 1)*V[1][1] +'
          ' (x[0] - 1)*V[0][1] + (x[0] + 1)*V[3][1])/4']
     ]
+
+    # Interpolation expression for a linear element
+    interp_expr = ('((1 - x[0])*(1 - x[1])*V[0] +'
+                   ' (1 + x[0])*(1 - x[1])*V[1] +'
+                   ' (1 - x[0])*(1 + x[1])*V[2] +'
+                   ' (1 + x[0])*(1 + x[1])*V[3])/4')
 
 
 class HexShape(TensorProdShape, BaseShape):
@@ -433,6 +421,16 @@ class HexShape(TensorProdShape, BaseShape):
          for i in range(3)]
     ]
 
+    # Interpolation expression for a linear element
+    interp_expr = ('((1 - x[0])*(1 - x[1])*(1 - x[2])*V[0] +'
+                   ' (1 + x[0])*(1 - x[1])*(1 - x[2])*V[1] +'
+                   ' (1 - x[0])*(1 + x[1])*(1 - x[2])*V[2] +'
+                   ' (1 + x[0])*(1 + x[1])*(1 - x[2])*V[3] +'
+                   ' (1 - x[0])*(1 - x[1])*(1 + x[2])*V[4] +'
+                   ' (1 + x[0])*(1 - x[1])*(1 + x[2])*V[5] +'
+                   ' (1 - x[0])*(1 + x[1])*(1 + x[2])*V[6] +'
+                   ' (1 + x[0])*(1 + x[1])*(1 + x[2])*V[7])/8')
+
 
 class TriShape(BaseShape):
     name = 'tri'
@@ -455,20 +453,24 @@ class TriShape(BaseShape):
         for i in range(2)
     ]
 
+    # Interpolation expression for a linear element
+    interp_expr = ('(-(x[0] + x[1])*V[0] + (1 + x[0])*V[1] +'
+                   ' (1 + x[1])*V[2])/2')
+
     @classmethod
     def std_ele(cls, sptord):
         pts1d = np.linspace(-1, 1, sptord + 1)
 
-        return [(p, q)
-                for i, q in enumerate(pts1d)
-                for p in pts1d[:(sptord + 1 - i)]]
+        return np.array([(p, q)
+                         for i, q in enumerate(pts1d)
+                         for p in pts1d[:(sptord + 1 - i)]])
 
     @classmethod
     def valid_spt(cls, spt, tol=1e-9):
-        x, y = spt
+        x, y = np.moveaxis(spt, -1, 0)
 
-        return (x + tol > -1 and x - tol < -y and
-                y + tol > -1 and y - tol < 1)
+        return ((x + tol > -1) & (x - tol < -y) &
+                (y + tol > -1) & (y - tol < 1))
 
 
 class TetShape(BaseShape):
@@ -493,22 +495,27 @@ class TetShape(BaseShape):
         for i in range(3)
     ]
 
+    # Interpolation expression for a linear element
+    interp_expr = ('(-(1 + x[0] + x[1] + x[2])*V[0] +'
+                   ' (1 + x[0])*V[1] + (1 + x[1])*V[2] +'
+                   ' (1 + x[2])*V[3])/2')
+
     @classmethod
     def std_ele(cls, sptord):
         pts1d = np.linspace(-1, 1, sptord + 1)
 
-        return [(p, q, r)
-                for i, r in enumerate(pts1d)
-                for j, q in enumerate(pts1d[:(sptord + 1 - i)])
-                for p in pts1d[:(sptord + 1 - i - j)]]
+        return np.array([(p, q, r)
+                         for i, r in enumerate(pts1d)
+                         for j, q in enumerate(pts1d[:(sptord + 1 - i)])
+                         for p in pts1d[:(sptord + 1 - i - j)]])
 
     @classmethod
     def valid_spt(cls, spt, tol=1e-9):
-        x, y, z = spt
+        x, y, z = np.moveaxis(spt, -1, 0)
 
-        return (x + tol > -1 and x - tol < -1 - y - z and
-                y + tol > -1 and y - tol < -z and
-                z + tol > -1 and z - tol < 1)
+        return ((x + tol > -1) & (x - tol < -1 - y - z) &
+                (y + tol > -1) & (y - tol < -z) &
+                (z + tol > -1) & (z - tol < 1))
 
 
 class PriShape(BaseShape):
@@ -541,18 +548,27 @@ class PriShape(BaseShape):
                      for j in range(3)]]
     jac_exprs = _jac_exprs_xy + _jac_exprs_z
 
+    # Interpolation expression for a linear element
+    interp_expr = ('(-(x[0] + x[1])*(1 - x[2])*V[0] +'
+                   ' (1 + x[0])*(1 - x[2])*V[1] +'
+                   ' (1 + x[1])*(1 - x[2])*V[2] -'
+                   ' (x[0] + x[1])*(1 + x[2])*V[3] +'
+                   ' (1 + x[0])*(1 + x[2])*V[4] +'
+                   ' (1 + x[1])*(1 + x[2])*V[5])/4')
+
     @classmethod
     def std_ele(cls, sptord):
         pts1d = np.linspace(-1, 1, sptord + 1)
 
-        return [(p, q, r)
-                for r in pts1d
-                for i, q in enumerate(pts1d)
-                for p in pts1d[:(sptord + 1 - i)]]
+        return np.array([(p, q, r)
+                         for r in pts1d
+                         for i, q in enumerate(pts1d)
+                         for p in pts1d[:(sptord + 1 - i)]])
 
     @classmethod
     def valid_spt(cls, spt, tol=1e-9):
-        return abs(spt[2]) < 1 + tol and TriShape.valid_spt(spt[:2], tol=tol)
+        return ((np.abs(spt[..., 2]) < 1 + tol) &
+                TriShape.valid_spt(spt[..., :2], tol=tol))
 
 
 class PyrShape(BaseShape):
@@ -591,21 +607,30 @@ class PyrShape(BaseShape):
          '(-V[0][2] - V[1][2] - V[2][2] - V[3][2] + 4*V[4][2])/8']
     ]
 
+    # Interpolation expression for a linear element
+    interp_expr = (
+        '(( 2*x[0]*x[1] - 2*x[0] - 2*x[1] - x[2] + 1)*V[0] +'
+        ' (-2*x[0]*x[1] + 2*x[0] - 2*x[1] - x[2] + 1)*V[1] +'
+        ' (-2*x[0]*x[1] - 2*x[0] + 2*x[1] - x[2] + 1)*V[2] +'
+        ' ( 2*x[0]*x[1] + 2*x[0] + 2*x[1] - x[2] + 1)*V[3] +'
+        ' 4*(1 + x[2])*V[4])/8'
+    )
+
     @classmethod
     def std_ele(cls, sptord):
         npts1d = 2*sptord + 1
         pts1d = np.linspace(-1, 1, npts1d)
 
-        return [(p, q, r)
-                for i, r in enumerate(pts1d[::2])
-                for q in pts1d[i:npts1d - i:2]
-                for p in pts1d[i:npts1d - i:2]]
+        return np.array([(p, q, r)
+                         for i, r in enumerate(pts1d[::2])
+                         for q in pts1d[i:npts1d - i:2]
+                         for p in pts1d[i:npts1d - i:2]])
 
     @classmethod
     def valid_spt(cls, spt, tol=1e-9):
-        x, y, z = spt
+        x, y, z = np.moveaxis(spt, -1, 0)
         u = (1 - z) / 2
 
-        return (x + tol > -u and x - tol < u and
-                y + tol > -u and y - tol < u and
-                z + tol > -1 and z - tol < 1)
+        return ((x + tol > -u) & (x - tol < u) &
+                (y + tol > -u) & (y - tol < u) &
+                (z + tol > -1) & (z - tol < 1))

@@ -42,9 +42,15 @@ class CUDAKernelProvider(BaseKernelProvider):
         return mod.get_function(name, argtypes)
 
     def _benchmark(self, kfunc, nbench=4, nwarmup=1):
-        stream = self.backend.cuda.create_stream()
-        start_evt = self.backend.cuda.create_event(timing=True)
-        stop_evt = self.backend.cuda.create_event(timing=True)
+        try:
+            stream = self._bench_stream
+            start_evt = self._bench_start_evt
+            stop_evt = self._bench_stop_evt
+        except AttributeError:
+            cuda = self.backend.cuda
+            self._bench_stream = stream = cuda.create_stream()
+            self._bench_start_evt = start_evt = cuda.create_event(timing=True)
+            self._bench_stop_evt = stop_evt = cuda.create_event(timing=True)
 
         for i in range(nbench + nwarmup):
             if i == nwarmup:
@@ -92,6 +98,8 @@ class CUDAPointwiseKernelProvider(CUDAKernelProvider,
 
         class PointwiseKernel(CUDAKernel):
             if rtargs:
+                rtnames = tuple(k for _, k in rtargs)
+
                 def bind(self, **kwargs):
                     for i, k in rtargs:
                         if k in kwargs:
