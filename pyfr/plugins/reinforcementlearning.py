@@ -10,7 +10,7 @@ from pyfr.plugins._surface import cross_fluxpts
 from pyfr.plugins.mixins import BackendMixin
 from pyfr.plugins.soln.fluidforce import FluidForceIntegrator
 from pyfr.plugins.solver.base import BaseSolverPlugin
-from pyfr.points import PointSampler
+from pyfr.points import PointLocator, PointSampler
 
 
 def _integrate_trapezoid(y, x):
@@ -26,6 +26,25 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
     systems = 'navier-stokes'
     formulations = ['std']
     dimensions = '2|3'
+
+    # RL resets rebuild the solver repeatedly.  For inline probe points this
+    # would otherwise re-run PointLocator each reset, creating enough MPI
+    # user reduction ops in long runs to hit the MPI implementation limit.
+    _probe_locs_cache = {}
+
+    @classmethod
+    def _get_probe_locs(cls, mesh, pts):
+        comm, rank, _ = get_comm_rank_root()
+        pts = np.ascontiguousarray(pts, dtype=float)
+
+        key = (mesh.fname, mesh.uuid, comm.size, rank, pts.shape,
+               pts.dtype.str, pts.tobytes())
+
+        if key not in cls._probe_locs_cache:
+            locs = PointLocator(mesh).locate(pts)[['cidx', 'eidx', 'tloc']]
+            cls._probe_locs_cache[key] = locs.copy()
+
+        return pts, cls._probe_locs_cache[key]
 
     def __init__(self, intg, cfgsect, suffix=None):
         super().__init__(intg, cfgsect, suffix)
@@ -45,7 +64,7 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
         spts = self.cfg.get(cfgsect, 'probe-pts')
         if ',' in spts:
             spts = self.cfg.getliteral(cfgsect, 'probe-pts')
-            locs = None
+            spts, locs = self._get_probe_locs(intg.system.mesh, spts)
         else:
             if rank == root:
                 pdata = intg.system.mesh.raw[f'plugins/sampler/{spts}'][:]
