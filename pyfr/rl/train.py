@@ -65,6 +65,159 @@ class _SingleEnvCollector:
         return None
 
 
+def _safe_gain(act_name: str):
+    name = (act_name or "").lower()
+    # Map common aliases
+    if name in {"leakyrelu", "leaky_relu"}:
+        try:
+            return torch.nn.init.calculate_gain("leaky_relu", 0.01)
+        except Exception:
+            return None
+    # Valid set per PyTorch docs
+    valid = {
+        "linear", "conv1d", "conv2d", "conv3d",
+        "conv_transpose1d", "conv_transpose2d", "conv_transpose3d",
+        "sigmoid", "tanh", "relu", "leaky_relu", "selu"
+    }
+    if name in valid:
+        try:
+            return torch.nn.init.calculate_gain(name)
+        except Exception:
+            return None
+    return None
+
+
+def _validate_network_architecture(name):
+    name = (name or "mlp").lower()
+    if name not in {"mlp", "linear"}:
+        raise ValueError(
+            f"Invalid network architecture {name!r}; expected 'mlp' or "
+            "'linear'"
+        )
+    return name
+
+
+def _make_observation_network(
+    in_features, out_features, architecture, depth, num_cells, activation,
+    device
+):
+    architecture = _validate_network_architecture(architecture)
+
+    if architecture == "linear":
+        return nn.Linear(in_features, out_features, device=device)
+
+    return MLP(
+        in_features=in_features,
+        out_features=out_features,
+        depth=depth,
+        num_cells=num_cells,
+        activation_class=getattr(nn, activation),
+        device=device,
+    )
+
+
+def _init_linear_layers(module, activation_name):
+    gain = _safe_gain(activation_name)
+
+    if gain is None:
+        print(
+            "Info: Using PyTorch default initialization because activation "
+            f"'{activation_name}' has no supported gain."
+        )
+        return
+
+    for layer in module.modules():
+        if isinstance(layer, torch.nn.Linear):
+            torch.nn.init.orthogonal_(layer.weight, gain=gain)
+            if layer.bias is not None:
+                layer.bias.data.zero_()
+
+
+def make_policy_and_value_modules(env, hp, device, return_log_prob=True):
+    action_dim = env.action_spec_unbatched.shape[-1]
+    input_shape = env.observation_spec["observation"].shape
+    obs_dim = input_shape[-1]
+
+    actor_base = _make_observation_network(
+        in_features=obs_dim,
+        out_features=action_dim if hp.state_ind_normal_scale else 2*action_dim,
+        architecture=hp.policy_architecture,
+        depth=hp.num_hidden_layers_policy,
+        num_cells=hp.num_cells_policy,
+        activation=hp.activation_policy,
+        device=device,
+    )
+    _init_linear_layers(
+        actor_base,
+        "linear" if _validate_network_architecture(
+            hp.policy_architecture
+        ) == "linear" else hp.activation_policy
+    )
+
+    # Add learnable scales (standard deviations)
+    if hp.state_ind_normal_scale:
+        actor_net = nn.Sequential(
+            actor_base,
+            AddStateIndependentNormalScale(
+                action_dim,  # Number of actions
+                scale_lb=1e-8,
+            ).to(device)
+        )
+    else:
+        actor_net = nn.Sequential(
+            actor_base,
+            NormalParamExtractor(
+                scale_mapping="biased_softplus_1.0",
+                scale_lb=0.1,   # lower bound for scale, this over-rides
+                                # min_val in tensordict distributions if
+                                # scale_lb > 0.01
+            ).to(device)
+        )
+
+    actor_module = TensorDictModule(
+        actor_net,
+        in_keys=["observation"],
+        out_keys=["loc", "scale"]
+    ).to(device)
+
+    policy = ProbabilisticActor(
+        module=actor_module,
+        spec=env.action_spec,
+        in_keys=["loc", "scale"],
+        distribution_class=TanhNormal,
+        return_log_prob=return_log_prob,
+        distribution_kwargs={
+            "low": env.action_spec.space.low,
+            "high": env.action_spec.space.high,
+            "tanh_loc": False,
+        },
+        # safe = True
+    ).to(device)
+
+    value_net = _make_observation_network(
+        in_features=obs_dim,
+        out_features=1,
+        architecture=hp.value_architecture,
+        depth=hp.num_hidden_layers_value,
+        num_cells=hp.num_cells_value,
+        activation=hp.activation_value,
+        device=device,
+    )
+    _init_linear_layers(
+        value_net,
+        "linear" if _validate_network_architecture(
+            hp.value_architecture
+        ) == "linear" else hp.activation_value
+    )
+
+    value_module = ValueOperator(
+        module=value_net,
+        in_keys=["observation"]
+    ).to(device)
+
+    return policy, value_module
+
+
 def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
     # Get config path at the start
     if hasattr(cfg_file, 'name'):
@@ -109,118 +262,9 @@ def train_agent(mesh_file, cfg_file, backend_name, checkpoint_dir='checkpoints',
 
     hp.print_summary()
 
-    # Actor network with proper output handling
-    action_dim = env.action_spec_unbatched.shape[-1]
-    input_shape = env.observation_spec["observation"].shape
-    actor_mlp = MLP(
-        in_features=input_shape[-1],
-        out_features=action_dim if hp.state_ind_normal_scale else 2*action_dim,
-        depth=hp.num_hidden_layers_policy,
-        num_cells=hp.num_cells_policy,
-        activation_class=getattr(nn, hp.activation_policy),
-        device=device,
+    policy, value_module = make_policy_and_value_modules(
+        env, hp, device, return_log_prob=True
     )
-
-    # Initialize policy weights
-    def _safe_gain(act_name: str):
-        name = (act_name or "").lower()
-        # Map common aliases
-        if name in {"leakyrelu", "leaky_relu"}:
-            try:
-                return torch.nn.init.calculate_gain("leaky_relu", 0.01)
-            except Exception:
-                return None
-        # Valid set per PyTorch docs
-        valid = {
-            "linear","conv1d","conv2d","conv3d",
-            "conv_transpose1d","conv_transpose2d","conv_transpose3d",
-            "sigmoid","tanh","relu","leaky_relu","selu"
-        }
-        if name in valid:
-            try:
-                return torch.nn.init.calculate_gain(name)
-            except Exception:
-                return None
-        return None
-
-    activation_name = hp.activation_policy
-    gain = _safe_gain(activation_name)
-
-    if gain is None:
-        print(f"Info: Using PyTorch default initialization for actor MLP because activation '{activation_name}' has no supported gain.")
-    else:
-        for layer in actor_mlp.modules():
-            if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.orthogonal_(layer.weight, gain=gain)
-                if layer.bias is not None:
-                    layer.bias.data.zero_()
-
-    # Add learnable scales (standard deviations)
-    if hp.state_ind_normal_scale:
-        actor_net = nn.Sequential(
-            actor_mlp,
-            AddStateIndependentNormalScale(
-                action_dim,  # Number of actions
-                scale_lb=1e-8,
-            ).to(device)
-        )
-    else:
-        actor_net = nn.Sequential(
-            actor_mlp,
-            NormalParamExtractor(
-                scale_mapping="biased_softplus_1.0",
-                scale_lb=0.1,   # lower bound for scale, this over-rides min_val in 
-                                # tensordict/nn/distributions/continuous.py class biased_softplus() if scale_lb > 0.01
-            ).to(device)
-        )
-
-    actor_module = TensorDictModule(
-        actor_net,
-        in_keys=["observation"],
-        out_keys=["loc", "scale"]
-    ).to(device)
-
-    policy = ProbabilisticActor(
-        module=actor_module,
-        spec=env.action_spec,
-        in_keys=["loc", "scale"],
-        distribution_class=TanhNormal,
-        return_log_prob=True,
-        distribution_kwargs={
-        "low": env.action_spec.space.low,
-        "high": env.action_spec.space.high,
-        "tanh_loc": False,
-        },
-        #safe = True
-    ).to(device)
-
-    # Value network (critic)
-    value_net = MLP(
-        in_features=input_shape[-1],
-        out_features=1,
-        depth=hp.num_hidden_layers_value,
-        num_cells=hp.num_cells_value,
-        activation_class=getattr(nn, hp.activation_value),
-        device=device,
-    )
-
-    # Initialize value weights
-    activation_name = hp.activation_value
-    gain = _safe_gain(activation_name)
-
-    if gain is None:
-        print(f"Info: Using PyTorch default initialization for actor MLP because activation '{activation_name}' has no supported gain.")
-    else:
-        for layer in value_net.modules():
-            if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.orthogonal_(layer.weight, gain=gain)
-                if layer.bias is not None:
-                    layer.bias.data.zero_()
-
-    value_module = ValueOperator(
-        module=value_net,
-        in_keys=["observation"]
-    ).to(device)
 
     # PPO components
     advantage_module = GAE(
@@ -630,6 +674,8 @@ class HyperParameters:
     torch_device: str = 'cpu'  # 'cuda', 'cpu'
     print_config_on_load: bool = False # set to True to view config file content on model load
     # Network architecture
+    policy_architecture: str = 'mlp'
+    value_architecture: str = 'mlp'
     num_hidden_layers_policy: int = 2
     num_hidden_layers_value: int = 2
     num_cells_policy: int = 512
@@ -702,12 +748,14 @@ class HyperParameters:
                 ("print_config_on_load", "Print config file content on model load"),
             ],
             "Network Architecture": [
-                ("num_hidden_layers_policy", "No. of hidden layers in policy network"),
-                ("num_hidden_layers_value", "No. of hidden layers in value network"),
-                ("num_cells_policy", "Size of policy network hidden layers"),
-                ("num_cells_value", "Size of value network hidden layers"),
-                ("activation_policy", "Activation function for policy network"),
-                ("activation_value", "Activation function for value network"),
+                ("policy_architecture", "'mlp' or 'linear' policy network"),
+                ("value_architecture", "'mlp' or 'linear' value network"),
+                ("num_hidden_layers_policy", "No. of hidden layers in MLP policy"),
+                ("num_hidden_layers_value", "No. of hidden layers in MLP value net"),
+                ("num_cells_policy", "Size of MLP policy hidden layers"),
+                ("num_cells_value", "Size of MLP value hidden layers"),
+                ("activation_policy", "Activation function for MLP policy"),
+                ("activation_value", "Activation function for MLP value net"),
                 ("state_ind_normal_scale", "state-independent normal scale for actions"),
             ],
             "Training Schedule": [

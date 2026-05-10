@@ -1,11 +1,8 @@
 import torch
-import torch.nn as nn
 import numpy as np
 import os
 import sys
 import time
-from tensordict.nn import TensorDictModule, AddStateIndependentNormalScale
-from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, MLP
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 from torchrl.envs import (
     Compose,
@@ -14,7 +11,7 @@ from torchrl.envs import (
     TransformedEnv,
 )
 import matplotlib.pyplot as plt
-from .train import HyperParameters, compare_configs
+from .train import HyperParameters, compare_configs, make_policy_and_value_modules
 from pyfr.inifile import Inifile
 from pyfr.readers.native import NativeReader
 from pyfr.rl.env import PyFREnvironment
@@ -87,62 +84,9 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
         print(checkpoint['config_content'])
         print("\n=======================================\n")
 
-    # Actor network with proper output handling
-    action_dim = env.action_spec_unbatched.shape[-1]
-    input_shape = env.observation_spec["observation"].shape
-    
-    # Create actor network with same architecture as train.py
-    actor_mlp = MLP(
-        in_features=input_shape[-1],
-        out_features=action_dim if hp.state_ind_normal_scale else 2*action_dim,
-        depth=hp.num_hidden_layers_policy,
-        num_cells=hp.num_cells_policy,
-        activation_class=getattr(nn, hp.activation_policy),
-        device=device,
+    policy, _ = make_policy_and_value_modules(
+        env, hp, device, return_log_prob=False
     )
-
-    # Initialize weights for consistency with training
-    for layer in actor_mlp.modules():
-        if isinstance(layer, torch.nn.Linear):
-            torch.nn.init.orthogonal_(layer.weight, 1.0)
-            layer.bias.data.zero_()
-            
-    # Add learnable scales (standard deviations) - matching train.py exactly
-    if hp.state_ind_normal_scale:
-        actor_net = nn.Sequential(
-            actor_mlp,
-            AddStateIndependentNormalScale(
-                action_dim,  # Number of actions
-                scale_lb=1e-8,
-            ).to(device)
-        )
-    else:
-        actor_net = nn.Sequential(
-            actor_mlp,
-            NormalParamExtractor(
-                scale_mapping="biased_softplus_1.0",
-                scale_lb=0.1,   # lower bound for scale
-            ).to(device)
-        )
-
-    actor_module = TensorDictModule(
-        actor_net,
-        in_keys=["observation"],
-        out_keys=["loc", "scale"]
-    ).to(device)
-
-    policy = ProbabilisticActor(
-        module=actor_module,
-        spec=env.action_spec,
-        in_keys=["loc", "scale"],
-        distribution_class=TanhNormal,
-        return_log_prob=False,  # Set to False for evaluation
-        distribution_kwargs={
-            "low": env.action_spec.space.low,
-            "high": env.action_spec.space.high,
-            "tanh_loc": False,
-        },
-    ).to(device)
     
     policy.load_state_dict(checkpoint['policy_state_dict'])
     policy.eval()  # Set to evaluation mode
@@ -169,8 +113,12 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model, ic_dir=None, 
     # Print network architecture summary
     print("\nNetwork Architecture:")
     print("-" * 40)
+    action_dim = env.action_spec_unbatched.shape[-1]
+    input_shape = env.observation_spec["observation"].shape
     print(f"Input shape: {input_shape}")
     print(f"Output shape: {action_dim}")
+    print(f"Policy architecture: {hp.policy_architecture}")
+    print(f"Value architecture: {hp.value_architecture}")
     print(f"Hidden layers: {hp.num_hidden_layers_policy}")
     print(f"Hidden units: {hp.num_cells_policy}")
     print(f"Activation: {hp.activation_policy}")
