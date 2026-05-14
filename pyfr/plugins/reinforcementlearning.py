@@ -10,7 +10,7 @@ from pyfr.plugins._surface import cross_fluxpts
 from pyfr.plugins.mixins import BackendMixin
 from pyfr.plugins.soln.fluidforce import FluidForceIntegrator
 from pyfr.plugins.solver.base import BaseSolverPlugin
-from pyfr.points import PointSampler
+from pyfr.points import PointLocator, PointSampler
 
 
 def _integrate_trapezoid(y, x):
@@ -26,6 +26,25 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
     systems = 'navier-stokes'
     formulations = ['std']
     dimensions = '2|3'
+
+    # RL resets rebuild the solver repeatedly.  For inline probe points this
+    # would otherwise re-run PointLocator each reset, creating enough MPI
+    # user reduction ops in long runs to hit the MPI implementation limit.
+    _probe_locs_cache = {}
+
+    @classmethod
+    def _get_probe_locs(cls, mesh, pts):
+        comm, rank, _ = get_comm_rank_root()
+        pts = np.ascontiguousarray(pts, dtype=float)
+
+        key = (mesh.fname, mesh.uuid, comm.size, rank, pts.shape,
+               pts.dtype.str, pts.tobytes())
+
+        if key not in cls._probe_locs_cache:
+            locs = PointLocator(mesh).locate(pts)[['cidx', 'eidx', 'tloc']]
+            cls._probe_locs_cache[key] = locs.copy()
+
+        return pts, cls._probe_locs_cache[key]
 
     def __init__(self, intg, cfgsect, suffix=None):
         super().__init__(intg, cfgsect, suffix)
@@ -45,7 +64,7 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
         spts = self.cfg.get(cfgsect, 'probe-pts')
         if ',' in spts:
             spts = self.cfg.getliteral(cfgsect, 'probe-pts')
-            locs = None
+            spts, locs = self._get_probe_locs(intg.system.mesh, spts)
         else:
             if rank == root:
                 pdata = intg.system.mesh.raw[f'plugins/sampler/{spts}'][:]
@@ -126,6 +145,9 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
         self.moment_history = []
         self.action_history = []
         self.avg_window = self.cfg.getfloat(cfgsect, 'averaging-window', 0.5)
+        self.min_reward_samples = self.cfg.getint(
+            cfgsect, 'min-reward-samples', 2
+        )
 
         self.reward_function = self.cfg.get(
             cfgsect, 'reward-function', '-abs(avg_moment)'
@@ -345,6 +367,7 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
 
         samps = self.psampler.gather(samples)
 
+        error = None
         if rank == root:
             if samps is None:
                 obs = np.zeros(self.observation_size, dtype=np.float32)
@@ -357,13 +380,20 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
                 obs = np.asarray(samps, dtype=np.float32).reshape(-1)
 
                 if obs.size != self.observation_size:
-                    obs = np.resize(obs, self.observation_size)
+                    error = (
+                        'Observation size mismatch in reinforcementlearning '
+                        f'plugin: expected {self.observation_size}, got '
+                        f'{obs.size}. Check probe point location and '
+                        'observation-variables.'
+                    )
         else:
             obs = None
 
-        obs = comm.bcast(obs, root=root)
+        payload = comm.bcast({'obs': obs, 'error': error}, root=root)
+        if payload['error'] is not None:
+            raise RuntimeError(payload['error'])
 
-        return self._torch.tensor(obs, device=self.device).float()
+        return self._torch.tensor(payload['obs'], device=self.device).float()
 
     def _compute_std(self, history, mean):
         if len(history) <= 1 or len(self.force_times) <= 1:
@@ -379,9 +409,17 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
     def _get_reward(self, solver):
         comm, rank, root = get_comm_rank_root()
 
+        error = None
         if rank == root:
-            if not self.force_times:
-                reward = 0.0
+            if len(self.force_times) < self.min_reward_samples:
+                error = (
+                    'Insufficient force samples for RL reward: expected at '
+                    f'least {self.min_reward_samples}, got '
+                    f'{len(self.force_times)}. Decrease '
+                    '[solver-plugin-reinforcementlearning] nsteps or reduce '
+                    'min-reward-samples.'
+                )
+                reward = None
             else:
                 variables = {}
 
@@ -396,7 +434,12 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
 
                 delta_t = self.force_times[-1] - self.force_times[0]
                 if delta_t <= 0:
-                    reward = 0.0
+                    error = (
+                        'Insufficient reward sampling time span: first and '
+                        'last force samples have the same time. Decrease '
+                        '[solver-plugin-reinforcementlearning] nsteps.'
+                    )
+                    reward = None
                 else:
                     if needs_avg_drag:
                         variables['avg_drag'] = (
@@ -480,7 +523,11 @@ class ReinforcementLearningPlugin(BackendMixin, BaseSolverPlugin):
         else:
             reward = None
 
-        return comm.bcast(reward, root=root)
+        payload = comm.bcast({'reward': reward, 'error': error}, root=root)
+        if payload['error'] is not None:
+            raise RuntimeError(payload['error'])
+
+        return payload['reward']
 
     def reset(self):
         self.force_times.clear()

@@ -20,7 +20,28 @@ from pyfr.rl.env import (
     serve_collective_envs,
     stop_collective_workers,
 )
-from .train import HyperParameters, compare_configs
+from .train import (
+    HyperParameters, compare_configs, _abort_collective_workers,
+    _select_backend_device_id, _tanh_normal_kwargs,
+)
+
+
+def _action_leaf_spec(env):
+    spec = env.action_spec_unbatched
+
+    # Depending on the TorchRL version/wrappers, action_spec_unbatched may be
+    # either a Composite with an "action" leaf or the Bounded action spec
+    # directly.  Only index by key when it is actually a Composite-like spec.
+    keys = getattr(spec, 'keys', None)
+    if callable(keys):
+        try:
+            if 'action' in keys(True, True):
+                return spec['action']
+        except TypeError:
+            if 'action' in keys():
+                return spec['action']
+
+    return spec
 
 
 def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
@@ -47,11 +68,7 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         config_content = None
 
     # Determine device-id
-    device_id = (
-        'local-rank'
-        if collective_mode and backend_name in {'cuda', 'hip'}
-        else 0
-    )
+    device_id = _select_backend_device_id(collective_mode, backend_name)
 
     # Initialize environment (MPI-collective)
     raw_env = PyFREnvironment(
@@ -67,6 +84,8 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
         return
 
     workers_active = collective_mode
+    env = None
+    fatal_exc = None
 
     try:
         if collective_mode:
@@ -134,7 +153,8 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
             print("\n=======================================\n")
 
         # Actor network with proper output handling
-        action_dim = env.action_spec_unbatched.shape[-1]
+        action_spec = _action_leaf_spec(env)
+        action_dim = action_spec.shape[-1]
         input_shape = env.observation_spec["observation"].shape
 
         actor_mlp = MLP(
@@ -179,15 +199,11 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
 
         policy = ProbabilisticActor(
             module=actor_module,
-            spec=env.action_spec,
+            spec=action_spec,
             in_keys=["loc", "scale"],
             distribution_class=TanhNormal,
             return_log_prob=False,
-            distribution_kwargs={
-                "low": env.action_spec.space.low,
-                "high": env.action_spec.space.high,
-                "tanh_loc": False,
-            },
+            distribution_kwargs=_tanh_normal_kwargs(action_spec, device),
         ).to(device)
 
         policy.load_state_dict(checkpoint['policy_state_dict'])
@@ -325,16 +341,22 @@ def evaluate_policy(mesh_file, cfg_file, backend_name, load_model,
             del eval_rollout
             return eval_reward
 
+    except BaseException as exc:
+        fatal_exc = exc
+        raise
     finally:
-        try:
-            env.set_evaluation_mode(False)
-            env.close()
-        except Exception:
+        if fatal_exc is not None and workers_active:
+            _abort_collective_workers(comm, fatal_exc)
+        else:
             try:
-                raw_env.set_evaluation_mode(False)
-                raw_env.close(raise_if_closed=False)
+                env.set_evaluation_mode(False)
+                env.close()
             except Exception:
-                pass
+                try:
+                    raw_env.set_evaluation_mode(False)
+                    raw_env.close(raise_if_closed=False)
+                except Exception:
+                    pass
 
-        if workers_active:
-            stop_collective_workers(comm, root)
+            if workers_active:
+                stop_collective_workers(comm, root)

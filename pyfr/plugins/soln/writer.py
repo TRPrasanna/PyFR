@@ -5,6 +5,8 @@ from pyfr.plugins.soln.base import BaseSolnPlugin
 from pyfr.writers.native import NativeWriter
 from pyfr.util import first
 
+import numpy as np
+
 
 class WriterPlugin(PostactionMixin, RegionMixin, BaseSolnPlugin):
     name = 'writer'
@@ -83,6 +85,7 @@ class WriterPlugin(PostactionMixin, RegionMixin, BaseSolnPlugin):
         stats = Inifile()
         stats.set('data', 'prefix', 'soln')
         intg.collect_stats(stats)
+        self._add_rl_control_state(intg, stats)
 
         # If we are the root rank then prepare the metadata
         if rank == root:
@@ -97,6 +100,42 @@ class WriterPlugin(PostactionMixin, RegionMixin, BaseSolnPlugin):
             metadata |= sdata
 
         return metadata
+
+    def _add_rl_control_state(self, intg, stats):
+        system = getattr(intg, 'system', None)
+        env = getattr(intg, 'env', None) or getattr(system, 'env', None)
+        if env is None or not hasattr(env, 'current_control'):
+            return
+
+        prev = np.atleast_1d(np.asarray(
+            getattr(env, 'previous_control', 0.0), dtype=np.float64
+        ))
+        curr = np.atleast_1d(np.asarray(
+            getattr(env, 'current_control', prev), dtype=np.float64
+        ))
+
+        if prev.shape != curr.shape:
+            return
+
+        act_dt = float(getattr(env, 'action_interval', 0.0))
+        ramp_start = float(getattr(env, 'current_time', intg.tcurr))
+        tcurr = float(intg.tcurr)
+
+        if act_dt > 0.0:
+            applied = (curr - prev) / act_dt * (tcurr - ramp_start) + prev
+            applied = np.maximum(np.minimum(applied, np.maximum(prev, curr)),
+                                 np.minimum(prev, curr))
+        else:
+            applied = curr.copy()
+
+        sect = 'rl-control-state'
+        stats.set(sect, 'num-actions', curr.size)
+        stats.set(sect, 'applied-control', applied.tolist())
+        stats.set(sect, 'previous-control', prev.tolist())
+        stats.set(sect, 'current-control', curr.tolist())
+        stats.set(sect, 'ramp-start-time', ramp_start)
+        stats.set(sect, 'action-interval', act_dt)
+        stats.set(sect, 'tcurr', tcurr)
 
     def _prepare_data(self, intg):
         data, aux = {}, {}

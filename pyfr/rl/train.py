@@ -5,6 +5,12 @@ from typing import Dict, Any
 import torch
 from torch import nn
 from collections import defaultdict
+import random
+import shutil
+import signal
+import sys
+
+import numpy as np
 from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator, NormalParamExtractor, MLP
 from torchrl.envs import (
@@ -14,6 +20,7 @@ from torchrl.envs import (
     StepCounter,
     TransformedEnv,
 )
+from torchrl.collectors import Collector
 from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
@@ -26,47 +33,184 @@ from pyfr.rl.env import (
     serve_collective_envs,
     stop_collective_workers,
 )
+from pyfr.rl.preempt import (
+    install_signal_handlers,
+    preemption_requested,
+    preemption_signal,
+)
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
 import os
 import math
-from torch.utils.tensorboard import SummaryWriter
 import time
 from pyfr.mpiutil import get_comm_rank_root, init_mpi
 
 
-class _SingleEnvCollector:
-    """Minimal single-process collector to avoid multiprocess GPU duplication."""
+class _PreemptionInterruptor:
+    def collection_stopped(self):
+        return preemption_requested()
 
-    def __init__(self, env, policy, frames_per_batch, total_frames):
-        self.env = env
-        self.policy = policy
-        self.frames_per_batch = frames_per_batch
-        self.total_frames = total_frames
-        self._nbatches = math.ceil(total_frames / frames_per_batch)
 
-    def __iter__(self):
-        for _ in range(self._nbatches):
-            # Match reset_at_each_iter=True behaviour.
-            self.env.reset()
-            with torch.no_grad():
-                batch = self.env.rollout(
-                    self.frames_per_batch,
-                    self.policy,
-                    auto_reset=True,
-                    break_when_any_done=False,
-                )
-            yield batch
+def _collector_shutdown(collector, *, close_env=True):
+    if collector is None:
+        return
 
-    def update_policy_weights_(self):
+    if hasattr(collector, 'shutdown'):
+        return collector.shutdown(close_env=close_env, raise_on_error=False)
+    if hasattr(collector, 'close'):
+        return collector.close()
+
+
+def _atomic_torch_save(obj, path):
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    tmp = f'{path}.tmp-{os.getpid()}'
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _save_tensordict_batch(td, path):
+    path = os.path.abspath(path)
+    tmp = f'{path}.tmp-{os.getpid()}'
+
+    if os.path.exists(tmp):
+        shutil.rmtree(tmp)
+    if os.path.exists(path):
+        shutil.rmtree(path)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    td.cpu().save(tmp)
+    os.replace(tmp, path)
+
+
+def _rng_state():
+    py_ver, py_state, py_gauss = random.getstate()
+    np_name, np_keys, np_pos, np_has_gauss, np_cached_gauss = (
+        np.random.get_state()
+    )
+
+    state = {
+        'torch': torch.get_rng_state(),
+        'python': {
+            'version': py_ver,
+            'state': list(py_state),
+            'gauss': py_gauss,
+        },
+        'numpy': {
+            'bit_generator': np_name,
+            'keys': torch.as_tensor(np_keys.astype(np.int64)),
+            'pos': int(np_pos),
+            'has_gauss': int(np_has_gauss),
+            'cached_gauss': float(np_cached_gauss),
+        },
+    }
+
+    if torch.cuda.is_available():
+        state['cuda_all'] = torch.cuda.get_rng_state_all()
+
+    return state
+
+
+def _restore_rng_state(state):
+    if not state:
+        return
+
+    if (v := state.get('torch')) is not None:
+        torch.set_rng_state(v)
+    if (v := state.get('python')) is not None:
+        random.setstate((
+            int(v['version']),
+            tuple(int(x) for x in v['state']),
+            v['gauss'],
+        ))
+    if (v := state.get('numpy')) is not None:
+        np.random.set_state((
+            v['bit_generator'],
+            v['keys'].cpu().numpy().astype(np.uint32),
+            int(v['pos']),
+            int(v['has_gauss']),
+            float(v['cached_gauss']),
+        ))
+    if (v := state.get('cuda_all')) is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(v)
+
+
+def _reward_or_neginf(value):
+    if isinstance(value, (int, float)) and value is not None:
+        return value
+    else:
+        return float('-inf')
+
+
+def _format_reward(value):
+    return 'n/a' if value is None else f'{float(value):.4f}'
+
+
+def _action_leaf_spec(env):
+    spec = env.action_spec_unbatched
+
+    # Depending on the TorchRL version/wrappers, action_spec_unbatched may be
+    # either a Composite with an "action" leaf or the Bounded action spec
+    # directly.  Only index by key when it is actually a Composite-like spec.
+    keys = getattr(spec, 'keys', None)
+    if callable(keys):
+        try:
+            if 'action' in keys(True, True):
+                return spec['action']
+        except TypeError:
+            if 'action' in keys():
+                return spec['action']
+
+    return spec
+
+
+def _visible_device_count():
+    cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if cvd is None:
         return None
 
-    def shutdown(self):
-        return None
+    devs = [d.strip() for d in cvd.split(',') if d.strip()]
+    return len(devs)
+
+
+def _select_backend_device_id(collective_mode, backend_name):
+    if not (collective_mode and backend_name in {'cuda', 'hip'}):
+        return 0
+
+    # Slurm GPU binding commonly exposes one GPU per MPI rank via
+    # CUDA_VISIBLE_DEVICES.  In that restricted view the correct device index
+    # inside each rank is always zero; otherwise map by local MPI rank.
+    if backend_name == 'cuda' and _visible_device_count() == 1:
+        return 0
+
+    return 'local-rank'
+
+
+def _tanh_normal_kwargs(action_spec, device):
+    return {
+        "low": action_spec.space.low.to(device),
+        "high": action_spec.space.high.to(device),
+        "tanh_loc": False,
+    }
+
+
+def _abort_collective_workers(comm, exc):
+    print(
+        'Fatal root-side exception in collective RL mode; aborting MPI '
+        f'workers: {type(exc).__name__}: {exc}',
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        comm.Abort(1)
+    except Exception:
+        pass
 
 
 def train_agent(mesh_file, cfg_file, backend_name,
                 checkpoint_dir='checkpoints', ic_dir=None, load_model=None):
     init_mpi()
+    install_signal_handlers()
     comm, rank, root = get_comm_rank_root()
     is_root = rank == root
     collective_mode = comm.size > 1
@@ -87,11 +231,7 @@ def train_agent(mesh_file, cfg_file, backend_name,
         config_content = None
 
     # Determine device-id
-    device_id = (
-        'local-rank'
-        if collective_mode and backend_name in {'cuda', 'hip'}
-        else 0
-    )
+    device_id = _select_backend_device_id(collective_mode, backend_name)
 
     # Initialize environment (MPI-collective: all ranks participate)
     raw_env = PyFREnvironment(
@@ -115,6 +255,10 @@ def train_agent(mesh_file, cfg_file, backend_name,
         return
 
     workers_active = collective_mode
+    wandb_run = None
+    env = None
+    collector = None
+    fatal_exc = None
 
     try:
         # Root only from here
@@ -148,7 +292,7 @@ def train_agent(mesh_file, cfg_file, backend_name,
                 'One RL environment will span the full MPI world.'
             )
             if backend_name in {'cuda', 'hip'}:
-                print("Backend device mapping: device-id = 'local-rank'")
+                print(f"Backend device mapping: device-id = {device_id!r}")
         else:
             num_devices = get_device_count(backend_name)
             if num_devices > 1 and backend_name in {'cuda', 'hip'}:
@@ -161,7 +305,8 @@ def train_agent(mesh_file, cfg_file, backend_name,
         hp.print_summary()
 
         # Actor network with proper output handling
-        action_dim = env.action_spec_unbatched.shape[-1]
+        action_spec = _action_leaf_spec(env)
+        action_dim = action_spec.shape[-1]
         input_shape = env.observation_spec["observation"].shape
         actor_mlp = MLP(
             in_features=input_shape[-1],
@@ -216,15 +361,11 @@ def train_agent(mesh_file, cfg_file, backend_name,
 
         policy = ProbabilisticActor(
             module=actor_module,
-            spec=env.action_spec,
+            spec=action_spec,
             in_keys=["loc", "scale"],
             distribution_class=TanhNormal,
             return_log_prob=True,
-            distribution_kwargs={
-                "low": env.action_spec.space.low,
-                "high": env.action_spec.space.high,
-                "tanh_loc": False,
-            },
+            distribution_kwargs=_tanh_normal_kwargs(action_spec, device),
         ).to(device)
 
         # Value network (critic)
@@ -279,18 +420,6 @@ def train_agent(mesh_file, cfg_file, backend_name,
         # Optimizer
         optim = torch.optim.Adam(loss_module.parameters(), hp.lr)
 
-        print(
-            f"\nUsing single-environment collector "
-            f"({'MPI collective' if collective_mode else 'local'})."
-        )
-
-        collector = _SingleEnvCollector(
-            env=env,
-            policy=policy,
-            frames_per_batch=hp.frames_per_batch,
-            total_frames=hp.total_frames,
-        )
-
         # Replay buffer (used for minibatch sampling, not experience replay)
         replay_buffer = ReplayBuffer(
             storage=LazyTensorStorage(max_size=hp.frames_per_batch),
@@ -310,12 +439,13 @@ def train_agent(mesh_file, cfg_file, backend_name,
             )
             policy.load_state_dict(checkpoint['policy_state_dict'])
             value_module.load_state_dict(checkpoint['value_state_dict'])
+            _restore_rng_state(checkpoint.get('rng_state'))
 
-            current_eval_reward = checkpoint.get(
-                'current_reward', float('-inf')
+            current_eval_reward = _reward_or_neginf(
+                checkpoint.get('current_reward', float('-inf'))
             )
-            loaded_best_reward = checkpoint.get(
-                'best_reward', float('-inf')
+            loaded_best_reward = _reward_or_neginf(
+                checkpoint.get('best_reward', float('-inf'))
             )
             start_episode = checkpoint.get('episode', 0)
             loaded_best_episode = checkpoint.get('best_episode', 0)
@@ -363,6 +493,30 @@ def train_agent(mesh_file, cfg_file, backend_name,
             else:
                 print("done.")
 
+            opt_sensitive_keys = {
+                'lr', 'num_epochs', 'clip_epsilon', 'entropy_eps',
+                'max_grad_norm', 'desired_num_minibatches'
+            }
+            opt_sensitive_diffs = {
+                key for key, _, _ in differences
+                if key in opt_sensitive_keys
+            }
+
+            if 'optimizer_state_dict' in checkpoint:
+                if opt_sensitive_diffs:
+                    print(
+                        "\nSkipping checkpoint optimizer state because "
+                        "optimizer-sensitive hyperparameters changed: "
+                        f"{', '.join(sorted(opt_sensitive_diffs))}."
+                    )
+                else:
+                    optim.load_state_dict(checkpoint['optimizer_state_dict'])
+
+                for group in optim.param_groups:
+                    group['lr'] = hp.lr
+
+            print(f"Optimizer learning rate set to: {hp.lr:.6g}")
+
             # Compare config files if available
             if 'config_content' in checkpoint and config_content:
                 print("\nVerifying config files...")
@@ -394,10 +548,13 @@ def train_agent(mesh_file, cfg_file, backend_name,
                 print("\n=======================================\n")
 
             print(f"\nLoaded model from: {load_model}")
-            print(f"Current eval reward: {current_eval_reward:.4f}")
+            print(
+                f"Current eval reward: "
+                f"{_format_reward(current_eval_reward)}"
+            )
             print(
                 f"Best eval reward from checkpoint: "
-                f"{loaded_best_reward:.4f}"
+                f"{_format_reward(loaded_best_reward)}"
             )
             print(
                 f"Best reward achieved at episode: {loaded_best_episode}"
@@ -427,52 +584,109 @@ def train_agent(mesh_file, cfg_file, backend_name,
 
         eval_str = ""
 
-        # Tensorboard writer
         wallclock_datetime = time.strftime("%Y-%m-%d_%H-%M-%S")
-        log_path = os.path.join(
-            checkpoint_dir, f"tensorboard_logs/{wallclock_datetime}"
-        )
-        writer = SummaryWriter(log_dir=log_path)
-
         hparam_dict = {}
         for key, value in hp.__dict__.items():
             if key not in ['_param_sources', '_derived_params']:
                 if isinstance(value, (int, float, str, bool)):
                     hparam_dict[key] = value
 
-        run_name = os.path.join(
-            os.path.dirname(os.path.realpath(log_path)),
-            f"{wallclock_datetime}"
+        import wandb
+
+        os.environ.setdefault('WANDB_MODE', hp.wandb_mode)
+        wandb_dir = os.path.join(checkpoint_dir, 'wandb')
+        os.makedirs(wandb_dir, exist_ok=True)
+
+        wandb_run = wandb.init(
+            project=hp.wandb_project,
+            name=hp.wandb_run_name or wallclock_datetime,
+            dir=wandb_dir,
+            config=hparam_dict,
+            resume='allow',
         )
         print(
-            f"Writing hyperparameters to tensorboard: {run_name}"
+            f"Writing training metrics to W&B run: {wandb_run.name} "
+            f"(mode={os.environ.get('WANDB_MODE', 'online')})"
         )
-        writer.add_hparams(hparam_dict, {}, run_name=run_name)
 
         updates_per_batch = (
             hp.num_epochs * (hp.frames_per_batch // sub_batch_size)
         )
+        latest_eval_reward = current_eval_reward
+
+        def _ckpt_dict(reward, train_reward=None):
+            return {
+                'policy_state_dict': policy.state_dict(),
+                'value_state_dict': value_module.state_dict(),
+                'optimizer_state_dict': optim.state_dict(),
+                'rng_state': _rng_state(),
+                'current_reward': _reward_or_neginf(reward),
+                'current_train_reward': train_reward,
+                'best_reward': best_eval_reward,
+                'episode': episode_count,
+                'best_episode': best_eval_episode,
+                'batch_idx': batch_idx,
+                'hyperparameters': {
+                    k: v for k, v in hp.__dict__.items()
+                    if not k.startswith('_') and not callable(v)
+                },
+                'config_content': config_content,
+                'config_path': cfg_path,
+            }
+
+        print(
+            f"\nUsing TorchRL Collector "
+            f"({'MPI collective' if collective_mode else 'local'})."
+        )
+
+        collector = Collector(
+            create_env_fn=env,
+            policy=policy,
+            frames_per_batch=hp.frames_per_batch,
+            total_frames=hp.total_frames,
+            split_trajs=False,
+            reset_at_each_iter=False,
+            device=device,
+            exploration_type=ExplorationType.RANDOM,
+            interruptor=_PreemptionInterruptor(),
+        )
 
         batch_idx = start_batch_idx
         for _, tensordict_data in enumerate(collector):
+            if preemption_requested():
+                signum = preemption_signal()
+                signame = (
+                    signal.Signals(signum).name
+                    if signum is not None else 'unknown'
+                )
+                print(f'Preemption requested by {signame}; checkpointing.')
+                _atomic_torch_save(
+                    _ckpt_dict(latest_eval_reward), latest_model_path
+                )
+                break
+
             episode_count += hp.episodes_per_batch
 
             # Training performance metrics
             train_reward = (
                 tensordict_data["next", "reward"].mean().item()
             )
-            writer.add_scalar(
-                "batch/train_reward", train_reward, batch_idx
-            )
-            writer.add_scalar(
-                "batch/episodes", episode_count, batch_idx
-            )
-            writer.add_scalar(
-                "batch/learning_rate",
-                optim.param_groups[0]['lr'], batch_idx
-            )
+            wandb.log({
+                "batch/train_reward": train_reward,
+                "batch/episodes": episode_count,
+                "batch/learning_rate": optim.param_groups[0]['lr'],
+                "batch/batch_idx": batch_idx,
+            })
+
+            if hp.save_trajectories:
+                traj_path = os.path.join(
+                    checkpoint_dir, hp.trajectory_dir,
+                    f'batch-{batch_idx:06d}.tensordict'
+                )
+                _save_tensordict_batch(tensordict_data, traj_path)
 
             # Training updates
+            stop_for_preemption = False
             for epoch_idx in range(hp.num_epochs):
                 advantage_module(tensordict_data)
                 data_view = tensordict_data.reshape(-1)
@@ -490,6 +704,12 @@ def train_agent(mesh_file, cfg_file, backend_name,
                     if hp.entropy_eps > 0:
                         loss_value = loss_value + loss_vals["loss_entropy"]
 
+                    if not torch.isfinite(loss_value):
+                        raise RuntimeError(
+                            f'Non-finite PPO loss at batch {batch_idx}, '
+                            f'epoch {epoch_idx}, update {sub_update_idx}'
+                        )
+
                     policy_obj = loss_vals["loss_objective"].item()
                     val_loss = loss_vals["loss_critic"].item()
                     ent_loss = (
@@ -505,6 +725,12 @@ def train_agent(mesh_file, cfg_file, backend_name,
                     grad_norm = nn.utils.clip_grad_norm_(
                         loss_module.parameters(), hp.max_grad_norm
                     )
+                    if not torch.isfinite(grad_norm):
+                        raise RuntimeError(
+                            f'Non-finite PPO gradient norm at batch '
+                            f'{batch_idx}, epoch {epoch_idx}, update '
+                            f'{sub_update_idx}'
+                        )
 
                     global_update_idx = (
                         batch_idx * updates_per_batch
@@ -513,61 +739,71 @@ def train_agent(mesh_file, cfg_file, backend_name,
                         + sub_update_idx
                     )
 
-                    writer.add_scalar(
-                        "loss/policy_objective",
-                        policy_obj, global_update_idx
-                    )
-                    writer.add_scalar(
-                        "loss/value_loss",
-                        val_loss, global_update_idx
-                    )
-                    writer.add_scalar(
-                        "loss/entropy_bonus",
-                        ent_loss, global_update_idx
-                    )
-                    writer.add_scalar(
-                        "grad/norm",
-                        grad_norm, global_update_idx
-                    )
+                    wandb.log({
+                        "loss/policy_objective": policy_obj,
+                        "loss/value_loss": val_loss,
+                        "loss/entropy_bonus": ent_loss,
+                        "grad/norm": float(grad_norm),
+                        "train/global_update": global_update_idx,
+                    })
 
                     optim.step()
                     optim.zero_grad()
 
+                    for pname, param in loss_module.named_parameters():
+                        if not torch.isfinite(param).all():
+                            raise RuntimeError(
+                                f'Non-finite PPO parameter after optimizer '
+                                f'step: {pname}'
+                            )
+
+                    if preemption_requested():
+                        stop_for_preemption = True
+                        break
+
+                if stop_for_preemption:
+                    break
+
+            with torch.no_grad():
+                probe_td = tensordict_data.select('observation').to(device)
+                probe_td = policy(probe_td)
+                for key in ('loc', 'scale', 'action'):
+                    val = probe_td.get(key)
+                    if val is not None and not torch.isfinite(val).all():
+                        raise RuntimeError(
+                            f'Non-finite policy {key} after PPO update at '
+                            f'batch {batch_idx}'
+                        )
+
             collector.update_policy_weights_()
+
+            if stop_for_preemption:
+                signum = preemption_signal()
+                signame = (
+                    signal.Signals(signum).name
+                    if signum is not None else 'unknown'
+                )
+                print(f'Preemption requested by {signame}; checkpointing.')
+                _atomic_torch_save(
+                    _ckpt_dict(latest_eval_reward, train_reward),
+                    latest_model_path
+                )
+                break
 
             # Logging
             logs["train_reward"].append(train_reward)
 
-            # Evaluate every hp.eval_frequency batches
-            if batch_idx % hp.eval_frequency == 0:
+            # Evaluate after every hp.eval_frequency completed batches.
+            if (batch_idx + 1) % hp.eval_frequency == 0:
                 eval_reward = evaluate_policy(env, policy)
+                latest_eval_reward = eval_reward
                 logs["eval_reward"].append(eval_reward)
 
-                writer.add_scalar(
-                    "eval/mean_reward", eval_reward, batch_idx + 1
-                )
-                writer.add_scalar(
-                    "train/learning_rate",
-                    optim.param_groups[0]['lr'], batch_idx + 1
-                )
-
-                # Save checkpoint dict helper
-                def _ckpt_dict(reward):
-                    return {
-                        'policy_state_dict': policy.state_dict(),
-                        'value_state_dict': value_module.state_dict(),
-                        'current_reward': reward,
-                        'best_reward': best_eval_reward,
-                        'episode': episode_count,
-                        'best_episode': best_eval_episode,
-                        'batch_idx': batch_idx,
-                        'hyperparameters': {
-                            k: v for k, v in hp.__dict__.items()
-                            if not k.startswith('_') and not callable(v)
-                        },
-                        'config_content': config_content,
-                        'config_path': cfg_path,
-                    }
+                wandb.log({
+                    "eval/mean_reward": eval_reward,
+                    "train/learning_rate": optim.param_groups[0]['lr'],
+                    "batch/batch_idx": batch_idx,
+                })
 
                 if eval_reward > best_eval_reward:
                     best_eval_reward = eval_reward
@@ -577,25 +813,35 @@ def train_agent(mesh_file, cfg_file, backend_name,
                         f"{best_eval_reward:.5f} at episode "
                         f"{episode_count}"
                     )
-                    torch.save(_ckpt_dict(eval_reward), best_model_path)
+                    _atomic_torch_save(
+                        _ckpt_dict(eval_reward, train_reward),
+                        best_model_path
+                    )
 
-                torch.save(
-                    _ckpt_dict(eval_reward),
+                _atomic_torch_save(
+                    _ckpt_dict(eval_reward, train_reward),
                     os.path.join(
                         checkpoint_dir, f'model-{batch_idx + 1}.pt'
                     )
                 )
-                torch.save(_ckpt_dict(eval_reward), latest_model_path)
 
                 eval_str = (
                     f"eval reward: {eval_reward:.5f} "
                     f"(best: {best_eval_reward:.5f})"
                 )
 
+                if episode_count < hp.episodes:
+                    collector.reset()
+
+            _atomic_torch_save(
+                _ckpt_dict(latest_eval_reward, train_reward),
+                latest_model_path
+            )
+
             # Progress bar update
             pbar.set_postfix({
                 "train_reward": f"{train_reward:.5f}",
-                "eval": eval_str,
+                "last_eval": eval_str,
                 "lr": f"{optim.param_groups[0]['lr']:.2e}",
             })
             pbar.update(hp.episodes_per_batch)
@@ -603,19 +849,34 @@ def train_agent(mesh_file, cfg_file, backend_name,
             batch_idx += 1
 
         pbar.close()
-        collector.shutdown()
-        writer.close()
+    except BaseException as exc:
+        fatal_exc = exc
+        raise
     finally:
-        try:
-            env.close()
-        except Exception:
+        if fatal_exc is not None and workers_active:
+            _abort_collective_workers(comm, fatal_exc)
+        else:
             try:
-                raw_env.close(raise_if_closed=False)
+                _collector_shutdown(collector, close_env=False)
             except Exception:
                 pass
 
-        if workers_active:
-            stop_collective_workers(comm, root)
+            try:
+                if env is not None:
+                    env.close()
+                elif raw_env is not None:
+                    raw_env.close(raise_if_closed=False)
+            except Exception:
+                pass
+
+            if workers_active:
+                stop_collective_workers(comm, root)
+
+            if wandb_run is not None:
+                try:
+                    wandb_run.finish()
+                except Exception:
+                    pass
 
 
 def evaluate_policy(env, policy, num_steps=1000000):
@@ -736,6 +997,13 @@ class HyperParameters:
     # Evaluation settings
     eval_frequency: int = 1
 
+    # Logging and persistence
+    wandb_project: str = 'pyfr-rl'
+    wandb_run_name: str = ''
+    wandb_mode: str = 'offline'
+    save_trajectories: bool = False
+    trajectory_dir: str = 'trajectories'
+
     def __post_init__(self):
         self._param_sources = {
             field_name: 'default'
@@ -821,6 +1089,13 @@ class HyperParameters:
             ],
             "Evaluation Settings": [
                 ("eval_frequency", "Evaluate policy every N updates"),
+            ],
+            "Logging and Persistence": [
+                ("wandb_project", "W&B project name"),
+                ("wandb_run_name", "W&B run name"),
+                ("wandb_mode", "W&B mode"),
+                ("save_trajectories", "Save collected TensorDict batches"),
+                ("trajectory_dir", "TensorDict batch directory"),
             ]
         }
 

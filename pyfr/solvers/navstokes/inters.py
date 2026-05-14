@@ -1,3 +1,5 @@
+from ast import literal_eval
+
 import numpy as np
 
 from pyfr.solvers.baseadvecdiff import (BaseAdvectionDiffusionBCInters,
@@ -248,10 +250,26 @@ class _AdiaJetRLControlMixin:
         self.control_params = be.matrix((1, 3))
         self.set_external('control_params', 'broadcast fpdtype_t[1][3]',
                           value=self.control_params)
-        self.control_params.set(np.array([[0.0, 0.0, 0.0]]))
+        self._control_params_host = np.array([[0.0, 0.0, 0.0]])
+        self.control_params.set(self._control_params_host)
 
         self._current_target = 0.0
         self._last_env_step = None
+
+    def setup(self, sdata, prevcfg):
+        sect_eq = (prevcfg is not None and
+                   self.cfg.sect_eq(prevcfg, self.cfgsect))
+
+        if sdata is not None and sect_eq:
+            params = np.asarray(sdata, dtype=np.float64).reshape(1, 3)
+            self._control_params_host = params.copy()
+            self.control_params.set(params)
+            self._current_target = float(params[0, 1])
+
+    @classmethod
+    def serialisefn(cls, bciface, prefix, srl):
+        sfn = lambda: bciface._control_params_host.copy()
+        srl.register(prefix, sfn if bciface else None)
 
     @classmethod
     def preparefn(cls, bciface, mesh, elemap):
@@ -273,9 +291,19 @@ class _AdiaJetRLControlMixin:
             return
 
         target = float(self._target_from_env(env))
-        self.control_params.set(np.array([[self._current_target, target, t]]))
+        params = np.array([[self._current_target, target, t]])
+        self.control_params.set(params)
+        self._control_params_host = params
         self._current_target = target
         self._last_env_step = env_step
+
+    def seed_control_state_from_env(self, env, t):
+        target = float(self._target_from_env(env))
+        params = np.array([[target, target, t]])
+        self.control_params.set(params)
+        self._control_params_host = params
+        self._current_target = target
+        self._last_env_step = None
 
 
 class NavierStokesAdiaJetNeuralType5BCInters(_AdiaJetRLControlMixin,
@@ -348,7 +376,8 @@ class _AdiaJetRLMultiControlMixin:
             f'broadcast fpdtype_t[{self.num_actuators}][3]',
             value=self.control_params
         )
-        self.control_params.set(np.zeros((self.num_actuators, 3)))
+        self._control_params_host = np.zeros((self.num_actuators, 3))
+        self.control_params.set(self._control_params_host)
 
         # Per-actuator spatial mask bounds:
         #   <axis>-min<i>, <axis>-max<i>
@@ -366,11 +395,30 @@ class _AdiaJetRLMultiControlMixin:
         # type6 always references ploc in the kernel for masking.
         if 'ploc' not in self._external_args:
             spec = f'in fpdtype_t[{self.ndims}]'
-            value = self._const_mat(lhs, 'get_ploc_for_inter')
+            value = self._const_mat(lhs, 'get_ploc_for_inters')
             self.set_external('ploc', spec, value=value)
 
         self._current_targets = np.zeros(self.num_actuators)
         self._last_env_step = None
+
+    def setup(self, sdata, prevcfg):
+        sect_eq = (prevcfg is not None and
+                   self.cfg.sect_eq(prevcfg, self.cfgsect))
+
+        if sdata is not None and sect_eq:
+            params = np.asarray(sdata, dtype=np.float64).reshape(
+                self.num_actuators, 3
+            )
+            self._control_params_host = params.copy()
+            self.control_params.set(params)
+            self._current_targets = params[:, 1].copy()
+
+    @classmethod
+    def serialisefn(cls, bciface, prefix, srl):
+        def sfn():
+            return bciface._control_params_host.copy()
+
+        srl.register(prefix, sfn if bciface else None)
 
     @classmethod
     def preparefn(cls, bciface, mesh, elemap):
@@ -441,13 +489,90 @@ class _AdiaJetRLMultiControlMixin:
         params[:, 2] = t
 
         self.control_params.set(params)
+        self._control_params_host = params
         self._current_targets = targets.copy()
         self._last_env_step = env_step
+
+    def seed_control_state_from_env(self, env, t):
+        targets = self._targets_from_env(env)
+        params = np.empty((self.num_actuators, 3), dtype=np.float64)
+        params[:, 0] = targets
+        params[:, 1] = targets
+        params[:, 2] = t
+
+        self.control_params.set(params)
+        self._control_params_host = params
+        self._current_targets = targets.copy()
+        self._last_env_step = None
+
+
+class _AdiaJetRLMultiSlotControlMixin(_AdiaJetRLMultiControlMixin):
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
+
+        self.num_z_slots, z_slot_bounds = self._read_z_slot_bounds(cfgsect, cfg)
+        self._tplargs['nzslots'] = self.num_z_slots
+
+        # Optional shared spanwise slot mask for repeated slots controlled by
+        # the same actuator action.  Keep one dummy slot when disabled so the
+        # generated kernel signature remains simple.
+        self.z_slot_bounds = be.matrix((max(self.num_z_slots, 1), 2))
+        self.set_external(
+            'z_slot_bounds',
+            f'broadcast fpdtype_t[{max(self.num_z_slots, 1)}][2]',
+            value=self.z_slot_bounds
+        )
+        self.z_slot_bounds.set(z_slot_bounds)
+
+    def _read_z_slot_bounds(self, cfgsect, cfg):
+        if self.ndims < 3 or not cfg.hasopt(cfgsect, 'z-slots'):
+            return 0, np.array([[-1.0e100, 1.0e100]], dtype=np.float64)
+
+        slots = np.asarray(literal_eval(cfg.get(cfgsect, 'z-slots')),
+                           dtype=np.float64)
+
+        if slots.ndim != 2 or slots.shape[1] != 2:
+            raise ValueError(
+                f'{cfgsect}: z-slots must be a list of (zmin, zmax) pairs'
+            )
+
+        if len(slots) < 1:
+            raise ValueError(f'{cfgsect}: z-slots must not be empty')
+
+        for i, (lo, hi) in enumerate(slots):
+            if lo > hi:
+                raise ValueError(
+                    f'Invalid z-slots entry {i} in {cfgsect}: {lo} > {hi}'
+                )
+
+        return len(slots), slots
 
 
 class NavierStokesAdiaJetNeuralType6BCInters(_AdiaJetRLMultiControlMixin,
                                              NavierStokesBaseBCInters):
     type = 'adia-jet-neural-type6'
+    cflux_state = 'ghost-imperm'
+
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
+
+        comps = ['u', 'v', 'w'][:self.ndims]
+        expr_keys = []
+        defaults = {}
+
+        # Each actuator i takes ui(x,y,...) and vi(x,y,...) (and wi for 3-D).
+        for i in range(self.num_actuators):
+            for comp in comps:
+                key = f'{comp}{i}'
+                expr_keys.append(key)
+                defaults[key] = 0
+
+        self.c |= self._exp_opts(expr_keys, lhs, default=defaults)
+
+
+class NavierStokesAdiaJetNeuralType7BCInters(_AdiaJetRLMultiSlotControlMixin,
+                                             NavierStokesBaseBCInters):
+    type = 'adia-jet-neural-type7'
     cflux_state = 'ghost-imperm'
 
     def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):

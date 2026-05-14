@@ -4,6 +4,7 @@ import random
 import sys
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import List
 
 import h5py
@@ -15,8 +16,9 @@ from torchrl.envs.common import EnvBase
 
 from pyfr.backends import get_backend
 from pyfr.inifile import Inifile
-from pyfr.mpiutil import get_comm_rank_root, init_mpi
+from pyfr.mpiutil import get_comm_rank_root, init_mpi, mpi
 from pyfr.readers.native import NativeReader
+from pyfr.rl.preempt import preemption_requested, request_preemption
 from pyfr.solvers import get_solver
 
 
@@ -51,6 +53,9 @@ class PyFREnvironment(EnvBase):
                 print(f'Using {backend_name} device {device_id}')
 
         self.backend = get_backend(backend_name, self.cfg)
+        self._episode_output_root = self._get_episode_output_root()
+        self._episode_output_specs = self._get_episode_output_specs()
+        self._episode_output_counts = {'setup': 0, 'train': 0, 'eval': 0}
 
         self.tend = self.cfg.getfloat('solver-time-integrator', 'tend')
         tstart = self.cfg.getfloat('solver-time-integrator', 'tstart', 0.0)
@@ -88,6 +93,8 @@ class PyFREnvironment(EnvBase):
 
         self.current_control = np.array(self.actions_init, dtype=np.float64)
         self.previous_control = np.array(self.actions_init, dtype=np.float64)
+        self._restart_control_state = None
+        self._warned_missing_restart_control_state = False
 
         # dtend is custom in this RL workflow; fall back to (tend - tstart)
         self.dtend = self.cfg.getfloat(
@@ -108,20 +115,29 @@ class PyFREnvironment(EnvBase):
         self.step_count = -1
 
         self.ic_manager = None
-        if self.is_root and ic_dir is not None:
-            try:
-                self.ic_manager = InitialConditionManager(
-                    ic_dir, self.mesh.uuid,
-                    print_diagnostic=self.print_diagnostic
+        if ic_dir is not None:
+            ic_error = None
+            if self.is_root:
+                try:
+                    self.ic_manager = InitialConditionManager(
+                        ic_dir, self.mesh.uuid,
+                        print_diagnostic=self.print_diagnostic
+                    )
+                except Exception as e:
+                    ic_error = str(e)
+
+            ic_error = self.comm.bcast(ic_error, root=self.root)
+            if ic_error is not None:
+                raise RuntimeError(
+                    f'Invalid initial-condition directory: {ic_error}'
                 )
-            except ValueError as e:
-                print(f'\nWarning: {e}')
-                print('Continuing without initial condition snapshots...')
         elif self.print_diagnostic:
             print('\nNote: No initial condition directory provided.')
             print('Training will use default initial conditions.')
 
         self.is_evaluating = False
+
+        self._set_episode_output_paths('setup')
 
         restart_soln = self._load_restart_soln()
         self._init_solver(initsoln=restart_soln)
@@ -199,6 +215,53 @@ class PyFREnvironment(EnvBase):
         self.pbar = None
         self.count_episodes = True
 
+    def _get_episode_output_root(self):
+        sect = 'solver-plugin-reinforcementlearning'
+
+        if self.cfg.hasopt(sect, 'episode-output-dir'):
+            return Path(self.cfg.get(sect, 'episode-output-dir')).absolute()
+        else:
+            return None
+
+    def _get_episode_output_specs(self):
+        specs = []
+        prefixes = ('soln-plugin-', 'solver-plugin-')
+
+        for sect in self.cfg.sections():
+            if not sect.startswith(prefixes):
+                continue
+            if sect == 'solver-plugin-reinforcementlearning':
+                continue
+            if not self.cfg.getbool(sect, 'episode-output', True):
+                continue
+
+            if self.cfg.hasopt(sect, 'file'):
+                specs.append((sect, 'file', self.cfg.get(sect, 'file')))
+
+            if self.cfg.hasopt(sect, 'basedir'):
+                specs.append((sect, 'basedir', self.cfg.get(sect, 'basedir')))
+
+        return specs
+
+    def _set_episode_output_paths(self, mode):
+        if self._episode_output_root is None:
+            return
+
+        self._episode_output_counts[mode] += 1
+        episode_dir = (
+            self._episode_output_root
+            / f'{mode}-episode-{self._episode_output_counts[mode]:06d}'
+        )
+        episode_dir.mkdir(parents=True, exist_ok=True)
+
+        for sect, opt, original in self._episode_output_specs:
+            if opt == 'file':
+                self.cfg.set(sect, opt, episode_dir / Path(original).name)
+            else:
+                self.cfg.set(sect, opt, episode_dir)
+
+        self.comm.barrier()
+
     def set_progress_bar(self, pbar):
         self.pbar = pbar
 
@@ -217,16 +280,73 @@ class PyFREnvironment(EnvBase):
         payload = self.comm.bcast(payload, root=self.root)
 
         if payload['error'] is not None:
-            if self.is_root:
-                print(f"Warning: Failed to load IC file: {payload['error']}")
-                print('Using default initial conditions.')
-            return None
+            raise RuntimeError(
+                f"Failed to select a valid initial condition: "
+                f"{payload['error']}"
+            )
 
         ic_file = payload['ic_file']
-        if ic_file is None:
+        if ic_file is None and self.ic_manager is not None:
+            raise RuntimeError(
+                'Initial-condition directory was provided, but no valid '
+                'initial condition file was selected'
+            )
+        elif ic_file is None:
+            self._restart_control_state = None
             return None
 
-        return self.mesh_reader.load_soln(ic_file)
+        soln = self.mesh_reader.load_soln(ic_file)
+        self._set_controls_from_restart(soln)
+
+        return soln
+
+    def _set_controls_from_restart(self, soln):
+        self._restart_control_state = None
+
+        sect = 'rl-control-state'
+        if not soln.stats.hasopt(sect, 'applied-control'):
+            if (self.print_diagnostic
+                    and not self._warned_missing_restart_control_state):
+                print(
+                    'Warning: restart solution has no [rl-control-state] '
+                    'applied-control; assuming actions-init/no-AFC actuator '
+                    'state.'
+                )
+                self._warned_missing_restart_control_state = True
+            return
+
+        try:
+            applied = np.asarray(
+                soln.stats.getliteral(sect, 'applied-control'),
+                dtype=np.float64
+            )
+        except Exception as e:
+            if self.print_diagnostic:
+                print(f'Ignoring invalid restart actuator state: {e}')
+            return
+
+        applied = np.atleast_1d(applied).ravel()
+        if applied.size != self.num_control_actions:
+            if self.print_diagnostic:
+                print(
+                    'Ignoring restart actuator state with '
+                    f'{applied.size} actions; expected '
+                    f'{self.num_control_actions}.'
+                )
+            return
+
+        self.current_control = applied.copy()
+        self.previous_control = applied.copy()
+        self._restart_control_state = {'applied_control': applied}
+
+    def _seed_bc_controls_from_restart(self):
+        if self._restart_control_state is None:
+            return
+
+        for bc in getattr(self.solver.system, '_bc_inters', []):
+            seed = getattr(bc, 'seed_control_state_from_env', None)
+            if seed is not None:
+                seed(self, self.solver.tcurr)
 
     def _init_solver(self, initsoln=None):
         self._release_solver()
@@ -239,6 +359,7 @@ class PyFREnvironment(EnvBase):
         # The RL BC hooks and plugin read controls from env.
         self.solver.env = self
         self.solver.system.env = self
+        self._seed_bc_controls_from_restart()
 
         self.rl_plugin = next(
             p for p in self.solver.plugins if p.name == 'reinforcementlearning'
@@ -251,14 +372,12 @@ class PyFREnvironment(EnvBase):
         if not hasattr(self, 'solver') or self.solver is None:
             return
 
-        try:
-            self.backend.wait()
-        except Exception:
-            pass
+        self.backend.wait()
 
         self.rl_plugin = None
         old_solver = self.solver
         self.solver = None
+        old_solver._finalise_plugins()
         del old_solver
         gc.collect()
 
@@ -269,6 +388,10 @@ class PyFREnvironment(EnvBase):
         self.step_count = 0
         self.current_control = np.array(self.actions_init, dtype=np.float64)
         self.previous_control = np.array(self.actions_init, dtype=np.float64)
+
+        self._set_episode_output_paths(
+            'eval' if self.is_evaluating else 'train'
+        )
 
         restart_soln = self._load_restart_soln()
         self._init_solver(initsoln=restart_soln)
@@ -304,33 +427,19 @@ class PyFREnvironment(EnvBase):
         self.current_time = self.solver.tcurr
         self.next_action_time = self.current_time + self.action_interval
 
-        try:
-            self.solver.advance_to(self.next_action_time)
+        self.solver.advance_to(self.next_action_time)
 
-            reward = self._compute_reward()
-            observation = self._get_observation()
-            truncated = self._check_done()
-            terminated = False
+        reward = self._compute_reward()
+        observation = self._get_observation()
+        truncated = self._check_done()
+        terminated = False
 
-            if truncated and self.count_episodes and self.is_root:
-                self.episode_count += 1
+        if self.comm.allreduce(preemption_requested(), op=mpi.LOR):
+            request_preemption()
+            truncated = True
 
-        except RuntimeError as e:
-            if self.is_root:
-                print(
-                    f'Solver crashed: {e}. '
-                    f'Last actions were: {self.current_control}'
-                )
-
-            observation = self.observation_spec.zero(
-                torch.Size([])
-            )['observation']
-            reward = -10.0
-            truncated = False
-            terminated = True
-
-            if self.count_episodes and self.is_root:
-                self.episode_count += 1
+        if truncated and self.count_episodes and self.is_root:
+            self.episode_count += 1
 
         return TensorDict(
             {
@@ -424,6 +533,11 @@ class CollectiveEnvController(EnvBase):
             'cmd': _CMD_STEP,
             'env': self.env_name,
             'action': action,
+            'step_count': (
+                int(tensordict['step_count'].item())
+                if 'step_count' in tensordict.keys(True) else None
+            ),
+            'preempt_requested': preemption_requested(),
         })
         return self.env._step(tensordict)
 
@@ -488,11 +602,19 @@ def serve_collective_envs(envs: dict[str, PyFREnvironment]):
             if cmd == _CMD_RESET:
                 env._reset()
             elif cmd == _CMD_STEP:
+                if payload.get('preempt_requested'):
+                    request_preemption()
+
                 action = payload['action']
-                td = TensorDict(
-                    {'action': torch.tensor(action, device=env.device)},
-                    batch_size=torch.Size([])
-                )
+                td_data = {
+                    'action': torch.tensor(action, device=env.device),
+                }
+                if payload.get('step_count') is not None:
+                    td_data['step_count'] = torch.tensor(
+                        payload['step_count'], device=env.device
+                    )
+
+                td = TensorDict(td_data, batch_size=torch.Size([]))
                 env._step(td)
             elif cmd == _CMD_SET_MODE:
                 env.set_evaluation_mode(payload['is_evaluating'])
@@ -572,6 +694,7 @@ class InitialConditionManager:
             raise ValueError(f'IC directory {self.ic_dir} not found')
 
         ic_files = []
+        invalid = []
         for f in sorted(os.listdir(self.ic_dir)):
             if not f.endswith('.pyfrs'):
                 continue
@@ -584,17 +707,38 @@ class InitialConditionManager:
 
                 if muuid == self.mesh_uuid:
                     ic_files.append(file_path)
+                else:
+                    invalid.append(
+                        f'{f}: mesh uuid {muuid} != {self.mesh_uuid}'
+                    )
             except Exception:
-                continue
+                invalid.append(f'{f}: unreadable or missing mesh-uuid')
+
+        if not ic_files:
+            detail = '; '.join(invalid[:5])
+            if len(invalid) > 5:
+                detail += f'; ... {len(invalid) - 5} more'
+
+            raise ValueError(
+                f'No valid .pyfrs files in {self.ic_dir} for mesh uuid '
+                f'{self.mesh_uuid}'
+                + (f' ({detail})' if detail else '')
+            )
 
         return ic_files
 
     def get_random_ic(self) -> str:
+        self.ic_files = self._find_valid_ics()
+        self.unused_files &= set(self.ic_files)
+
         if not self.unused_files:
             self.unused_files = set(self.ic_files)
 
         if not self.unused_files:
-            return None
+            raise ValueError(
+                f'No valid .pyfrs files remain in {self.ic_dir} for mesh uuid '
+                f'{self.mesh_uuid}'
+            )
 
         ic_file = random.choice(sorted(self.unused_files))
         self.unused_files.remove(ic_file)

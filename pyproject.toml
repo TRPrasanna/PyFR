@@ -31,11 +31,11 @@ dependencies = [
     "platformdirs >= 2.2.0",
     "pytools >= 2016.2.1",
     "rtree >= 1.4.1",
-    "tensorboard",
     "tensordict",
     "torch",
     "torchrl",
     "tqdm",
+    "wandb >= 0.21.4",
 ]
 
 [project.optional-dependencies]
